@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Firebase Test</title>
+</head>
+<body>
+    <h1>Firebase Connection Test</h1>
+    <div id="status">Testing...</div>
+    <div id="debug"></div>
+
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+    
+    <script>
+        // Firebase configuration (same as verify_users.php)
+        const firebaseConfig = {
+            apiKey: "AIzaSyCvWpVVoJQU8IXF8tS21KVUpJ6Y2LLo7xA",
+            authDomain: "ibantayv2.firebaseapp.com",
+            projectId: "ibantayv2",
+            storageBucket: "ibantayv2.appspot.com",
+            messagingSenderId: "1005084190324",
+            appId: "1:1005084190324:web:53a3f7cf41e9b9a6ff8b9f",
+            measurementId: "G-K9J4Q3PLBH"
+        };
+
+        // Initialize Firebase
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.firestore();
+
+        const statusDiv = document.getElementById('status');
+        const debugDiv = document.getElementById('debug');
+
+        function log(message) {
+            console.log(message);
+            debugDiv.innerHTML += '<p>' + message + '</p>';
+        }
+
+        async function testFirebase() {
+            try {
+                log('Connecting to Firebase...');
+                statusDiv.textContent = 'Connecting...';
+                
+                // Test simple query
+                const snapshot = await db.collection('users').limit(5).get();
+                log(`Found ${snapshot.size} users`);
+                
+                statusDiv.textContent = 'Connected successfully!';
+                statusDiv.style.color = 'green';
+                
+                // List some user data
+                snapshot.forEach(doc => {
+                    const data = doc.data();
+                    log(`User ${doc.id}: ${data.fullName || 'No name'} - Status: ${data.accountStatus || data.status || 'unknown'}`);
+                });
+                
+            } catch (error) {
+                log('Error: ' + error.message);
+                statusDiv.textContent = 'Connection failed!';
+                statusDiv.style.color = 'red';
+                console.error('Firebase error:', error);
+            }
+        }
+
+        // Run test when page loads
+        testFirebase();
+    </script>
+</body>
+</html>

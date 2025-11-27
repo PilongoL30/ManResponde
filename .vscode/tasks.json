@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "shell",
+			"label": "Apply non-gradient premium UI updates",
+			"command": "echo Applying non-gradient premium UI updates"
+		}
+	]
+}
