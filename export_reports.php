@@ -1,6 +1,6 @@
 <?php
-session_start();
 require_once __DIR__.'/db_config.php';
+session_start();
 
 // Check if user is logged in and is admin
 if (!isset($_SESSION['user_id']) || $_SESSION['user_role'] !== 'admin') {
@@ -11,6 +11,7 @@ if (!isset($_SESSION['user_id']) || $_SESSION['user_role'] !== 'admin') {
 // Categories configuration
 $categories = [
     'ambulance' => ['label' => 'Ambulance', 'collection' => 'ambulance_reports', 'icon' => 'truck', 'color' => 'blue'],
+    'police'    => ['label' => 'Police',    'collection' => 'police_reports',    'icon' => 'user-shield', 'color' => 'slate'],
     'tanod'     => ['label' => 'Tanod',     'collection' => 'tanod_reports',     'icon' => 'shield-check', 'color' => 'sky'],
     'fire'      => ['label' => 'Fire',      'collection' => 'fire_reports',      'icon' => 'fire', 'color' => 'red'],
     'flood'     => ['label' => 'Flood',     'collection' => 'flood_reports',     'icon' => 'home', 'color' => 'indigo'],
@@ -239,14 +240,11 @@ function export_to_pdf(array $allReports, array $categories): void {
             }
             
             // Get image URL if available
-            $imageUrl = '';
+            $imageUrl = $report['imageUrl'] ?? $report['image'] ?? '';
             $imageDisplay = 'No Image';
-            if (!empty($report['imageUrl'])) {
-                $imageUrl = $report['imageUrl'];
-                $imageDisplay = '<a href="' . htmlspecialchars($imageUrl) . '" target="_blank" style="color: #2563eb; text-decoration: underline;">View Image</a>';
-            } elseif (!empty($report['image'])) {
-                $imageUrl = $report['image'];
-                $imageDisplay = '<a href="' . htmlspecialchars($imageUrl) . '" target="_blank" style="color: #2563eb; text-decoration: underline;">View Image</a>';
+            
+            if (!empty($imageUrl)) {
+                $imageDisplay = '<a href="' . htmlspecialchars($imageUrl) . '" target="_blank"><img src="' . htmlspecialchars($imageUrl) . '" alt="Report Image" style="max-width: 100px; max-height: 100px; object-fit: cover; border-radius: 4px; border: 1px solid #ddd;"></a>';
             }
             
             $statusClass = 'status-' . strtolower($report['status'] ?? 'pending');

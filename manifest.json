@@ -1,0 +1,49 @@
+{
+  "name": "ManResponde Emergency Dashboard",
+  "short_name": "ManResponde",
+  "description": "Emergency response management system for barangay services",
+  "start_url": "/ManResponde/dashboard.php",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#2563eb",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "responde.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "responde.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [],
+  "categories": ["productivity", "utilities"],
+  "shortcuts": [
+    {
+      "name": "Dashboard",
+      "short_name": "Dashboard",
+      "description": "View emergency dashboard",
+      "url": "/ManResponde/dashboard.php?view=dashboard",
+      "icons": [{ "src": "responde.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Live Map",
+      "short_name": "Map",
+      "description": "View live incident map",
+      "url": "/ManResponde/dashboard.php?view=map",
+      "icons": [{ "src": "responde.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Live Support",
+      "short_name": "Support",
+      "description": "Access live support chat",
+      "url": "/ManResponde/dashboard.php?view=live-support",
+      "icons": [{ "src": "responde.png", "sizes": "192x192" }]
+    }
+  ]
+}

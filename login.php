@@ -1,8 +1,11 @@
 <?php
 // login.php
 
-session_start();
 require_once __DIR__ . '/db_config.php';
+
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 
 use Kreait\Firebase\Exception\Auth\InvalidPassword;
 use Kreait\Firebase\Exception\Auth\UserNotFound;
@@ -16,13 +19,30 @@ $auth = initialize_auth();
 $error_message = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $identifier = trim($_POST['identifier'] ?? '');
-    $password   = (string)($_POST['password'] ?? '');
-
-    if ($identifier === '' || $password === '') {
-        $error_message = 'Please enter your email/username and password.';
+    // Verify CSRF token
+    if (!csrf_verify_token()) {
+        $error_message = 'Security token validation failed. Please try again.';
     } else {
+        $uid = null;
+        $email = null;
+
         try {
+        // CASE A: Google Sign-In
+        if (!empty($_POST['google_id_token'])) {
+            // Add 300 seconds (5 minutes) leeway for clock skew
+            $verifiedIdToken = $auth->verifyIdToken($_POST['google_id_token'], 300);
+            $uid = $verifiedIdToken->claims()->get('sub');
+            $email = $verifiedIdToken->claims()->get('email');
+        } 
+        // CASE B: Password Login
+        else {
+            $identifier = trim($_POST['identifier'] ?? '');
+            $password   = (string)($_POST['password'] ?? '');
+
+            if ($identifier === '' || $password === '') {
+                throw new Exception('Please enter your email/username and password.');
+            }
+
             // Resolve username -> email (if needed)
             $email = $identifier;
             $resolvedUid = null;
@@ -42,7 +62,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $signInResult = $auth->signInWithEmailAndPassword($email, $password);
 
             // Extract UID across SDK versions
-            $uid = null;
             if (is_callable([$signInResult, 'firebaseUserId'])) {
                 $uid = $signInResult->firebaseUserId();
             } elseif (method_exists($signInResult, 'data')) {
@@ -64,8 +83,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$uid) {
                 throw new Exception('Unable to determine user ID.');
             }
+        }
 
-            // Load Firestore profile via REST (from db_config.php helpers)
+        // COMMON: Check User Role in Firestore
+        if ($uid) {
             $userData = firestore_get_doc_by_id('users', $uid);
             if (!$userData) {
                 throw new Exception('User data not found in the database.');
@@ -81,15 +102,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $_SESSION['user_email'] = $userData['email'] ?? $email;
             $_SESSION['user_role'] = $role;
             $_SESSION['user_fullname'] = $userData['fullName'] ?? '';
+            $_SESSION['assignedBarangay'] = $userData['assignedBarangay'] ?? '';
 
             header('Location: dashboard');
             exit;
-        } catch (InvalidPassword | UserNotFound $e) {
-            $error_message = 'Invalid credentials.';
-        } catch (Throwable $e) {
-            $error_message = $e->getMessage();
         }
+
+    } catch (InvalidPassword | UserNotFound $e) {
+        $error_message = 'Invalid credentials.';
+    } catch (Throwable $e) {
+        $error_message = $e->getMessage();
     }
+    } // End CSRF check
 }
 
 // Provide local svg_icon helper if not available
@@ -243,6 +267,7 @@ if (!function_exists('svg_icon')) {
                         <?php endif; ?>
 
                         <form action="login" method="POST" class="space-y-5">
+                            <?php echo csrf_field(); ?>
                             <div>
                                 <label for="identifier" class="field-label">Email or Username</label>
                                 <div class="input-group">
@@ -269,6 +294,20 @@ if (!function_exists('svg_icon')) {
                             <button type="submit" class="w-full btn btn-gradient">
                                 <?php echo svg_icon('arrow-right','w-5 h-5'); ?>
                                 Sign In
+                            </button>
+
+                            <div class="relative my-4">
+                                <div class="absolute inset-0 flex items-center">
+                                    <div class="w-full border-t border-gray-200"></div>
+                                </div>
+                                <div class="relative flex justify-center text-sm">
+                                    <span class="px-2 bg-white text-gray-500">Or continue with</span>
+                                </div>
+                            </div>
+
+                            <button type="button" onclick="signInWithGoogle()" class="w-full btn bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 transition-colors">
+                                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" class="w-5 h-5 mr-2" alt="Google">
+                                Sign in with Google
                             </button>
 
                             <p class="text-center text-xs text-gray-400">© <?php echo date('Y'); ?> ManResponde. All rights reserved.</p>
@@ -299,6 +338,45 @@ if (!function_exists('svg_icon')) {
     document.getElementById('identifier')?.classList.add('error');
     document.getElementById('password')?.classList.add('error');
     <?php endif; ?>
+    </script>
+    <!-- Firebase SDKs -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
+
+    <script>
+      const firebaseConfig = {
+        apiKey: "AIzaSyDiNgvmttAwhAjPthjJtcZ1Hr9PLWnhErQ",
+        authDomain: "ibantayv2.firebaseapp.com",
+        projectId: "ibantayv2"
+      };
+      firebase.initializeApp(firebaseConfig);
+      
+      function signInWithGoogle() {
+        const provider = new firebase.auth.GoogleAuthProvider();
+        firebase.auth().signInWithPopup(provider)
+          .then((result) => {
+            return result.user.getIdToken();
+          })
+          .then((idToken) => {
+            // Submit token to server
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = 'login.php';
+            
+            const input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = 'google_id_token';
+            input.value = idToken;
+            
+            form.appendChild(input);
+            document.body.appendChild(form);
+            form.submit();
+          })
+          .catch((error) => {
+            console.error(error);
+            alert('Google Sign-In Error: ' + error.message);
+          });
+      }
     </script>
 </body>
 </html>

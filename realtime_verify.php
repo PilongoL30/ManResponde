@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__ . '/db_config.php';
 session_start();
 
 // Check if user is logged in and is admin

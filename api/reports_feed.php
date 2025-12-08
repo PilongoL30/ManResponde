@@ -1,12 +1,8 @@
 <?php
+require_once dirname(__DIR__) . '/db_config.php';
 session_start();
 header('Content-Type: application/json; charset=utf-8');
 // Strong no-cache headers
-header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-header('Pragma: no-cache');
-header('Expires: 0');
-
-require_once dirname(__DIR__) . '/db_config.php';
 
 if (!isset($_SESSION['user_id'])) {
     http_response_code(401);
@@ -52,6 +48,9 @@ function latest_reports_min(string $collection, int $limit = 200): array {
                     'timestamp' => $d['timestamp'] ?? null,
                     'reporterId'=> $d['reporterId'] ?? '',
                     '_created'  => $d['_created'] ?? null,
+                    'latitude'  => $d['latitude'] ?? null,
+                    'longitude' => $d['longitude'] ?? null,
+                    'coordinates' => $d['coordinates'] ?? null,
                 ];
             }
         } catch (Throwable $e) {}
@@ -76,6 +75,9 @@ function latest_reports_min(string $collection, int $limit = 200): array {
                 'timestamp' => $fields['timestamp'] ?? ($doc['createTime'] ?? null),
                 'reporterId'=> $fields['reporterId'] ?? '',
                 '_created'  => $doc['createTime'] ?? null,
+                'latitude'  => $fields['latitude'] ?? null,
+                'longitude' => $fields['longitude'] ?? null,
+                'coordinates' => $fields['coordinates'] ?? null,
             ];
         }
         usort($items, function($a, $b) {
@@ -98,6 +100,7 @@ function latest_reports_min(string $collection, int $limit = 200): array {
 
 $categories = [
     'ambulance' => ['label' => 'Ambulance', 'collection' => 'ambulance_reports'],
+    'police'    => ['label' => 'Police',    'collection' => 'police_reports'],
     'tanod'     => ['label' => 'Tanod',     'collection' => 'tanod_reports'],
     'fire'      => ['label' => 'Fire',      'collection' => 'fire_reports'],
     'flood'     => ['label' => 'Flood',     'collection' => 'flood_reports'],

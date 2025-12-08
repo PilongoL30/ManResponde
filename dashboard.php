@@ -1,9 +1,47 @@
 <?php
+ob_start(); // Start output buffering immediately to catch any stray output
 
-session_start();
 require_once __DIR__.'/db_config.php';
+
+// Session is already started in db_config.php via config.php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
 require_once __DIR__.'/notification_system.php';
 require_once __DIR__.'/fcm_config.php';
+
+// CSRF Protection for POST requests
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Skip CSRF for specific actions that come from external sources
+    $skipCsrf = ['firebase_webhook', 'external_api'];
+    $action = $_POST['api_action'] ?? $_GET['action'] ?? '';
+    
+    if (!in_array($action, $skipCsrf)) {
+        if (!csrf_verify_token()) {
+            http_response_code(403);
+            
+            // Log CSRF failure for debugging
+            if (DEBUG_MODE) {
+                error_log("CSRF validation failed for action: {$action}, token provided: " . (isset($_POST[CSRF_TOKEN_NAME]) ? 'yes' : 'no'));
+            }
+            
+            if (!empty($_POST['api_action']) || isset($_SERVER['HTTP_X_REQUESTED_WITH'])) {
+                // AJAX request
+                header('Content-Type: application/json');
+                echo json_encode([
+                    'success' => false,
+                    'error' => 'CSRF token validation failed. Please refresh the page and try again.',
+                    'action' => $action
+                ]);
+                exit;
+            } else {
+                // Regular form submission
+                die('CSRF token validation failed. Please go back and try again.');
+            }
+        }
+    }
+}
 
 // Using Kreait Firebase SDK exceptions
 use Kreait\Firebase\Exception\Auth\UserNotFound;
@@ -15,9 +53,22 @@ use Kreait\Firebase\Exception\Auth\EmailExists;
  *
  * @param string $collection The name of the Firestore collection.
  * @param int $limit The maximum number of documents to retrieve.
+ * @param bool $useCache Whether to use caching (default: true).
  * @return array An array of report documents.
  */
-function list_latest_reports(string $collection, int $limit = 20): array {
+function list_latest_reports(string $collection, int $limit = 20, bool $useCache = true): array {
+    // Enforce maximum limit
+    $limit = min($limit, DEFAULT_PAGE_SIZE);
+    
+    // Try cache first
+    if ($useCache) {
+        $cacheKey = "reports_{$collection}_{$limit}";
+        $cached = cache_get($cacheKey, 30); // 30-second cache
+        if ($cached !== null) {
+            return $cached;
+        }
+    }
+    
     $items = [];
     if (function_exists('firestore_query_latest')) {
         try {
@@ -36,23 +87,19 @@ function list_latest_reports(string $collection, int $limit = 20): array {
                     'reporterId' => $d['reporterId'] ?? $d['uid'] ?? '',
                     '_created'   => $d['_created'] ?? null,
                 ];
-                // Debug: Log ambulance report data for diagnosis
-                if ($collection === 'ambulance_reports') {
-                    error_log("Ambulance report debug - ID: {$item['id']}, FullName: '{$item['fullName']}', Contact: '{$item['contact']}', Location: '{$item['location']}', ReporterId: '{$item['reporterId']}', Timestamp: '{$item['timestamp']}' | Raw: " . json_encode($d));
-                }
-                
-                // Debug: Log purpose field for tanod reports
-                if ($collection === 'tanod_reports') {
-                    error_log("Tanod report purpose debug - ID: {$item['id']}, Purpose: '{$item['purpose']}', Raw purpose: " . ($d['purpose'] ?? 'NULL') . ", Raw description: " . ($d['description'] ?? 'NULL'));
-                }
-                
                 $items[] = $item;
             }
-        } catch (Throwable $e) {}
+        } catch (Throwable $e) {
+            if (DEBUG_MODE) {
+                error_log("Error in firestore_query_latest for {$collection}: " . $e->getMessage());
+            }
+        }
     }
     // Fallback to REST API if the specific function doesn't exist
     if (count($items) < $limit) {
-        $raw = rest_list_documents($collection, 200);
+        // Reduced from 200 to limit * 2 for better performance
+        $fetchLimit = min($limit * 2, 50);
+        $raw = rest_list_documents($collection, $fetchLimit);
         foreach ($raw as $doc) {
             if (!isset($doc['name'])) continue;
             $parts = explode('/', $doc['name']);
@@ -73,16 +120,6 @@ function list_latest_reports(string $collection, int $limit = 20): array {
                 'reporterId' => $fields['reporterId'] ?? '',
                 '_created'   => $doc['createTime'] ?? null,
             ];
-            // Debug: Log ambulance report data for REST fallback
-            if ($collection === 'ambulance_reports') {
-                error_log("Ambulance report REST debug - ID: {$item['id']}, FullName: '{$item['fullName']}', Contact: '{$item['contact']}', Location: '{$item['location']}', ReporterId: '{$item['reporterId']}', Timestamp: '{$item['timestamp']}' | Raw: " . json_encode($fields));
-            }
-            
-            // Debug: Log purpose field for tanod reports
-            if ($collection === 'tanod_reports') {
-                error_log("Tanod report purpose debug (REST) - ID: {$item['id']}, Purpose: '{$item['purpose']}', Raw purpose: " . ($fields['purpose'] ?? 'NULL') . ", Raw description: " . ($fields['description'] ?? 'NULL'));
-            }
-            
             $items[] = $item;
         }
         usort($items, function($a, $b) {
@@ -100,6 +137,13 @@ function list_latest_reports(string $collection, int $limit = 20): array {
         }
         $items = $dedup;
     }
+    
+    // Cache the results before returning
+    if ($useCache && !empty($items)) {
+        $cacheKey = "reports_{$collection}_{$limit}";
+        cache_set($cacheKey, $items, 30); // 30-second cache
+    }
+    
     return $items;
 }
 
@@ -151,19 +195,45 @@ $userRole = $_SESSION['user_role'] ?? 'staff';
 $userName = $_SESSION['user_fullname'] ?? 'User';
 $isAdmin  = ($userRole === 'admin');
 
-// Determine current view (only admins can switch views)
+// Fetch user profile to check categories (for Tanod access)
+$userProfile = get_user_profile($userId);
+$userCategories = $userProfile['categories'] ?? [];
+// Check if user has 'tanod' category (case-insensitive check)
+$isTanod = false;
+if (!empty($userCategories)) {
+    foreach ($userCategories as $cat) {
+        if (strtolower($cat) === 'tanod') {
+            $isTanod = true;
+            break;
+        }
+    }
+}
+
+// Determine current view
 $view = $_GET['view'] ?? 'dashboard';
-$allowedAdminViews = ['dashboard', 'create-account', 'verify-users'];
-if (!$isAdmin || !in_array($view, $allowedAdminViews)) {
+
+// Define allowed views based on role
+$allowedViews = ['dashboard', 'live-support', 'map', 'analytics'];
+if ($isAdmin) {
+    $allowedViews[] = 'create-account';
+    $allowedViews[] = 'verify-users';
+} elseif ($isTanod) {
+    $allowedViews[] = 'verify-users';
+}
+
+// Validate view
+if (!in_array($view, $allowedViews)) {
     $view = 'dashboard';
 }
 
 // --- CATEGORY CONFIGURATION ---
 $categories = [
     'ambulance' => ['label' => 'Ambulance', 'collection' => 'ambulance_reports', 'icon' => 'truck', 'color' => 'blue'],
+    'police'    => ['label' => 'Police',    'collection' => 'police_reports',    'icon' => 'user-shield', 'color' => 'slate'],
     'tanod'     => ['label' => 'Tanod',     'collection' => 'tanod_reports',     'icon' => 'shield-check', 'color' => 'sky'],
     'fire'      => ['label' => 'Fire',      'collection' => 'fire_reports',      'icon' => 'fire', 'color' => 'red'],
     'flood'     => ['label' => 'Flood',     'collection' => 'flood_reports',     'icon' => 'home', 'color' => 'indigo'],
+    'other'     => ['label' => 'Other',     'collection' => 'other_reports',     'icon' => 'question-mark-circle', 'color' => 'gray'],
 ];
 
 // --- LAZY FIRESTORE INITIALIZATION (optimized for performance) ---
@@ -293,6 +363,8 @@ function build_recent_feed_optimized(array $categories, string $categoryFilter, 
                     'imageUrl'     => $it['imageUrl'] ?? '',
                     'status'       => $it['status'] ?? 'Pending',
                     'priority'     => $it['priority'] ?? '',
+                    'lat'          => $it['latitude'] ?? ($it['coordinates']['latitude'] ?? null),
+                    'lng'          => $it['longitude'] ?? ($it['coordinates']['longitude'] ?? null),
                     'timestamp'    => $ts,
                     'tsDisplay'    => fmt_ts($ts),
                     'collection'   => $meta['collection'],
@@ -437,6 +509,8 @@ function build_recent_feed_ultra_fast(array $categories, string $categoryFilter,
                         'priority' => $docData['priority'] ?? '',
                         'timestamp' => $ts,
                         'tsDisplay' => fmt_ts($ts),
+                        'updatedBy' => $docData['updatedBy'] ?? '',
+                        'updatedAt' => $docData['updatedAt'] ?? '',
                         'collection' => $meta['collection'],
                     ];
                 }
@@ -1014,6 +1088,7 @@ if (isset($_POST['api_action'])) {
         $password = $_POST['password'] ?? '';
         $accountTypes = $_POST['accountTypes'] ?? [];
         $categories = $_POST['categories'] ?? [];
+        $assignedBarangay = $_POST['assignedBarangay'] ?? null;
         
         // Construct full name in "Last, First Middle" format
         $fullName = $lastName;
@@ -1028,6 +1103,8 @@ if (isset($_POST['api_action'])) {
              $response['message'] = 'Account creation failed. Last name, first name, email, username and password are required.';
         } elseif (empty($accountTypes)) {
             $response['message'] = 'Account creation failed. Please select at least one account type (Staff or Responder).';
+        } elseif ((in_array('tanod', $categories) || in_array('police', $categories)) && empty($assignedBarangay)) {
+            $response['message'] = 'Account creation failed. Assigned Barangay/Outpost is required for Tanod and Police categories.';
         } else {
             try {
                 // Initialize Firebase Auth
@@ -1060,6 +1137,7 @@ if (isset($_POST['api_action'])) {
                     'roles' => $accountTypes, // Store all selected roles
                     'status' => 'approved',
                     'categories' => $categories,
+                    'assignedBarangay' => $assignedBarangay,
                     'createdAt' => date('Y-m-d H:i:s'),
                     'createdBy' => $userId,
                     'lastLogin' => null
@@ -1157,17 +1235,26 @@ if (isset($_POST['api_action'])) {
     // Admin: Clear All Cache
     if ($isAdmin && $action === 'clear_cache') {
         try {
-            // Clear session cache
-            if (isset($_SESSION['__cache'])) {
-                unset($_SESSION['__cache']);
-            }
+            // Clear file-based cache
+            $cleared = cache_clear();
             
-            // Could add other cache clearing logic here (Redis, Memcached, etc.)
+            // Also cleanup expired cache files
+            $expired = cache_cleanup_expired();
             
-            $response = ['success' => true, 'message' => 'All cache cleared successfully'];
+            // Get cache stats
+            $stats = cache_stats();
+            
+            $response = [
+                'success' => true, 
+                'message' => "Cache cleared successfully. Removed {$cleared} files ({$expired} expired).",
+                'stats' => $stats
+            ];
         } catch (Exception $e) {
             error_log("Error clearing cache: " . $e->getMessage());
-            $response['message'] = 'Failed to clear cache: ' . $e->getMessage();
+            $response = [
+                'success' => false,
+                'message' => 'Failed to clear cache: ' . $e->getMessage()
+            ];
         }
         
         if (ob_get_length()) ob_clean();
@@ -1244,11 +1331,16 @@ if (isset($_POST['api_action'])) {
             // Try regular method if fast failed
             if (!$updateSuccess && function_exists('firestore_set_document')) {
                 error_log("Trying regular update method...");
-                $updateSuccess = firestore_set_document($collection, $docId, $payload);
-                if ($updateSuccess) {
-                    error_log("Regular update successful: {$collection}/{$docId}");
-                } else {
-                    error_log("Regular update failed: {$collection}/{$docId}");
+                try {
+                    $updateSuccess = firestore_set_document($collection, $docId, $payload);
+                    if ($updateSuccess) {
+                        error_log("Regular update successful: {$collection}/{$docId}");
+                    } else {
+                        error_log("Regular update failed: {$collection}/{$docId}");
+                    }
+                } catch (Exception $e) {
+                    error_log("Regular update exception: " . $e->getMessage());
+                    $updateSuccess = false;
                 }
             }
             
@@ -1335,6 +1427,15 @@ if (isset($_POST['api_action'])) {
                 echo json_encode(['success' => true, 'message' => $successMessage]);
                 // Invalidate cached dashboard data
                 unset($_SESSION['__cache']['admin_stats'], $_SESSION['__cache']['recent_feed']);
+                
+                // Also clear all specific recent_feed_* cache keys
+                if (isset($_SESSION['__cache']) && is_array($_SESSION['__cache'])) {
+                    foreach (array_keys($_SESSION['__cache']) as $key) {
+                        if (strpos($key, 'recent_feed_') === 0) {
+                            unset($_SESSION['__cache'][$key]);
+                        }
+                    }
+                }
             } else {
                 error_log("All update methods failed: {$collection}/{$docId} to {$newStatus}");
                 echo json_encode(['success' => false, 'message' => 'Failed to update report status in database. Please check error logs.']);
@@ -1441,87 +1542,12 @@ if (isset($_POST['api_action'])) {
 
     // Admin: Reset user session for fresh start
     if ($isAdmin && $action === 'reset_user_session') {
+        // Clean output buffer to ensure valid JSON
+        if (ob_get_length()) ob_clean();
         header('Content-Type: application/json');
         unset($_SESSION['known_pending_users']);
         error_log("User session reset for fresh real-time detection");
         echo json_encode(['success' => true, 'message' => 'Session reset']);
-        exit();
-    }
-
-    // Admin: Debug - Show ALL users in database to find the issue
-    if ($isAdmin && $action === 'debug_pending_users') {
-        header('Content-Type: application/json');
-        
-        try {
-            $allUsers = [];
-            $pendingUsers = [];
-            $allUsersRaw = [];
-            global $firestore;
-            
-            if ($firestore) {
-                // First, get ALL users (no filters) to see what's actually there
-                try {
-                    $allDocs = $firestore->collection('users')->documents();
-                    foreach ($allDocs as $doc) {
-                        if ($doc->exists()) {
-                            $userData = $doc->data();
-                            $userData['id'] = $doc->id();
-                            $allUsersRaw[] = $userData;
-                            
-                            // Check for pending status in various fields
-                            $status = $userData['status'] ?? $userData['accountStatus'] ?? $userData['Status'] ?? $userData['AccountStatus'] ?? null;
-                            if ($status && strtolower($status) === 'pending') {
-                                $userData['detectedStatus'] = $status;
-                                $pendingUsers[] = $userData;
-                            }
-                        }
-                    }
-                } catch (Throwable $e) {
-                    error_log("Debug all users query error: " . $e->getMessage());
-                }
-                
-                // Also try the specific pending queries
-                $queries = [
-                    'accountStatus' => $firestore->collection('users')->where('accountStatus', '==', 'pending'),
-                    'status' => $firestore->collection('users')->where('status', '==', 'pending'),
-                    'Status' => $firestore->collection('users')->where('Status', '==', 'pending'),
-                    'AccountStatus' => $firestore->collection('users')->where('AccountStatus', '==', 'pending')
-                ];
-                
-                foreach ($queries as $field => $query) {
-                    try {
-                        $docs = $query->documents();
-                        foreach ($docs as $doc) {
-                            if ($doc->exists()) {
-                                $userData = $doc->data();
-                                $userData['id'] = $doc->id();
-                                $userData['queryField'] = $field;
-                                $allUsers[] = $userData;
-                            }
-                        }
-                    } catch (Throwable $e) {
-                        error_log("Debug query error for $field: " . $e->getMessage());
-                    }
-                }
-            }
-            
-            echo json_encode([
-                'success' => true,
-                'allPendingUsers' => $allUsers,
-                'pendingUsersDetected' => $pendingUsers,
-                'allUsersRaw' => array_slice($allUsersRaw, 0, 5), // Show first 5 users for debugging
-                'count' => count($allUsers),
-                'pendingCount' => count($pendingUsers),
-                'totalUsersInCollection' => count($allUsersRaw),
-                'sessionUsers' => $_SESSION['known_pending_users'] ?? [],
-                'sessionCount' => count($_SESSION['known_pending_users'] ?? [])
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Debug failed: ' . $e->getMessage()
-            ]);
-        }
         exit();
     }
 
@@ -1662,6 +1688,10 @@ if (isset($_POST['api_action'])) {
     
     // DEBUG: Test specific user lookup
     if ($isAdmin && $action === 'debug_user') {
+        // Clean output buffer to ensure valid JSON
+        if (ob_get_length()) ob_clean();
+        header('Content-Type: application/json');
+
         $userId = $_POST['userId'] ?? '';
         if (empty($userId)) {
             echo json_encode(['success' => false, 'message' => 'User ID required']);
@@ -1695,6 +1725,10 @@ if (isset($_POST['api_action'])) {
 
     // AJAX: Recent feed for admin dashboard with optimized caching and filtering
     if ($isAdmin && $action === 'recent_feed') {
+        // Disable error display to prevent JSON corruption
+        ini_set('display_errors', 0);
+        error_reporting(0);
+        
         $startTime = microtime(true);
         
         // Clean output buffer to ensure valid JSON
@@ -1708,9 +1742,15 @@ if (isset($_POST['api_action'])) {
         $statusFilter = trim($_POST['status'] ?? 'all');
         
         try {
-            // Create cache key based on filters with aggressive caching
+            // Check if force refresh is requested
+            $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
+            
+            // Create cache key based on filters
             $cacheKey = "recent_feed_" . md5($search . $categoryFilter . $statusFilter);
-            $cachedData = cache_get($cacheKey, 60); // 1-minute cache for real-time updates
+            
+            // Use cache only if not forcing refresh
+            // Reduced cache to 2 seconds for better realtime feel while preventing slam
+            $cachedData = $forceRefresh ? null : cache_get($cacheKey, 2); 
             
             if ($cachedData === null) {
                 // Use working optimized approach (fallback from ultra-fast)
@@ -1727,6 +1767,9 @@ if (isset($_POST['api_action'])) {
             $offset = ($page - 1) * $pageSize;
             $paginatedRecent = array_slice($cachedData, $offset, $pageSize);
             
+            // Final buffer clean before output
+            if (ob_get_length()) ob_clean();
+            
             echo json_encode([
                 'success' => true,
                 'data' => $paginatedRecent,
@@ -1742,6 +1785,9 @@ if (isset($_POST['api_action'])) {
                 'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
             ]);
         } catch (Exception $e) {
+            // Final buffer clean before error output
+            if (ob_get_length()) ob_clean();
+            
             error_log("Recent activity error: " . $e->getMessage() . " Stack: " . $e->getTraceAsString());
             echo json_encode([
                 'success' => false,
@@ -1763,7 +1809,8 @@ if (isset($_POST['api_action'])) {
         
         try {
             // Check cache first with aggressive caching for admin dashboard
-            $adminStats = cache_get('admin_stats', 60); // 1-minute cache for faster updates
+            $cacheKey = 'admin_stats_' . $userRole;
+            $adminStats = cache_get($cacheKey, 60); // 60-second cache for better performance
             
             // Check if we need to force refresh (cache busting)
             $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
@@ -1771,7 +1818,7 @@ if (isset($_POST['api_action'])) {
             if ($adminStats === null || $forceRefresh) {
                 if ($forceRefresh) {
                     // Clear cache if forcing refresh
-                    unset($_SESSION['__cache']['admin_stats']);
+                    cache_delete($cacheKey);
                     $adminStats = null;
                 }
                 
@@ -1796,10 +1843,12 @@ if (isset($_POST['api_action'])) {
                         'approved' => $countResults[$col]['approved'] ?? 0,
                         'pending'  => $countResults[$col]['pending'] ?? 0,
                         'declined' => $countResults[$col]['declined'] ?? 0,
+                        'responded' => $countResults[$col]['responded'] ?? 0,
                     ];
                 }
                 
-                cache_set('admin_stats', $adminStats);
+                // Cache the results for 60 seconds
+                cache_set($cacheKey, $adminStats, 60);
             }
             
             echo json_encode([
@@ -1897,8 +1946,8 @@ if (isset($_POST['api_action'])) {
                 'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
             ]);
         }
-    exit();
-}
+        exit();
+    }
 
     // Staff: Check for urgent reports
     if (!$isAdmin && $action === 'check_urgent') {
@@ -2181,40 +2230,6 @@ if (isset($_POST['api_action'])) {
         exit();
     }
 
-    // AJAX: Debug tanod report purpose (for testing)
-    if ($action === 'debug_tanod_purpose') {
-        header('Content-Type: application/json');
-        
-        try {
-            // Get a sample tanod report to debug
-            $items = list_latest_reports('tanod_reports', 5);
-            $debugData = [];
-            
-            foreach ($items as $item) {
-                $debugData[] = [
-                    'id' => $item['id'],
-                    'purpose' => $item['purpose'],
-                    'fullName' => $item['fullName'],
-                    'location' => $item['location'],
-                    'raw_purpose' => $item['purpose'] ?? 'NULL',
-                    'raw_description' => $item['description'] ?? 'NULL'
-                ];
-            }
-            
-            echo json_encode([
-                'success' => true,
-                'data' => $debugData,
-                'count' => count($debugData)
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to debug tanod purpose: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
     // AJAX: Get specific report data (for modal fallback)
     if ($action === 'get_report_data') {
         header('Content-Type: application/json');
@@ -2235,11 +2250,6 @@ if (isset($_POST['api_action'])) {
             if (function_exists('firestore_get_doc_by_id')) {
                 $reportData = firestore_get_doc_by_id($collection, $docId);
                 if ($reportData) {
-                    // Debug: Log the purpose field for tanod reports
-                    if ($collection === 'tanod_reports') {
-                        error_log("Direct fetch purpose debug - ID: {$docId}, Purpose: '{$reportData['purpose']}', Raw purpose: " . ($reportData['purpose'] ?? 'NULL') . ", Raw description: " . ($reportData['description'] ?? 'NULL'));
-                        error_log("Full report data for debugging: " . json_encode($reportData));
-                    }
                     echo json_encode([
                         'success' => true,
                         'data' => $reportData
@@ -2257,11 +2267,6 @@ if (isset($_POST['api_action'])) {
                 
                 if (isset($response['fields'])) {
                     $reportData = firestore_decode_fields($response['fields']);
-                    // Debug: Log the purpose field for tanod reports
-                    if ($collection === 'tanod_reports') {
-                        error_log("Direct fetch purpose debug (REST) - ID: {$docId}, Purpose: '{$reportData['purpose']}', Raw purpose: " . ($reportData['purpose'] ?? 'NULL') . ", Raw description: " . ($reportData['description'] ?? 'NULL'));
-                        error_log("Full report data for debugging (REST): " . json_encode($reportData));
-                    }
                     echo json_encode([
                         'success' => true,
                         'data' => $reportData
@@ -2282,18 +2287,28 @@ if (isset($_POST['api_action'])) {
         exit();
     }
 
-    // Staff: Check for new reports (real-time sync)
-    if (!$isAdmin && $action === 'check_new_reports') {
+    // Check for new reports (real-time sync) - For both Staff and Admin
+    if ($action === 'check_new_reports') {
         // Ensure we return JSON
         header('Content-Type: application/json');
         $lastCheckTime = $_POST['last_check'] ?? '';
         
         try {
             $newReports = [];
+            $userCategories = [];
             
-            // Get user profile to know assigned categories
-            $userProfile = get_user_profile($_SESSION['user_id']);
-            if (!$userProfile || empty($userProfile['categories'])) {
+            if ($isAdmin) {
+                // Admin checks all categories
+                $userCategories = array_keys($categories);
+            } else {
+                // Staff checks assigned categories
+                $userProfile = get_user_profile($_SESSION['user_id']);
+                if ($userProfile && !empty($userProfile['categories'])) {
+                    $userCategories = $userProfile['categories'];
+                }
+            }
+            
+            if (empty($userCategories)) {
                 echo json_encode([
                     'success' => true,
                     'hasNew' => false,
@@ -2301,8 +2316,6 @@ if (isset($_POST['api_action'])) {
                 ]);
                 exit();
             }
-            
-            $userCategories = $userProfile['categories'];
             
             foreach ($userCategories as $category) {
                 // Use the global categories array instead of undefined function
@@ -2450,6 +2463,9 @@ function svg_icon(string $name, string $class = 'w-6 h-6') {
         'x-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9.75 9.75l4.5 4.5m0-4.5l-4.5 4.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />',
         'identification' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15 9h3.75M15 12h3.75M15 15h3.75M4.5 19.5h15a2.25 2.25 0 002.25-2.25V6.75A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25v10.5A2.25 2.25 0 004.5 19.5zm6-10.125a1.875 1.875 0 11-3.75 0 1.875 1.875 0 013.75 0zm1.294 6.336a6.721 6.721 0 01-3.17.789 6.721 6.721 0 01-3.168-.789 3.376 3.376 0 016.338 0z" />',
         'user-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M17.982 18.725A7.488 7.488 0 0012 15.75a7.488 7.488 0 00-5.982 2.975m11.963 0a9 9 0 10-11.963 0m11.963 0A8.966 8.966 0 0112 21a8.966 8.966 0 01-5.982-2.275M15 9.75a3 3 0 11-6 0 3 3 0 016 0z" />',
+        'chat' => '<path stroke-linecap="round" stroke-linejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z" />',
+        'paper-airplane' => '<path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />',
+        'map-pin' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15 10.5a3 3 0 11-6 0 3 3 0 016 0z" /><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 10.5c0 7.142-7.5 11.25-7.5 11.25S4.5 17.642 4.5 10.5a7.5 7.5 0 1115 0z" />',
     ][$name] ?? '');
     return '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="'.$class.'">'.$path.'</svg>';
 }
@@ -2510,7 +2526,7 @@ function render_report_table(array $list, string $collection, array $categories)
                     data-collection="'.htmlspecialchars($collection).'"
                     data-fullname="'.htmlspecialchars($it['fullName'] ?? '').'" data-contact="'.htmlspecialchars($it['mobileNumber'] ?? $it['contact'] ?? '').'"
                     data-location="'.htmlspecialchars($it['location'] ?? '').'"'.
-                    ($collection === 'tanod_reports' ? ' data-purpose="'.htmlspecialchars($it['purpose'] ?? $it['description'] ?? '', ENT_QUOTES).'"' : ' data-purpose=""').
+                    (($collection === 'tanod_reports' || $collection === 'other_reports') ? ' data-purpose="'.htmlspecialchars($it['purpose'] ?? $it['description'] ?? '', ENT_QUOTES).'"' : ' data-purpose=""').
                     ' data-status="'.htmlspecialchars($displayStatus).'" data-timestamp="'.htmlspecialchars($tDisplay).'"'.
                     ' data-reporterid="'.htmlspecialchars($it['reporterId'] ?? '').'" data-imageurl="'.htmlspecialchars($imgUrl).'">
                     '.svg_icon('eye', 'w-4 h-4').'<span>View</span>
@@ -2758,6 +2774,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
     <meta charset="UTF-8">
     <title>ManResponde • Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <?php echo csrf_meta(); ?>
     
     <!-- Favicon -->
     <link rel="icon" type="image/png" sizes="32x32" href="responde.png">
@@ -2766,6 +2783,9 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
     <link rel="shortcut icon" href="responde.png">
     
     <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Leaflet Map -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
@@ -2829,23 +2849,25 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             --radius-3xl: 1.5rem;
         }
 
-        /* === DARK MODE VARIABLES === */
+        /* === DARK MODE VARIABLES (DISABLED) === */
+        /* 
         html.dark {
-            --white: #0f172a;
-            --gray-50: #1e293b;
-            --gray-100: #334155;
-            --gray-200: #475569;
-            --gray-300: #64748b;
-            --gray-400: #94a3b8;
-            --gray-500: #cbd5e1;
-            --gray-600: #e2e8f0;
-            --gray-700: #f1f5f9;
-            --gray-800: #f8fafc;
+            --white: #1e293b;
+            --gray-50: #334155;
+            --gray-100: #475569;
+            --gray-200: #64748b;
+            --gray-300: #94a3b8;
+            --gray-400: #cbd5e1;
+            --gray-500: #e2e8f0;
+            --gray-600: #f1f5f9;
+            --gray-700: #f8fafc;
+            --gray-800: #ffffff;
             --gray-900: #ffffff;
             
-            --glass-bg: rgba(15, 23, 42, 0.75);
-            --glass-border: rgba(255, 255, 255, 0.1);
+            --glass-bg: rgba(30, 41, 59, 0.85);
+            --glass-border: rgba(255, 255, 255, 0.15);
         }
+        */
 
         /* ========================================
            FOUNDATION STYLES
@@ -3595,9 +3617,9 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         }
 
         /* ========================================
-           DARK MODE ENHANCEMENTS
+           DARK MODE ENHANCEMENTS (DISABLED)
            ======================================== */
-        
+        /*
         html.dark body {
             background: linear-gradient(135deg, 
                 #0f172a 0%, 
@@ -3639,6 +3661,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         html.dark .kpi-value {
             color: var(--gray-100);
         }
+        */
 
         /* ========================================
            UTILITY CLASSES
@@ -3949,6 +3972,32 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             animation: pulse 2s infinite;
         }
 
+        /* Status Badges for Tables */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            line-height: 1;
+        }
+        
+        .status-badge-success {
+            background-color: #dcfce7; /* green-100 */
+            color: #166534; /* green-800 */
+        }
+        
+        .status-badge-pending {
+            background-color: #fef3c7; /* amber-100 */
+            color: #92400e; /* amber-800 */
+        }
+        
+        .status-badge-declined {
+            background-color: #fee2e2; /* red-100 */
+            color: #991b1b; /* red-800 */
+        }
+
         .activity-meta {
             display: flex;
             align-items: center;
@@ -4005,20 +4054,51 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                     <span>Dashboard</span>
                 </a>
 
+                <?php $isAnalyticsActive = ($view === 'analytics'); ?>
+                <a href="dashboard?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isAnalyticsActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
+                    </svg>
+                    <span>Analytics</span>
+                </a>
+                
+                <?php $isMapActive = ($view === 'map'); ?>
+                <a href="dashboard?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isMapActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                    </svg>
+                    <span>Interactive Map</span>
+                </a>
+
+                <?php $isLiveSupportActive = ($view === 'live-support'); ?>
+                <a href="dashboard?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isLiveSupportActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50'; ?>">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+                    </svg>
+                    <span>Live Support</span>
+                    <span id="liveSupportBadge" class="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
+                </a>
+
                 <?php if ($isAdmin): ?>
                 <?php $isCreateAccountActive = ($view === 'create-account'); ?>
                 <a href="dashboard?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isCreateAccountActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                     <?php echo svg_icon('user-plus', 'w-5 h-5'); ?>
                     <span>Create Account</span>
                 </a>
+                <?php endif; ?>
                 
+                <?php if ($isAdmin || $isTanod): ?>
                 <?php $isVerifyUsersActive = ($view === 'verify-users'); ?>
                 <!-- Link to new standalone Verify Users page -->
                 <a href="verify_users.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isVerifyUsersActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                     <?php echo svg_icon('user-check', 'w-5 h-5'); ?>
                     <span>Verify Users</span>
+                    <span id="verifyUsersBadge" class="ml-auto bg-amber-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
                 </a>
-                
+                <?php endif; ?>
+
+                <?php if ($isAdmin): ?>
                 <!-- Export Reports -->
                 <button onclick="showExportModal()" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600 w-full text-left">
                     <?php echo svg_icon('download', 'w-5 h-5'); ?>
@@ -4071,6 +4151,32 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                             <?php echo svg_icon('dashboard', 'w-5 h-5'); ?>
                             <span>Dashboard</span>
                         </a>
+
+                        <?php $isAnalyticsActive = ($view === 'analytics'); ?>
+                        <a href="dashboard?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isAnalyticsActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
+                            </svg>
+                            <span>Analytics</span>
+                        </a>
+                        
+                        <?php $isMapActive = ($view === 'map'); ?>
+                        <a href="dashboard?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isMapActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                            </svg>
+                            <span>Interactive Map</span>
+                        </a>
+
+                        <?php $isLiveSupportActive = ($view === 'live-support'); ?>
+                        <a href="dashboard?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isLiveSupportActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+                            </svg>
+                            <span>Live Support</span>
+                            <span id="liveSupportBadgeMobile" class="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
+                        </a>
                         
                         <?php if ($isAdmin): ?>
                             <?php $isCreateAccountActive = ($view === 'create-account'); ?>
@@ -4078,13 +4184,18 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                                 <?php echo svg_icon('user-plus', 'w-5 h-5'); ?>
                                 <span>Create Account</span>
                             </a>
-                            
+                        <?php endif; ?>
+                        
+                        <?php if ($isAdmin || $isTanod): ?>
                             <?php $isVerifyUsersActive = ($view === 'verify-users'); ?>
-                            <a href="dashboard?view=verify-users" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isVerifyUsersActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                            <a href="verify_users.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isVerifyUsersActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                                 <?php echo svg_icon('user-check', 'w-5 h-5'); ?>
                                 <span>Verify Users</span>
+                                <span id="verifyUsersBadgeMobile" class="ml-auto bg-amber-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
                             </a>
-                            
+                        <?php endif; ?>
+
+                        <?php if ($isAdmin): ?>
                             <!-- Export Reports for mobile -->
                             <button onclick="showExportModal(); closeMobileSidebar();" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600 w-full text-left">
                                 <?php echo svg_icon('download', 'w-5 h-5'); ?>
@@ -4111,14 +4222,23 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                         <div>
                     <h1 class="text-3xl md:text-4xl font-extrabold text-slate-900 tracking-tighter">
                         <?php
-                            if ($isAdmin && $view === 'create-account') echo 'Create Account';
+                            if ($view === 'live-support') echo 'Live Support';
+                            elseif ($isAdmin && $view === 'create-account') echo 'Create Account';
+                            elseif ($view === 'analytics') echo 'Analytics';
+                            elseif ($view === 'map') echo 'Interactive Map';
                             else echo 'Dashboard';
                         ?>
                     </h1>
                     <p class="text-slate-500 mt-1 text-base md:text-lg">
                         <?php
-                            if ($isAdmin && $view === 'create-account') {
+                            if ($view === 'live-support') {
+                                echo 'Connect with residents in real-time.';
+                            } elseif ($isAdmin && $view === 'create-account') {
                                 echo 'Create new user accounts with flexible role assignment (Staff/Responder).';
+                            } elseif ($view === 'analytics') {
+                                echo 'Comprehensive statistical overview of emergency reports.';
+                            } elseif ($view === 'map') {
+                                echo 'Real-time visualization of emergency incidents and responder locations.';
                             } else {
                                 echo 'Welcome back, '.htmlspecialchars($userName).'. Here\'s what\'s happening.';
                             }
@@ -4130,7 +4250,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                         <div class="relative">
                             <button id="notificationBell" class="relative p-3 text-slate-600 hover:text-red-600 transition-colors bg-white/80 backdrop-blur-sm rounded-full shadow-lg border border-slate-200/80">
                                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-5 5v-5zM10.5 3.75a6 6 0 0 1 6 6v3.75l2.25 2.25V12a8.25 8.25 0 0 0-8.25-8.25H6.75A8.25 8.25 0 0 0 1.5 12v3.75l2.25-2.25V9.75a6 6 0 0 1 6-6Z"></path>
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"></path>
                                 </svg>
                                 <span id="notificationBadge" class="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center hidden">0</span>
                             </button>
@@ -4151,511 +4271,63 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                 </header>
 
 
-                <?php if ($isAdmin): ?>
+                <?php if ($view === 'live-support'): ?>
+                    <?php include 'views/live_support.php'; ?>
+
+                <?php elseif ($view === 'map'): ?>
+                    <?php include 'views/interactive_map.php'; ?>
+
+                <?php elseif ($isAdmin): ?>
                     <?php if ($view === 'create-account'): ?>
-                        <section class="mb-6 animate-fade-in-up" style="--anim-delay: 100ms;">
-                            <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg shadow-sky-500/5 border border-slate-200/80 p-6 md:p-8">
-                                <div class="flex items-center gap-3 mb-2">
-                                    <span class="flex items-center justify-center w-10 h-10 bg-sky-100 rounded-lg"><?php echo svg_icon('user-plus', 'w-6 h-6 text-sky-600'); ?></span>
-                                    <h2 class="text-xl font-bold text-slate-800">Create New Account</h2>
-                                </div>
-                                <p class="text-slate-500 mb-6">Create accounts with flexible role assignment for Staff and/or Responder.</p>
+                        <?php include 'views/create_account.php'; ?>
 
-                                <div class="w-full max-w-2xl md:max-w-3xl lg:max-w-4xl xl:max-w-6xl 2xl:max-w-[1600px] mx-auto">
-                                    <form id="createAccountForm" class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg shadow-sky-500/5 border border-slate-200/80 p-6 md:p-8 space-y-8">
-                                        
-                                        <!-- Account Type Selection -->
-                                        <div class="bg-gradient-to-br from-sky-50 to-blue-50 rounded-xl p-6 border-2 border-sky-200">
-                                            <h3 class="text-lg font-bold text-slate-800 mb-3 flex items-center gap-2">
-                                                <svg class="w-6 h-6 text-sky-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
-                                                </svg>
-                                                Select Account Type(s) *
-                                            </h3>
-                                            <p class="text-sm text-slate-600 mb-4">Choose one or both roles for this account</p>
-                                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                                <label class="relative cursor-pointer">
-                                                    <input type="checkbox" name="accountTypes[]" value="staff" class="peer sr-only account-type-checkbox">
-                                                    <div class="flex flex-col items-center gap-3 p-6 bg-white rounded-xl border-2 border-slate-200 peer-checked:border-sky-500 peer-checked:bg-sky-50 peer-checked:shadow-lg transition-all hover:border-sky-300">
-                                                        <svg class="w-12 h-12 text-sky-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
-                                                        </svg>
-                                                        <div class="text-center">
-                                                            <p class="font-bold text-slate-800">Staff</p>
-                                                            <p class="text-xs text-slate-500 mt-1">Manage reports</p>
-                                                        </div>
-                                                        <div class="absolute top-2 right-2 w-6 h-6 rounded-full border-2 border-slate-300 bg-white peer-checked:bg-green-500 peer-checked:border-green-500 flex items-center justify-center transition-all">
-                                                            <svg class="w-4 h-4 text-white opacity-0 peer-checked:opacity-100" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/>
-                                                            </svg>
-                                                        </div>
-                                                    </div>
-                                                </label>
-                                                
-                                                <label class="relative cursor-pointer">
-                                                    <input type="checkbox" name="accountTypes[]" value="responder" class="peer sr-only account-type-checkbox">
-                                                    <div class="flex flex-col items-center gap-3 p-6 bg-white rounded-xl border-2 border-slate-200 peer-checked:border-emerald-500 peer-checked:bg-emerald-50 peer-checked:shadow-lg transition-all hover:border-emerald-300">
-                                                        <svg class="w-12 h-12 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.286z"/>
-                                                        </svg>
-                                                        <div class="text-center">
-                                                            <p class="font-bold text-slate-800">Responder</p>
-                                                            <p class="text-xs text-slate-500 mt-1">Emergency response</p>
-                                                        </div>
-                                                        <div class="absolute top-2 right-2 w-6 h-6 rounded-full border-2 border-slate-300 bg-white peer-checked:bg-green-500 peer-checked:border-green-500 flex items-center justify-center transition-all">
-                                                            <svg class="w-4 h-4 text-white opacity-0 peer-checked:opacity-100" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/>
-                                                            </svg>
-                                                        </div>
-                                                    </div>
-                                                </label>
-                                            </div>
-                                            <div id="roleSelectionError" class="hidden mt-3 text-sm text-red-600 font-medium">
-                                                Please select at least one account type
-                                            </div>
-                                            <div class="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                                                <p class="text-xs text-blue-800 flex items-start gap-2">
-                                                    <svg class="w-4 h-4 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-                                                    </svg>
-                                                    <span><strong>Flexible Multi-Role:</strong> You can select both roles. Staff handles report management, Responder provides emergency response. Select one or both as needed.</span>
-                                                </p>
-                                            </div>
-                                        </div>
-
-                                        <!-- Personal Information -->
-                                        <div class="bg-slate-50 rounded-xl p-6 border border-slate-200">
-                                            <h3 class="text-lg font-bold text-slate-800 mb-4">Personal Information</h3>
-                                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                                <div>
-                                                    <label for="acctLastName" class="block text-sm font-medium text-slate-700 mb-1.5">Last Name *</label>
-                                                    <input id="acctLastName" name="lastName" type="text" required class="w-full rounded-md border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder:text-slate-400 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 transition-all" placeholder="Dela Cruz">
-                                                </div>
-                                                <div>
-                                                    <label for="acctFirstName" class="block text-sm font-medium text-slate-700 mb-1.5">First Name *</label>
-                                                    <input id="acctFirstName" name="firstName" type="text" required class="w-full rounded-md border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder:text-slate-400 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 transition-all" placeholder="Juan">
-                                                </div>
-                                                <div>
-                                                    <label for="acctMiddleName" class="block text-sm font-medium text-slate-700 mb-1.5">Middle Name</label>
-                                                    <input id="acctMiddleName" name="middleName" type="text" class="w-full rounded-md border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder:text-slate-400 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 transition-all" placeholder="Santos (optional)">
-                                                </div>
-                                            </div>
-                                        </div>
-                                        
-                                        <!-- Login Credentials -->
-                                        <div class="bg-slate-50 rounded-xl p-6 border border-slate-200">
-                                            <h3 class="text-lg font-bold text-slate-800 mb-4">Login Credentials</h3>
-                                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                                <div>
-                                                    <label for="acctEmail" class="block text-sm font-medium text-slate-700 mb-1.5">Email Address *</label>
-                                                    <input id="acctEmail" name="email" type="email" required class="w-full rounded-md border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder:text-slate-400 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 transition-all" placeholder="juan.delacruz@email.com">
-                                                </div>
-                                                <div>
-                                                    <label for="acctUsername" class="block text-sm font-medium text-slate-700 mb-1.5">Username *</label>
-                                                    <input id="acctUsername" name="username" type="text" required class="w-full rounded-md border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder:text-slate-400 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 transition-all" placeholder="Unique username">
-                                                </div>
-                                                <div class="md:col-span-2">
-                                                    <label for="acctPassword" class="block text-sm font-medium text-slate-700 mb-1.5">Password *</label>
-                                                    <input id="acctPassword" name="password" type="password" required class="w-full rounded-md border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder:text-slate-400 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20 transition-all" placeholder="Strong password">
-                                                </div>
-                                            </div>
-                                        </div>
-                                        
-                                        <!-- Category Assignment -->
-                                        <div id="categorySection" class="bg-slate-50 rounded-xl p-6 border border-slate-200">
-                                            <h3 class="text-lg font-bold text-slate-800 mb-4">Assign Categories</h3>
-                                            <p class="text-sm text-slate-600 mb-4">Select which emergency types this account can manage.</p>
-                                            <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
-                                                <?php foreach ($categories as $slug => $meta): ?>
-                                                <?php if ($slug !== 'other'): ?>
-                                                <label class="custom-checkbox flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-3 py-2 shadow-sm hover:bg-sky-50 transition cursor-pointer">
-                                                    <input type="checkbox" name="categories[]" value="<?php echo htmlspecialchars($slug); ?>" class="accent-sky-600">
-                                                    <span class="box">
-                                                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="w-5 h-5 text-sky-600">
-                                                            <path d="M4.5 12.75l6 6 9-13.5" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-                                                        </svg>
-                                                    </span>
-                                                    <span class="text font-medium text-slate-700"><?php echo htmlspecialchars($meta['label']); ?></span>
-                                                </label>
-                                                <?php endif; ?>
-                                                <?php endforeach; ?>
-                                            </div>
-                                        </div>
-                                        <div class="flex justify-end mt-6">
-                                            <button type="submit" class="bg-sky-600 hover:bg-sky-700 text-white px-8 py-3 text-lg font-bold rounded-xl shadow-lg flex items-center gap-3 transition">
-                                                <span class="btn-text">Create Account</span>
-                                                <span class="btn-spinner hidden"><?php echo svg_icon('spinner', 'w-5 h-5 animate-spin'); ?></span>
-                                            </button>
-                                        </div>
-                                    </form>
-                                </div>
-                            </div>
-                        </section>
+                    <?php elseif ($view === 'analytics'): ?>
+                        <?php include 'views/analytics.php'; ?>
 
                     <?php else: // Default Admin Dashboard View ?>
-                        <!-- Premium overview with Top KPIs -->
-                        <section class="mb-6 animate-fade-in-up" style="--anim-delay: 60ms;">
-                            <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg border border-slate-200/80 p-5 md:p-6">
-                                <div class="flex flex-col gap-3">
+                        <?php include 'views/dashboard_home.php'; ?>
+                    <?php endif; ?>
+                
+                <?php else: // Staff View ?>
+                    <?php if ($view === 'analytics'): ?>
+                        <?php include 'views/analytics.php'; ?>
+                    <?php else: ?>
+                        <div class="mb-4 rounded-xl bg-white/70 backdrop-blur-sm border border-slate-200/80 shadow-sm p-4 animate-fade-in-up" style="--anim-delay: 100ms;">
+                            <p class="text-sm text-slate-600">
+                                Your assigned categories:
+                                <?php
+                                    if (!empty($userCategories)) {
+                                        foreach ($userCategories as $cat) {
+                                            $catSlug = strtolower($cat);
+                                            $catLabel = $categories[$catSlug]['label'] ?? ucfirst($cat);
+                                            echo '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 mr-2">' . htmlspecialchars($catLabel) . '</span>';
+                                        }
+                                    } else {
+                                        echo '<span class="text-slate-400 italic">None</span>';
+                                    }
+                                ?>
+                            </p>
+                        </div>
+
+                        <section class="space-y-6" id="staffReportCards">
+                            <div class="text-center py-12 text-slate-500">
+                                <div class="inline-flex items-center gap-3">
+                                    <?php echo svg_icon('spinner', 'w-5 h-5 animate-spin'); ?>
                                     <div>
-                                        <span class="brand-pill">ManResponde Command Center</span>
-                                        <h2 class="mt-2 text-2xl font-extrabold text-slate-900 tracking-tight">Overview</h2>
-                                        <p class="text-slate-500 text-sm">Realtime snapshot of total reports and decisions.</p>
-                                    </div>
-                                    <div id="topKpiContainer" class="grid grid-cols-2 md:grid-cols-4 gap-3">
-                                        <div class="kpi-card"><div class="kpi-label">Pending</div><div class="kpi-value text-amber-600">—</div></div>
-                                        <div class="kpi-card"><div class="kpi-label">Approved</div><div class="kpi-value text-emerald-600">—</div></div>
-                                        <div class="kpi-card"><div class="kpi-label">Declined</div><div class="kpi-value text-rose-600">—</div></div>
-                                        <div class="kpi-card"><div class="kpi-label">Total</div><div class="kpi-value text-slate-900">—</div></div>
-                                    </div>
-                                </div>
-                            </div>
-                        </section>
-
-                        <section class="mb-0 animate-fade-in-up" style="--anim-delay: 100ms;">
-                            <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg border border-slate-200/80 p-6">
-                                <div class="flex items-center justify-between mb-6">
-                                    <div>
-                                        <h2 class="text-2xl font-bold text-slate-800 tracking-tight">Report Statistics</h2>
-                                        <p class="text-sm text-slate-500 mt-1">Detailed breakdown by emergency categories</p>
-                                    </div>
-                                    <div class="flex items-center gap-2">
-                                        <div class="px-3 py-1 bg-emerald-100 text-emerald-700 rounded-full text-xs font-medium">Live Data</div>
-                                    </div>
-                                </div>
-                                <div id="adminStatsContainer" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 sm:gap-5">
-                                    <div class="col-span-full text-center py-10 text-slate-500">
-                                        <div class="inline-flex items-center gap-2">
-                                            <?php echo svg_icon('spinner', 'w-5 h-5 animate-spin'); ?>
-                                            Loading statistics...
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </section>
-
-                        <?php
-                        // Build Recent Activity (latest across all categories) with 5-minute cache
-                        $recentFeed = cache_get('recent_feed', 300);
-                        if ($recentFeed === null) {
-                            $recentFeed = build_recent_feed($categories);
-                            cache_set('recent_feed', $recentFeed);
-                        }
-                        ?>
-
-                        <section class="mt-6 mb-0 animate-fade-in-up" style="--anim-delay: 150ms;">
-                            <div class="glass-card p-8" data-section="recent-activity">
-                                <div class="flex items-center justify-between mb-6">
-                                    <div class="flex items-center gap-4">
-                                        <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white shadow-lg">
-                                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
-                                            </svg>
-                                        </div>
-                                        <div>
-                                            <h3 class="text-2xl font-bold text-gradient">Recent Activity</h3>
-                                            <p class="text-sm text-gray-500 mt-1">Live updates from emergency reports</p>
-                                        </div>
-                                    </div>
-                                    <div class="flex items-center gap-3">
-                                        <div class="flex items-center gap-2">
-                                            <div class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                                            <span class="text-xs text-gray-500">Live</span>
-                                        </div>
-                                        <span class="brand-pill" id="activityCount">Last 10 updates</span>
-                                    </div>
-                                </div>
-
-                                <div class="activity-filter mb-6 p-6 glass-card">
-                                    <div class="flex items-center gap-3 mb-4">
-                                        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white">
-                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
-                                            </svg>
-                                        </div>
-                                        <h4 class="font-semibold text-gray-700">Filter & Search</h4>
-                                    </div>
-                                    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-                                        <div class="relative">
-                                            <div class="input-group">
-                                                <div class="input-icon">
-                                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
-                                                    </svg>
-                                                </div>
-                                                <input id="activitySearch" type="text" placeholder="Search name or location..." class="input-premium with-icon" />
-                                            </div>
-                                        </div>
-                                        <div class="relative">
-                                            <div class="input-group">
-                                                <div class="input-icon">
-                                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
-                                                    </svg>
-                                                </div>
-                                                <select id="activityCategory" class="input-premium with-icon">
-                                                    <option value="all">All categories</option>
-                                                    <?php foreach ($categories as $slug => $meta): ?>
-                                                        <option value="<?php echo htmlspecialchars($slug); ?>"><?php echo htmlspecialchars($meta['label']); ?></option>
-                                                    <?php endforeach; ?>
-                                                </select>
-                                            </div>
-                                        </div>
-                                        <div class="relative">
-                                            <div class="input-group">
-                                                <div class="input-icon">
-                                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                                    </svg>
-                                                </div>
-                                                <select id="activityStatus" class="input-premium with-icon">
-                                                    <option value="all">All statuses</option>
-                                                    <option value="pending">Pending</option>
-                                                    <option value="approved">Approved</option>
-                                                    <option value="declined">Declined</option>
-                                                </select>
-                                            </div>
-                                        </div>
-                                        <button id="activityReset" type="button" class="btn btn-secondary w-full justify-center">
-                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
-                                            </svg>
-                                            Reset Filters
-                                        </button>
-                                    </div>
-                                </div>
-
-                                <div class="activity-scroll glass-card max-h-[500px] overflow-y-auto">
-                                    <ul id="activityList" class="p-4 space-y-3">
-                                        <div class="text-center py-12 text-gray-500">
-                                            <div class="w-16 h-16 mx-auto mb-4 rounded-full bg-gradient-to-br from-blue-100 to-purple-100 flex items-center justify-center">
-                                                <svg class="w-8 h-8 text-blue-500 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
-                                                </svg>
-                                            </div>
-                                            <p class="text-lg font-semibold">Loading recent activity...</p>
-                                            <p class="text-sm text-gray-400 mt-1">Fetching latest emergency reports</p>
-                                        </div>
-                                    </ul>
-                                </div>
-                                <div id="activityPagination" class="mt-6 flex items-center justify-between pt-4 border-t border-gray-200/50">
-                                    <div id="activityRange" class="text-sm text-gray-500 font-medium">Showing 0-0 of 0</div>
-                                    <div class="flex items-center gap-3">
-                                        <div class="flex items-center gap-2">
-                                            <label for="activityPageSize" class="text-sm text-gray-500 hidden sm:block">Rows per page:</label>
-                                            <select id="activityPageSize" class="input-premium text-sm">
-                                                <option value="10">10</option>
-                                                <option value="20" selected>20</option>
-                                                <option value="50">50</option>
-                                            </select>
-                                        </div>
-                                        <div class="flex items-center gap-1">
-                                            <button id="activityPrev" type="button" class="btn btn-secondary">
-                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
-                                                </svg>
-                                                Previous
-                                            </button>
-                                            <button id="activityNext" type="button" class="btn btn-secondary">
-                                                Next
-                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-                                                </svg>
-                                            </button>
-                                        </div>
+                                        <div class="text-lg font-medium">Loading your reports...</div>
+                                        <div class="text-sm text-slate-400">Please wait a moment.</div>
                                     </div>
                                 </div>
                             </div>
                         </section>
                     <?php endif; ?>
-                
-                <?php else: // Staff View ?>
-                    <div class="mb-4 rounded-xl bg-white/70 backdrop-blur-sm border border-slate-200/80 shadow-sm p-4 animate-fade-in-up" style="--anim-delay: 100ms;">
-                        <p class="text-sm text-slate-600">
-                            Your assigned categories:
-
-                        </p>
-                    </div>
-
-
-
-                    <section class="space-y-6" id="staffReportCards">
-                        <div class="text-center py-12 text-slate-500">
-                            <div class="inline-flex items-center gap-3">
-                                <?php echo svg_icon('spinner', 'w-5 h-5 animate-spin'); ?>
-                                <div>
-                                    <div class="text-lg font-medium">Loading your reports...</div>
-                                    <div class="text-sm text-slate-400">Please wait a moment.</div>
-                                        </div>
-                                    </div>
-                        </div>
-                    </section>
                 <?php endif; ?>
 
             </div>
         </main>
     </div>
     
-    <div id="exportModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 transition-opacity duration-300 opacity-0 pointer-events-none">
-        <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onclick="closeExportModal()"></div>
-        <div class="relative max-w-md w-full bg-white rounded-2xl shadow-xl overflow-hidden transition-transform duration-300 scale-95 opacity-0">
-            <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-                <h3 class="text-lg font-bold text-slate-800">Export Reports</h3>
-                <button class="text-slate-400 hover:text-slate-800 transition-colors" onclick="closeExportModal()"><?php echo svg_icon('x-mark', 'w-6 h-6'); ?></button>
-            </div>
-            <div class="p-6">
-                <div class="space-y-4">
-                    <div>
-                        <label class="block text-sm font-medium text-slate-700 mb-2">Category</label>
-                        <select id="exportCategory" class="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
-                            <option value="all">All Categories</option>
-                            <?php foreach ($categories as $slug => $meta): ?>
-                                <option value="<?php echo $slug; ?>"><?php echo htmlspecialchars($meta['label']); ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-slate-700 mb-2">Format</label>
-                        <div class="grid grid-cols-2 gap-3">
-                            <button type="button" onclick="exportReports('excel')" class="btn btn-primary w-full justify-center">
-                                <svg class="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
-                                    <path d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zM3 10a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zM14 9a1 1 0 00-1 1v6a1 1 0 001 1h2a1 1 0 001-1v-6a1 1 0 00-1-1h-2z"/>
-                                </svg>
-                                Excel (CSV)
-                                        </button>
-                            <button type="button" onclick="exportReports('pdf')" class="btn btn-view w-full justify-center">
-                                <svg class="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
-                                    <path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 01-1-1zm1 3a1 1 0 100 2h6a1 1 0 100-2H7z" clip-rule="evenodd"/>
-                                </svg>
-                                PDF (HTML)
-                                        </button>
-                                    </div>
-                                </div>
-                    <div class="text-xs text-slate-500">
-                        <p>• Excel: Downloads as CSV file that can be opened in Excel</p>
-                        <p>• PDF: Downloads as HTML file that can be printed or converted to PDF</p>
-                                </div>
-                                </div>
-                                </div>
-                            </div>
-    </div>
-    <!-- Confirmation Modal for Approve Action -->
-    <div id="approveModal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 transition-opacity duration-300 opacity-0 pointer-events-none">
-        <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onclick="closeApproveModal()"></div>
-        <div class="relative max-w-md w-full bg-white rounded-2xl shadow-xl overflow-hidden transition-transform duration-300 scale-95 opacity-0">
-            <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-                <h3 class="text-lg font-bold text-green-800">Approve Report</h3>
-                <button class="text-slate-400 hover:text-slate-800 transition-colors" onclick="closeApproveModal()"><?php echo svg_icon('x-mark', 'w-6 h-6'); ?></button>
-            </div>
-            <div class="p-6">
-                <div class="flex items-center mb-4">
-                    <div class="w-12 h-12 bg-green-100 rounded-full flex items-center justify-center">
-                        <?php echo svg_icon('check-circle', 'w-8 h-8 text-green-600'); ?>
-                    </div>
-                    <div class="ml-4">
-                        <h4 class="text-lg font-semibold text-gray-900">Confirm Approval</h4>
-                        <p class="text-sm text-gray-600">You are about to approve this emergency report</p>
-                    </div>
-                </div>
-
-                <div class="bg-green-50 p-4 rounded-lg mb-4">
-                    <div class="flex items-start">
-                        <div class="flex-shrink-0">
-                            <?php echo svg_icon('check-circle', 'w-5 h-5 text-green-400'); ?>
-                        </div>
-                        <div class="ml-3">
-                            <h5 class="text-sm font-medium text-green-800">What happens when you approve:</h5>
-                            <ul class="mt-2 text-sm text-green-700 list-disc list-inside">
-                                <li>Emergency responders will be notified</li>
-                                <li>Report status changes to "Approved"</li>
-                                <li>Response team will be dispatched</li>
-                            </ul>
-                        </div>
-                    </div>
-                </div>
-
-                <div id="approve-report-details" class="text-sm text-gray-600 mb-4">
-                    <!-- Report details will be populated here -->
-                </div>
-
-                <div class="flex gap-3">
-                    <button class="btn btn-secondary flex-1" onclick="closeApproveModal()">Cancel</button>
-                    <button class="btn btn-primary flex-1" onclick="confirmApprove()" style="background-color: #10b981;">
-                        <?php echo svg_icon('check-circle', 'w-4 h-4'); ?>
-                        Yes, Approve Report
-                    </button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Confirmation Modal for Decline Action -->
-    <div id="declineModal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 transition-opacity duration-300 opacity-0 pointer-events-none">
-        <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onclick="closeDeclineModal()"></div>
-        <div class="relative max-w-md w-full bg-white rounded-2xl shadow-xl overflow-hidden transition-transform duration-300 scale-95 opacity-0">
-            <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-                <h3 class="text-lg font-bold text-red-800">Decline Report</h3>
-                <button class="text-slate-400 hover:text-slate-800 transition-colors" onclick="closeDeclineModal()"><?php echo svg_icon('x-mark', 'w-6 h-6'); ?></button>
-            </div>
-            <div class="p-6">
-                <div class="flex items-center mb-4">
-                    <div class="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center">
-                        <?php echo svg_icon('x-circle', 'w-8 h-8 text-red-600'); ?>
-                    </div>
-                    <div class="ml-4">
-                        <h4 class="text-lg font-semibold text-gray-900">Confirm Decline</h4>
-                        <p class="text-sm text-gray-600">You are about to decline this emergency report</p>
-                    </div>
-                </div>
-
-                <div class="bg-red-50 p-4 rounded-lg mb-4">
-                    <div class="flex items-start">
-                        <div class="flex-shrink-0">
-                            <?php echo svg_icon('x-circle', 'w-5 h-5 text-red-400'); ?>
-                        </div>
-                        <div class="ml-3">
-                            <h5 class="text-sm font-medium text-red-800">What happens when you decline:</h5>
-                            <ul class="mt-2 text-sm text-red-700 list-disc list-inside">
-                                <li>Reporter will be notified of the decline</li>
-                                <li>They will receive instructions to resubmit</li>
-                                <li>No emergency response will be dispatched</li>
-                            </ul>
-                        </div>
-                    </div>
-                </div>
-
-                <div id="decline-report-details" class="text-sm text-gray-600 mb-4">
-                    <!-- Report details will be populated here -->
-                </div>
-
-                <div class="mb-4">
-                    <label for="declineReason" class="block text-sm font-medium text-gray-700 mb-2">
-                        Reason for Decline <span class="text-red-500">*</span>
-                    </label>
-                    <textarea 
-                        id="declineReason" 
-                        name="declineReason" 
-                        rows="3" 
-                        class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none text-sm"
-                        placeholder="Please provide a clear reason for declining this report (e.g., insufficient information, duplicate report, not an emergency, etc.)"
-                        required
-                        maxlength="500"></textarea>
-                    <div class="flex justify-between items-center mt-1">
-                        <p class="text-xs text-gray-500">This reason will be sent to the reporter in the notification.</p>
-                        <span class="text-xs text-gray-400" id="reasonCharCount">0/500</span>
-                    </div>
-                </div>
-
-                <div class="flex gap-3">
-                    <button class="btn btn-secondary flex-1" onclick="closeDeclineModal()">Cancel</button>
-                    <button class="btn btn-danger flex-1" onclick="confirmDecline()" style="background-color: #dc2626; color: white;">
-                        <?php echo svg_icon('x-circle', 'w-4 h-4'); ?>
-                        Yes, Decline Report
-                    </button>
-                </div>
-            </div>
-        </div>
-    </div>
+    <?php include 'includes/modals_dashboard.php'; ?>
     
     <div id="reportModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 transition-all duration-500 opacity-0 pointer-events-none backdrop-blur-sm">
         <div class="absolute inset-0 bg-gradient-to-br from-slate-900/80 via-slate-800/70 to-slate-900/80" onclick="closeReportModal()"></div>
@@ -4743,6 +4415,15 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                                         Location
                                     </label>
                                     <div id="m_location" class="text-base font-semibold text-gray-700 p-3 bg-gray-50/80 rounded-xl border border-gray-200">—</div>
+                                    
+                                    <!-- Embedded Map Container -->
+                                    <div id="m_map_container" class="hidden mt-3 rounded-xl overflow-hidden border border-gray-200 shadow-sm">
+                                        <div id="m_map" class="w-full h-64 z-0"></div>
+                                        <div class="bg-gray-50 px-3 py-2 text-xs text-gray-500 flex justify-between items-center border-t border-gray-200">
+                                            <span><i class="fas fa-map-marker-alt mr-1"></i> Incident Location</span>
+                                            <span id="m_map_status">Loading map...</span>
+                                        </div>
+                                    </div>
                                 </div>
                                 
                                 <div class="space-y-2">
@@ -4880,14 +4561,39 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             authDomain: "ibantayv2.firebaseapp.com",
             projectId: "ibantayv2"
         };
+        
+        // CSRF Token Helper
+        function getCsrfToken() {
+            const meta = document.querySelector('meta[name="csrf-token"]');
+            return meta ? meta.getAttribute('content') : '';
+        }
+        
+        // Enhanced FormData with CSRF token
+        function createFormDataWithCsrf() {
+            const formData = new FormData();
+            formData.append('<?php echo CSRF_TOKEN_NAME; ?>', getCsrfToken());
+            return formData;
+        }
+        
+        // Automatically add CSRF token to all FormData instances
+        const originalFormData = window.FormData;
+        window.FormData = function(form) {
+            const formData = new originalFormData(form);
+            const csrfToken = getCsrfToken();
+            if (csrfToken && !formData.has('<?php echo CSRF_TOKEN_NAME; ?>')) {
+                formData.append('<?php echo CSRF_TOKEN_NAME; ?>', csrfToken);
+            }
+            return formData;
+        };
     </script>
     
     <script>
     // Ensure theme preference is applied ASAP
     (function() {
       try {
-        const pref = localStorage.getItem('theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-        if (pref === 'dark') document.documentElement.classList.add('dark');
+        // Force light mode as per user request
+        document.documentElement.classList.remove('dark');
+        localStorage.setItem('theme', 'light');
       } catch(e) {}
     })();
     </script>
@@ -4956,14 +4662,14 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         // Helper function to normalize Firebase document data (handle field mapping for different report types)
         function normalizeFirebaseReportData(reportData) {
             // All report types have the same basic fields: contact, fullName, imageUrl, location, reporterId, status, timestamp
-            // None have purpose or description fields
+            // Some reports (like other_reports) might have description
             const mobileNumber = reportData.mobileNumber || reportData.contact || reportData.reporterContact || '';
             return {
                 fullName: reportData.fullName || reportData.reporterName || '',
                 contact: mobileNumber,
                 mobileNumber: mobileNumber, // Preserve both for compatibility
                 location: reportData.location || '',
-                purpose: '', // All reports don't have purpose or description fields
+                purpose: reportData.purpose || reportData.description || '', // Updated to include description
                 reporterId: reportData.reporterId || '',
                 imageUrl: reportData.imageUrl || '',
                 status: reportData.status || 'Pending',
@@ -5076,7 +4782,25 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
 
         // --- NOTIFICATION SOUND ---
         // Create a simple notification sound
-        function playNotificationSound() {
+        function playNotificationSound(soundType = 'default') {
+            // Special handling for emergency siren
+            if (soundType === 'siren') {
+                try {
+                    const audio = new Audio('alarmsiren.mp3');
+                    audio.volume = 1.0; // Max volume for emergency
+                    audio.play().then(() => {
+                        console.log('Emergency siren played');
+                    }).catch(e => {
+                        console.error('Siren play failed:', e);
+                        // Fallback to default sound if siren fails
+                        playNotificationSound('default');
+                    });
+                    return;
+                } catch (e) {
+                    console.error('Siren error:', e);
+                }
+            }
+
             try {
                 // Try multiple methods to ensure sound plays
                 
@@ -5157,9 +4881,9 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         window.playNotificationSound = playNotificationSound;
         
         // Enhanced notification with visual feedback
-        function showNotificationWithSound(message, type = 'success') {
+        function showNotificationWithSound(message, type = 'success', soundType = 'default') {
             // Play sound
-            playNotificationSound();
+            playNotificationSound(soundType);
             
             // Show toast with enhanced visual feedback
             showToast(message, type);
@@ -5199,6 +4923,8 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
     
             try {
                 const formData = new FormData(form);
+                // Add CSRF token
+                formData.append('<?php echo CSRF_TOKEN_NAME; ?>', getCsrfToken());
                 if (!formData.has('api_action')) {
                     let action = 'update_status';
                     if (form.id === 'createStaffForm') action = 'create_staff';
@@ -5261,6 +4987,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             
             try {
                 const formData = new FormData(form);
+                formData.append('<?php echo CSRF_TOKEN_NAME; ?>', getCsrfToken());
                 formData.append('api_action', 'update_status');
                 
                 const response = await fetch(window.location.href, {
@@ -5702,7 +5429,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                 
                 // Also do a full refresh to ensure data consistency
                 setTimeout(async () => {
-                    const formData = new FormData();
+                    const formData = createFormDataWithCsrf();
                     formData.append('api_action', 'load_staff_data');
                     
                     try {
@@ -5832,6 +5559,35 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         // Attach listener for Admin 'Create Account' form (unified Staff/Responder)
         const createAccountForm = document.getElementById('createAccountForm');
         if (createAccountForm) {
+            // Handle Tanod and Police Barangay/Outpost Selection
+            const tanodCheckbox = createAccountForm.querySelector('input[name="categories[]"][value="tanod"]');
+            const policeCheckbox = createAccountForm.querySelector('input[name="categories[]"][value="police"]');
+            const barangaySection = document.getElementById('barangaySelection');
+            const barangaySelect = document.getElementById('assignedBarangay');
+
+            function toggleBarangaySelection() {
+                const isTanod = tanodCheckbox && tanodCheckbox.checked;
+                const isPolice = policeCheckbox && policeCheckbox.checked;
+
+                if (isTanod || isPolice) {
+                    barangaySection.classList.remove('hidden');
+                    barangaySelect.required = true;
+                } else {
+                    barangaySection.classList.add('hidden');
+                    barangaySelect.required = false;
+                    barangaySelect.value = '';
+                }
+            }
+
+            if (barangaySection && barangaySelect) {
+                if (tanodCheckbox) {
+                    tanodCheckbox.addEventListener('change', toggleBarangaySelection);
+                }
+                if (policeCheckbox) {
+                    policeCheckbox.addEventListener('change', toggleBarangaySelection);
+                }
+            }
+
             createAccountForm.addEventListener('submit', async (e) => {
                 e.preventDefault();
                 
@@ -6065,6 +5821,95 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             setText('m_contact', ds.contact);
             setText('m_location', ds.location);
             setText('m_reporterId', ds.reporterid);
+
+            // --- MAP INITIALIZATION ---
+            const mapContainer = document.getElementById('m_map_container');
+            const mapStatus = document.getElementById('m_map_status');
+            
+            // Reset map container
+            if (mapContainer) {
+                mapContainer.classList.add('hidden');
+                if (window.reportMap) {
+                    window.reportMap.remove();
+                    window.reportMap = null;
+                }
+            }
+
+            if (ds.location && ds.location !== '—' && ds.location.trim() !== '' && mapContainer) {
+                mapContainer.classList.remove('hidden');
+                if (mapStatus) mapStatus.textContent = 'Locating...';
+                
+                // Function to init map
+                const initMap = (lat, lng, label) => {
+                    setTimeout(() => {
+                        if (window.reportMap) {
+                            window.reportMap.remove();
+                            window.reportMap = null;
+                        }
+                        
+                        // Create map instance
+                        window.reportMap = L.map('m_map').setView([lat, lng], 16);
+                        
+                        // Add OpenStreetMap tile layer
+                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                        }).addTo(window.reportMap);
+                        
+                        // Add marker
+                        L.marker([lat, lng]).addTo(window.reportMap)
+                            .bindPopup(label)
+                            .openPopup();
+                            
+                        // Force map redraw after modal animation to prevent gray tiles
+                        setTimeout(() => {
+                            window.reportMap.invalidateSize();
+                        }, 300);
+                        
+                        if (mapStatus) mapStatus.textContent = 'Location found';
+                    }, 100);
+                };
+
+                // 0. Check for direct coordinates from dataset
+                if (ds.lat && ds.lng && ds.lat !== 'null' && ds.lng !== 'null' && !isNaN(parseFloat(ds.lat)) && !isNaN(parseFloat(ds.lng))) {
+                     initMap(parseFloat(ds.lat), parseFloat(ds.lng), ds.location);
+                } else {
+                    // 1. Try to parse coordinates from string (e.g. "14.5, 121.0")
+                    const coordMatch = ds.location.match(/(-?\d+\.\d+),\s*(-?\d+\.\d+)/);
+                    
+                    if (coordMatch) {
+                        const lat = parseFloat(coordMatch[1]);
+                        const lng = parseFloat(coordMatch[2]);
+                        initMap(lat, lng, ds.location);
+                    } else {
+                        // 2. Geocode address using Nominatim
+                        // Append 'Philippines' context if not present to improve accuracy
+                        let queryStr = ds.location;
+                        if (!queryStr.toLowerCase().includes('philippines')) {
+                            queryStr += ', Philippines';
+                        }
+                        
+                        const query = encodeURIComponent(queryStr);
+                        
+                        fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${query}&limit=1`)
+                            .then(res => res.json())
+                            .then(data => {
+                                if (data && data.length > 0) {
+                                    const lat = parseFloat(data[0].lat);
+                                    const lng = parseFloat(data[0].lon);
+                                    initMap(lat, lng, ds.location);
+                                } else {
+                                    if (mapStatus) mapStatus.textContent = 'Location not found on map';
+                                    // Fallback to Manila
+                                    initMap(14.5995, 120.9842, 'Location not found: ' + ds.location);
+                                }
+                            })
+                            .catch(err => {
+                                console.error('Geocoding error:', err);
+                                if (mapStatus) mapStatus.textContent = 'Map error';
+                            });
+                    }
+                }
+            }
             
             // If contact is empty or "—", fetch from Firebase to get mobileNumber
             if (!ds.contact || ds.contact === '—' || ds.contact.trim() === '') {
@@ -6105,8 +5950,8 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             setText('m_purpose', purposeValue || '—');
             
             
-            // If tanod report and purpose still empty, fetch directly from DB as a fallback
-            if (ds.collection === 'tanod_reports') {
+            // If tanod report or other report and purpose still empty, fetch directly from DB as a fallback
+            if (ds.collection === 'tanod_reports' || ds.collection === 'other_reports') {
                 const pv = (purposeValue || '').trim();
                 if (!pv || pv === '—') {
                     try {
@@ -6130,9 +5975,9 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                     }
                 }
             }
-// Show Purpose field for tanod reports, hide for others
+// Show Purpose field for tanod reports and other reports, hide for others
             const purposeContainer = document.getElementById('m_purpose').parentElement;
-            if (ds.collection === 'tanod_reports') {
+            if (ds.collection === 'tanod_reports' || ds.collection === 'other_reports') {
                 purposeContainer.style.display = '';
             } else {
                 purposeContainer.style.display = 'none';
@@ -6540,6 +6385,15 @@ const meta = categories[ds.slug] || {};
             });
         })();
 
+        // Initialize global refresh function placeholder
+        window.refreshRecentActivity = function() { 
+            if (typeof loadRecentPage === 'function') {
+                loadRecentPage(currentPage);
+            } else {
+                console.log('Recent activity refresh not initialized yet'); 
+            }
+        };
+
         (function() {
             const list = document.getElementById('activityList');
             if (!list) return;
@@ -6554,12 +6408,16 @@ const meta = categories[ds.slug] || {};
             let pageSize = pageSizeEl ? parseInt(pageSizeEl.value || '20', 10) : 20;
 
             // Enhanced loading with retry mechanism and better error handling
-            async function loadRecentPage(page = 1, retryCount = 0) {
+            async function loadRecentPage(page = 1, retryCount = 0, forceRefresh = false) {
                 const maxRetries = 3;
                 const retryDelay = 1000 * Math.pow(2, retryCount); // Exponential backoff
                 
-                // Show loading state with better feedback
-                if (retryCount === 0) {
+                // Show loading state with better feedback only on first load or explicit page change
+                // Don't show full loading spinner on background refreshes
+                const isBackgroundRefresh = window.isBackgroundRefresh === true;
+                window.isBackgroundRefresh = false; // Reset flag
+
+                if (retryCount === 0 && !isBackgroundRefresh && !forceRefresh) {
                     list.innerHTML = `
                         <div class="text-center py-16">
                             <div class="w-16 h-16 mx-auto mb-4 rounded-full bg-gradient-to-br from-blue-100 to-purple-100 flex items-center justify-center">
@@ -6586,6 +6444,13 @@ const meta = categories[ds.slug] || {};
                     fd.append('category', categoryEl ? categoryEl.value : 'all');
                     fd.append('status', statusEl ? statusEl.value : 'all');
                     
+                    if (forceRefresh) {
+                        fd.append('force_refresh', 'true');
+                    }
+                    
+                    // Add timestamp to prevent browser caching
+                    fd.append('_t', Date.now());
+                    
                     const res = await fetch(window.location.href, {
                         method: 'POST',
                         body: fd
@@ -6604,6 +6469,11 @@ const meta = categories[ds.slug] || {};
                     total = Number(json.total || 0);
                     currentPage = Number(json.page || page);
                     const data = Array.isArray(json.data) ? json.data : [];
+                    
+                    // Initialize server signature from the response if available
+                    if (json.signature && page === 1) {
+                        window.lastServerSignature = json.signature;
+                    }
                     
                     // Store recent feed data globally for modal fallback
                     window.recentFeedData = data;
@@ -6629,6 +6499,22 @@ const meta = categories[ds.slug] || {};
                                         borderColor: 'border-red-200',
                                         label: 'Declined'
                                     };
+                                case 'responded':
+                                    return {
+                                        bgColor: 'from-blue-500 to-cyan-600',
+                                        textColor: 'text-blue-700',
+                                        dotColor: 'bg-blue-500',
+                                        borderColor: 'border-blue-200',
+                                        label: 'Responded'
+                                    };
+                                case 'resolved':
+                                    return {
+                                        bgColor: 'from-gray-500 to-slate-600',
+                                        textColor: 'text-gray-700',
+                                        dotColor: 'bg-gray-500',
+                                        borderColor: 'border-gray-200',
+                                        label: 'Resolved'
+                                    };
                                 default:
                                     return {
                                         bgColor: 'from-yellow-500 to-amber-600',
@@ -6651,6 +6537,7 @@ const meta = categories[ds.slug] || {};
                             data-location="${esc(row.location)}" data-purpose="${esc(row.purpose)}"
                             data-reporterid="${esc(row.reporterId)}" data-imageurl="${esc(row.imageUrl)}"
                             data-status="${esc(st)}" data-timestamp="${esc(row.tsDisplay)}"
+                            data-lat="${esc(row.lat)}" data-lng="${esc(row.lng)}"
                             class="glass-card p-5 cursor-pointer animate-fade-in-up group hover:scale-[1.02] transition-all duration-300"
                             style="--anim-delay: ${index * 50}ms"
                         >
@@ -6856,16 +6743,67 @@ const meta = categories[ds.slug] || {};
                 };
                 warmCache();
             }, 2000);
+
+            // Expose loadRecentPage to global scope
+            window.loadRecentPage = loadRecentPage;
+            
+            // Override global refresh function
+            window.refreshRecentActivity = function() {
+                window.isBackgroundRefresh = true; // Use background refresh to avoid spinner
+                loadRecentPage(currentPage);
+            };
+
+            // Check for updates every 2 seconds (Faster polling for realtime feel)
+            async function checkForUpdates() {
+                // Only poll if tab is visible to save resources
+                if (document.hidden) return;
+                
+                try {
+                    const categoryEl = document.getElementById('activityCategory');
+                    const statusEl = document.getElementById('activityStatus');
+                    
+                    const fd = new FormData();
+                    fd.append('api_action', 'check_recent_updates');
+                    fd.append('category', categoryEl ? categoryEl.value : 'all');
+                    fd.append('status', statusEl ? statusEl.value : 'all');
+                    
+                    const res = await fetch(window.location.href, { method: 'POST', body: fd });
+                    const json = await res.json();
+                    
+                    if (json.success) {
+                        // If we have a new signature that is different from our last known one
+                        // This ensures we only reload the full list when there is actually new data
+                        // We use a simple MD5-like comparison (server sends MD5, we can't easily MD5 on client without lib)
+                        // So we rely on the server sending a signature, and we just check if it changed from what we last saw
+                        // Wait, we can't compare server MD5 with client string.
+                        // Let's just store the server signature!
+                        
+                        if (json.signature && json.signature !== window.lastServerSignature) {
+                            console.log('New activity detected (signature change), refreshing feed...');
+                            window.lastServerSignature = json.signature; // Update immediately to prevent double refresh
+                            window.isBackgroundRefresh = true;
+                            // Force refresh to bypass cache
+                            loadRecentPage(currentPage, 0, true);
+                        }
+                    }
+                } catch (e) {
+                    // Silent fail for background checks
+                    // console.error('Failed to check for updates:', e);
+                }
+            }
+
+            setInterval(checkForUpdates, 2000);
         })();
 
         // KPI Helper Functions for Overview Section
         function getKpiAggregatesFromStats(stats) {
-            let totalPending = 0, totalApproved = 0, totalDeclined = 0, grandTotal = 0;
+            let totalPending = 0, totalApproved = 0, totalDeclined = 0, totalResponded = 0, grandTotal = 0;
             
             Object.values(stats).forEach(stat => {
                 totalPending += parseInt(stat.pending || 0);
                 totalApproved += parseInt(stat.approved || 0);
                 totalDeclined += parseInt(stat.declined || 0);
+                totalResponded += parseInt(stat.responded || 0);
                 grandTotal += parseInt(stat.total || 0);
             });
             
@@ -6873,6 +6811,7 @@ const meta = categories[ds.slug] || {};
                 pending: totalPending,
                 approved: totalApproved,
                 declined: totalDeclined,
+                responded: totalResponded,
                 total: grandTotal
             };
         }
@@ -6940,6 +6879,7 @@ const meta = categories[ds.slug] || {};
                 const kpis = [
                     { key: 'pending', label: 'Pending', value: aggregates.pending, color: 'amber' },
                     { key: 'approved', label: 'Approved', value: aggregates.approved, color: 'emerald' },
+                    { key: 'responded', label: 'Responded', value: aggregates.responded, color: 'cyan' },
                     { key: 'declined', label: 'Declined', value: aggregates.declined, color: 'rose' },
                     { key: 'total', label: 'Total', value: aggregates.total, color: 'slate' }
                 ];
@@ -6966,6 +6906,7 @@ const meta = categories[ds.slug] || {};
                             const colors = {
                                 'amber': '#f59e0b',
                                 'emerald': '#10b981',
+                                'cyan': '#06b6d4',
                                 'rose': '#f43f5e',
                                 'slate': '#64748b'
                             };
@@ -7010,7 +6951,7 @@ const meta = categories[ds.slug] || {};
             `;
             
             try {
-                const formData = new FormData();
+                const formData = createFormDataWithCsrf();
                 formData.append('api_action', 'load_admin_stats');
                 formData.append('force_refresh', 'true'); // Force fresh data
                 
@@ -7032,15 +6973,17 @@ const meta = categories[ds.slug] || {};
                         
                         // Render stats cards
                         Object.entries(categories).forEach(([slug, meta]) => {
-                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0 };
+                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0, responded: 0 };
                             const total = Math.max(0, parseInt(stat.total) || 0);
                             const approved = Math.max(0, parseInt(stat.approved) || 0);
                             const pending = Math.max(0, parseInt(stat.pending) || 0);
                             const declined = Math.max(0, parseInt(stat.declined) || 0);
+                            const responded = Math.max(0, parseInt(stat.responded) || 0);
                             
                             const approvedPct = total > 0 ? Math.round((approved / total) * 100) : 0;
                             const pendingPct = total > 0 ? Math.round((pending / total) * 100) : 0;
                             const declinedPct = total > 0 ? Math.round((declined / total) * 100) : 0;
+                            const respondedPct = total > 0 ? Math.round((responded / total) * 100) : 0;
                             
                             const card = document.createElement('div');
                             card.className = 'stat-card p-5';
@@ -7054,44 +6997,55 @@ const meta = categories[ds.slug] || {};
                                         <p class="text-xs text-slate-500">Overview</p>
                                     </div>
                                 </div>
-                                <div class="grid grid-cols-3 gap-3 text-center mb-4">
+                                <div class="grid grid-cols-4 gap-2 text-center mb-4">
                                     <div>
-                                        <div class="text-4xl font-extrabold text-amber-600 tracking-tighter">
+                                        <div class="text-2xl font-extrabold text-amber-600 tracking-tighter">
                                             <span data-countup="${pending}" data-status="pending">${pending}</span>
                                         </div>
-                                        <div class="text-xs text-slate-500 uppercase tracking-wider font-medium">Pending</div>
+                                        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium">Pend</div>
                                     </div>
                                     <div>
-                                        <div class="text-4xl font-extrabold text-emerald-600 tracking-tighter">
+                                        <div class="text-2xl font-extrabold text-emerald-600 tracking-tighter">
                                             <span data-countup="${approved}" data-status="approved">${approved}</span>
                                         </div>
-                                        <div class="text-xs text-slate-500 uppercase tracking-wider font-medium">Approved</div>
+                                        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium">Appr</div>
                                     </div>
                                     <div>
-                                        <div class="text-4xl font-extrabold text-red-600 tracking-tighter">
+                                        <div class="text-2xl font-extrabold text-cyan-600 tracking-tighter">
+                                            <span data-countup="${responded}" data-status="responded">${responded}</span>
+                                        </div>
+                                        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium">Resp</div>
+                                    </div>
+                                    <div>
+                                        <div class="text-2xl font-extrabold text-red-600 tracking-tighter">
                                             <span data-countup="${declined}" data-status="declined">${declined}</span>
                                         </div>
-                                        <div class="text-xs text-slate-500 uppercase tracking-wider font-medium">Declined</div>
+                                        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium">Decl</div>
                                     </div>
                                 </div>
                                 <div class="space-y-2">
                                     <div class="progress-track">
                                         <span class="progress-seg pending" data-w="${pendingPct}%"></span>
                                         <span class="progress-seg approved" data-w="${approvedPct}%"></span>
+                                        <span class="progress-seg responded" style="background-color: #06b6d4;" data-w="${respondedPct}%"></span>
                                         <span class="progress-seg declined" data-w="${declinedPct}%"></span>
                                     </div>
-                                    <div class="flex items-center justify-between text-xs text-slate-500">
-                                        <div class="flex items-center gap-2">
-                                            <span class="inline-block w-2.5 h-2.5 rounded-full bg-amber-500"></span>
-                                            <span>${pendingPct}% Pending</span>
+                                    <div class="grid grid-cols-2 gap-1 text-[10px] text-slate-500">
+                                        <div class="flex items-center gap-1">
+                                            <span class="inline-block w-2 h-2 rounded-full bg-amber-500"></span>
+                                            <span>${pendingPct}% Pend</span>
                                         </div>
-                                        <div class="flex items-center gap-2">
-                                            <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
-                                            <span>${approvedPct}% Approved</span>
+                                        <div class="flex items-center gap-1">
+                                            <span class="inline-block w-2 h-2 rounded-full bg-emerald-500"></span>
+                                            <span>${approvedPct}% Appr</span>
                                         </div>
-                                        <div class="flex items-center gap-2">
-                                            <span class="inline-block w-2.5 h-2.5 rounded-full bg-red-500"></span>
-                                            <span>${declinedPct}% Declined</span>
+                                        <div class="flex items-center gap-1">
+                                            <span class="inline-block w-2 h-2 rounded-full bg-cyan-500"></span>
+                                            <span>${respondedPct}% Resp</span>
+                                        </div>
+                                        <div class="flex items-center gap-1">
+                                            <span class="inline-block w-2 h-2 rounded-full bg-red-500"></span>
+                                            <span>${declinedPct}% Decl</span>
                                         </div>
                                     </div>
                                 </div>
@@ -7225,7 +7179,7 @@ const meta = categories[ds.slug] || {};
         };
 
         // Admin: Load dashboard statistics asynchronously
-        <?php if ($isAdmin && $view === 'dashboard'): ?>
+        <?php if ($isAdmin && $view === 'analytics'): ?>
         (async () => {
             try {
                 // Show loading states for both sections
@@ -8334,8 +8288,20 @@ const meta = categories[ds.slug] || {};
                                 });
                             }
                             
+                            // Determine sound type based on new reports
+                            let soundType = 'default';
+                            if (result.data && Array.isArray(result.data)) {
+                                const hasEmergency = result.data.some(item => {
+                                    const cat = (item.category || '').toLowerCase();
+                                    return cat === 'ambulance' || cat === 'fire';
+                                });
+                                if (hasEmergency) {
+                                    soundType = 'siren';
+                                }
+                            }
+
                             // Show notification with sound and visual effects
-                            showNotificationWithSound('🆕 New reports received!', 'success');
+                            showNotificationWithSound('🆕 New reports received!', 'success', soundType);
                         }
                     }
                 } catch (error) {
@@ -8442,11 +8408,9 @@ const meta = categories[ds.slug] || {};
 
         // Add manual refresh function
         window.refreshStaffReports = async function() {
-            try {
-                const formData = new FormData();
-                formData.append('api_action', 'load_staff_data');
-                
-                const response = await fetch(window.location.href, {
+                try {
+                    const formData = createFormDataWithCsrf();
+                    formData.append('api_action', 'load_staff_data');                const response = await fetch(window.location.href, {
                     method: 'POST',
                     body: formData
                 });
@@ -8563,6 +8527,7 @@ const meta = categories[ds.slug] || {};
                 const pendingItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'pending');
                 const approvedItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'approved');
                 const declinedItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'declined');
+                const respondedItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'responded');
                 // Emergency alerts section removed
                 let emergencySection = '';
                 // --- PAGINATION LOGIC ---
@@ -8593,6 +8558,10 @@ const meta = categories[ds.slug] || {};
                             <button type="button" class="seg-btn" data-tab="declined" onclick="switchTab('${slug}', 'declined')">
                                 <span class="seg-label">Declined</span>
                                 <span class="tab-count">${declinedItems.length}</span>
+                            </button>
+                            <button type="button" class="seg-btn" data-tab="responded" onclick="switchTab('${slug}', 'responded')">
+                                <span class="seg-label">Responded</span>
+                                <span class="tab-count">${respondedItems.length}</span>
                             </button>
                         </div>
                     </div>
@@ -8659,6 +8628,37 @@ const meta = categories[ds.slug] || {};
                             const paginatedDeclined = declinedItems.slice(startIdx, endIdx);
                             return `
                                 ${renderReportsTable(paginatedDeclined, meta.collection, categories)}
+                                <div class='flex items-center justify-between mt-4'>
+                                    <div class='text-sm text-slate-600 font-semibold bg-slate-100 px-4 py-2 rounded-lg shadow-sm'>
+                                        <span class='inline-block mr-2 text-blue-600 font-bold'>Showing</span>
+                                        <span class='inline-block'>${total === 0 ? 0 : startIdx + 1}-${endIdx}</span>
+                                        <span class='inline-block mx-2'>of</span>
+                                        <span class='inline-block font-bold'>${total}</span>
+                                    </div>
+                                    <div class='flex items-center gap-2 bg-slate-50 px-3 py-2 rounded-lg shadow-sm'>
+                                        <label for='staffPageSize' class='mr-2 text-sm font-medium text-slate-700'>Rows:</label>
+                                        <select id='staffPageSize' class='border border-blue-300 rounded-lg px-2 py-1 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all'>
+                                            <option value='10' ${pageSize === 10 ? 'selected' : ''}>10</option>
+                                            <option value='20' ${pageSize === 20 ? 'selected' : ''}>20</option>
+                                            <option value='50' ${pageSize === 50 ? 'selected' : ''}>50</option>
+                                        </select>
+                                        <button id='staffPrev' class='ml-4 px-3 py-1 border border-blue-300 rounded-lg text-sm font-semibold text-blue-700 bg-white hover:bg-blue-50 transition-all ${page === 1 ? 'opacity-50 cursor-not-allowed' : ''}'>Prev</button>
+                                        <button id='staffNext' class='px-3 py-1 border border-blue-300 rounded-lg text-sm font-semibold text-blue-700 bg-white hover:bg-blue-50 transition-all ${endIdx >= total ? 'opacity-50 cursor-not-allowed' : ''}'>Next</button>
+                                    </div>
+                                </div>
+                            `;
+                        })()}
+                    </div>
+                    <div class="panel-content" data-slug="${slug}" data-tab="responded">
+                        ${(() => {
+                            const page = window.staffPagination.page;
+                            const pageSize = window.staffPagination.pageSize;
+                            const total = respondedItems.length;
+                            const startIdx = (page - 1) * pageSize;
+                            const endIdx = Math.min(startIdx + pageSize, total);
+                            const paginatedResponded = respondedItems.slice(startIdx, endIdx);
+                            return `
+                                ${renderReportsTable(paginatedResponded, meta.collection, categories)}
                                 <div class='flex items-center justify-between mt-4'>
                                     <div class='text-sm text-slate-600 font-semibold bg-slate-100 px-4 py-2 rounded-lg shadow-sm'>
                                         <span class='inline-block mr-2 text-blue-600 font-bold'>Showing</span>
@@ -9264,11 +9264,11 @@ const meta = categories[ds.slug] || {};
         ];
         
         // Watch each collection for new documents
-        reportCollections.forEach(collection => {
+        reportCollections.forEach(colName => {
             try {
                 // Use collection query to listen for new documents
                 const q = query(
-                    collection(db, collection),
+                    collection(db, colName),
                     where('status', '==', 'Pending'),
                     orderBy('timestamp', 'desc'),
                     limit(1)
@@ -9300,7 +9300,7 @@ const meta = categories[ds.slug] || {};
                             
                             // Only create notification for documents created in the last 5 minutes
                             if (timeDiff < 5 * 60 * 1000) {
-                                createNotificationForNewReport(collection, change.doc.id, data);
+                                createNotificationForNewReport(colName, change.doc.id, data);
                             }
                         }
                     });
@@ -9313,7 +9313,7 @@ const meta = categories[ds.slug] || {};
                 window.notificationUnsubscribers.push(unsubscribe);
                 
             } catch (error) {
-                console.error(`Error setting up real-time listener for ${collection}:`, error);
+                console.error(`Error setting up real-time listener for ${colName}:`, error);
             }
         });
     }
@@ -9687,8 +9687,25 @@ const meta = categories[ds.slug] || {};
                     showSuccessModal(newStatus, docId);
                     
                     // Update the UI immediately
-                    const reportRows = document.querySelectorAll(`tr.report-row[data-id="${docId}"]`);
-                    console.log('🎯 Found report rows:', reportRows.length);
+                    let reportRows = Array.from(document.querySelectorAll(`tr.report-row[data-id="${docId}"]`));
+                    
+                    // Fallback: Try to find row via the button that triggered the action
+                    if (reportRows.length === 0) {
+                        console.log('⚠️ No rows found by data-id, trying button reference...');
+                        let btn = null;
+                        if (newStatus === 'Approved') btn = window.currentExternalApproveBtn;
+                        else if (newStatus === 'Declined') btn = window.currentExternalDeclineBtn;
+                        
+                        if (btn) {
+                            const row = btn.closest('tr.report-row') || btn.closest('tr');
+                            if (row) {
+                                console.log('🎯 Found row via button reference');
+                                reportRows.push(row);
+                            }
+                        }
+                    }
+                    
+                    console.log('🎯 Total report rows to update:', reportRows.length);
                     reportRows.forEach(row => {
                         // Update status badge
                         const badge = row.querySelector('.status-badge');
@@ -9717,9 +9734,79 @@ const meta = categories[ds.slug] || {};
                             }, 300);
                         }, 2000); // Longer delay to see the success feedback
                     });
+
+                    // Update Recent Activity items immediately (Real-time UI update)
+                    const recentItems = document.querySelectorAll(`#activityList li[data-id="${docId}"]`);
+                    console.log('🎯 Updating recent activity items:', recentItems.length);
+                    recentItems.forEach(item => {
+                        // Update data attribute
+                        item.dataset.status = newStatus.toLowerCase();
+                        
+                        // Update icon background
+                        const iconBg = item.querySelector('.w-14.h-14');
+                        if (iconBg) {
+                            // Remove old gradient classes
+                            iconBg.classList.remove('from-yellow-500', 'to-amber-600', 'from-green-500', 'to-emerald-600', 'from-red-500', 'to-rose-600');
+                            
+                            // Add new gradient classes
+                            if (newStatus === 'Approved') {
+                                iconBg.classList.add('from-green-500', 'to-emerald-600');
+                            } else if (newStatus === 'Declined') {
+                                iconBg.classList.add('from-red-500', 'to-rose-600');
+                            } else {
+                                iconBg.classList.add('from-yellow-500', 'to-amber-600');
+                            }
+                        }
+                        
+                        // Update status dot
+                        const statusDot = item.querySelector('.absolute.-top-1.-right-1');
+                        if (statusDot) {
+                            statusDot.classList.remove('bg-yellow-500', 'bg-green-500', 'bg-red-500');
+                            statusDot.classList.add(newStatus === 'Approved' ? 'bg-green-500' : (newStatus === 'Declined' ? 'bg-red-500' : 'bg-yellow-500'));
+                        }
+                        
+                        // Update status badge
+                        const statusBadge = item.querySelector('.inline-flex.items-center.gap-2');
+                        if (statusBadge) {
+                            // Update text color
+                            statusBadge.classList.remove('text-yellow-700', 'text-green-700', 'text-red-700');
+                            statusBadge.classList.add(newStatus === 'Approved' ? 'text-green-700' : (newStatus === 'Declined' ? 'text-red-700' : 'text-yellow-700'));
+                                
+                            // Update border color
+                            statusBadge.classList.remove('border-yellow-200', 'border-green-200', 'border-red-200');
+                            statusBadge.classList.add(newStatus === 'Approved' ? 'border-green-200' : (newStatus === 'Declined' ? 'border-red-200' : 'border-yellow-200'));
+                                
+                            // Update inner dot
+                            const innerDot = statusBadge.querySelector('.w-2.h-2');
+                            if (innerDot) {
+                                innerDot.classList.remove('bg-yellow-500', 'bg-green-500', 'bg-red-500');
+                                innerDot.classList.add(newStatus === 'Approved' ? 'bg-green-500' : (newStatus === 'Declined' ? 'bg-red-500' : 'bg-yellow-500'));
+                            }
+                            
+                            // Update text content
+                            // Find the text node (it's usually the last child after the dot span)
+                            let textUpdated = false;
+                            statusBadge.childNodes.forEach(node => {
+                                if (node.nodeType === 3 && node.textContent.trim().length > 0) {
+                                    node.textContent = ' ' + newStatus;
+                                    textUpdated = true;
+                                }
+                            });
+                            
+                            if (!textUpdated) {
+                                statusBadge.appendChild(document.createTextNode(' ' + newStatus));
+                            }
+                        }
+                    });
                     
                     // Update tab counts in real-time
                     updateTabCountsRealtime(collection, docId, newStatus);
+                    
+                    // Refresh Recent Activity list to reflect changes
+                    if (typeof window.refreshRecentActivity === 'function') {
+                        console.log('🔄 Refreshing recent activity list...');
+                        window.refreshRecentActivity();
+                    }
                     
                     // Update counters and refresh data
                     if (typeof updateStatusCounters === 'function') {
@@ -10294,6 +10381,624 @@ const meta = categories[ds.slug] || {};
             }, 2000);
         });
 
+        // Live Support Chat Logic
+        document.addEventListener('DOMContentLoaded', function() {
+            const chatListSidebar = document.getElementById('chatListSidebar');
+            const chatArea = document.getElementById('chatArea');
+            const backToChatListBtn = document.getElementById('backToChatList');
+            const chatList = document.getElementById('chatList');
+            const messagesArea = document.getElementById('messagesArea');
+            const messageForm = document.getElementById('messageForm');
+            const messageInput = document.getElementById('messageInput');
+            const chatSearch = document.getElementById('chatSearch');
+            
+            let currentChatId = null;
+            let currentChatStatus = null;
+            let chatPollInterval = null;
+            let messagePollInterval = null;
+            let latestChats = [];
+            let lastFetchedMessages = [];
+            let pendingMessages = [];
+
+            // Mobile UI: Show Chat List
+            function showChatList() {
+                if (window.innerWidth < 768) {
+                    chatListSidebar.classList.remove('-translate-x-full', 'hidden');
+                    chatArea.classList.add('hidden');
+                }
+            }
+
+            // Mobile UI: Show Chat Area
+            function showChatArea() {
+                if (window.innerWidth < 768) {
+                    chatListSidebar.classList.add('hidden');
+                    chatArea.classList.remove('hidden');
+                }
+            }
+
+            if (backToChatListBtn) {
+                backToChatListBtn.addEventListener('click', showChatList);
+            }
+
+            // Fetch Chats
+            let isFetchingChats = false;
+            const recentlyAcceptedChats = new Set();
+
+            async function fetchChats() {
+                if (isFetchingChats) return;
+                isFetchingChats = true;
+                try {
+                    // Add timestamp to prevent caching
+                    const response = await fetch('api/support_chat.php?action=get_chats&t=' + new Date().getTime());
+                    const result = await response.json();
+                    
+                    if (Array.isArray(result.chats)) {
+                        const normalizedChats = result.chats
+                            .map(chat => {
+                                const chatId = chat.id || chat._id || chat.userId || chat.user_id || chat.uid || '';
+                                const lastMessageTime = chat.lastMessageTimestamp || chat.lastMessageTime || chat.timestamp || chat._created || null;
+                                
+                                // Override status if recently accepted
+                                let status = chat.status;
+                                if (recentlyAcceptedChats.has(chatId)) {
+                                    status = 'active';
+                                }
+
+                                return {
+                                    ...chat,
+                                    id: chatId,
+                                    status: status,
+                                    lastMessageTime
+                                };
+                            })
+                            .filter(chat => chat.id);
+
+                        if (normalizedChats.length !== result.chats.length) {
+                            console.warn('Some chats were missing IDs and were skipped.');
+                        }
+
+                        latestChats = normalizedChats;
+                        renderChatList(normalizedChats);
+                        return normalizedChats;
+                    }
+                } catch (error) {
+                    console.error('Error fetching chats:', error);
+                } finally {
+                    isFetchingChats = false;
+                }
+                return latestChats;
+            }
+
+            // Render Chat List
+            function renderChatList(chats) {
+                chatList.innerHTML = '';
+                if (chats.length === 0) {
+                    chatList.innerHTML = '<div class="text-center py-8 text-slate-500 text-sm">No active chats or pending requests</div>';
+                    return;
+                }
+
+                const pendingChats = chats.filter(c => !c.status || c.status === 'pending' || c.status === 'waiting');
+                const activeChats = chats.filter(c => c.status === 'active');
+                const endedChats = chats.filter(c => c.status === 'ended');
+
+                if (pendingChats.length > 0) {
+                    const pendingHeader = document.createElement('div');
+                    pendingHeader.className = 'px-3 py-2 text-xs font-bold text-slate-500 uppercase tracking-wider';
+                    pendingHeader.textContent = 'Pending Requests';
+                    chatList.appendChild(pendingHeader);
+
+                    pendingChats.forEach(chat => renderChatItem(chat));
+                }
+
+                if (activeChats.length > 0) {
+                    const activeHeader = document.createElement('div');
+                    activeHeader.className = 'px-3 py-2 text-xs font-bold text-slate-500 uppercase tracking-wider mt-2';
+                    activeHeader.textContent = 'Active Conversations';
+                    chatList.appendChild(activeHeader);
+
+                    activeChats.forEach(chat => renderChatItem(chat));
+                }
+
+                if (endedChats.length > 0) {
+                    const endedHeader = document.createElement('div');
+                    endedHeader.className = 'px-3 py-2 text-xs font-bold text-slate-500 uppercase tracking-wider mt-2';
+                    endedHeader.textContent = 'Past Conversations';
+                    chatList.appendChild(endedHeader);
+
+                    endedChats.forEach(chat => renderChatItem(chat));
+                }
+            }
+
+            function renderChatItem(chat) {
+                const chatId = chat.id || chat._id || chat.userId || chat.user_id || chat.uid || '';
+                if (!chatId) {
+                    console.warn('Skipping chat with no identifier', chat);
+                    return;
+                }
+
+                const div = document.createElement('div');
+                div.className = `p-3 rounded-xl cursor-pointer hover:bg-slate-100 transition-colors mb-1 ${currentChatId === chatId ? 'bg-sky-50 border-l-4 border-sky-500' : ''}`;
+                div.onclick = () => loadChat({ ...chat, id: chatId });
+                
+                const lastMessage = chat.lastMessage ? (chat.lastMessage.length > 30 ? chat.lastMessage.substring(0, 30) + '...' : chat.lastMessage) : 'No messages yet';
+                const time = chat.lastMessageTime ? new Date(chat.lastMessageTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '';
+                const isPending = !chat.status || chat.status === 'pending' || chat.status === 'waiting';
+                const isEnded = chat.status === 'ended';
+                
+                const chatName = chat.userName || 'Unknown User';
+                const chatInitials = chatName.substring(0, 2).toUpperCase();
+                
+                let avatarClass = 'bg-sky-100 text-sky-600';
+                if (isPending) avatarClass = 'bg-amber-100 text-amber-600';
+                if (isEnded) avatarClass = 'bg-slate-200 text-slate-500';
+
+                div.innerHTML = `
+                    <div class="flex items-center gap-3">
+                        <div class="w-10 h-10 rounded-full ${avatarClass} flex items-center justify-center font-bold text-sm relative">
+                            ${chatInitials}
+                            ${isPending ? '<span class="absolute -top-1 -right-1 w-3 h-3 bg-amber-500 rounded-full border-2 border-white"></span>' : ''}
+                        </div>
+                        <div class="flex-1 min-w-0">
+                            <div class="flex justify-between items-start">
+                                <h4 class="font-bold text-slate-800 text-sm truncate ${isEnded ? 'text-slate-500' : ''}">${chatName}</h4>
+                                <span class="text-xs text-slate-400 whitespace-nowrap ml-2">${time}</span>
+                            </div>
+                            <p class="text-xs text-slate-500 truncate mt-0.5 ${isPending ? 'font-semibold text-slate-700' : ''}">${lastMessage}</p>
+                            ${chat.unreadCount > 0 ? `<span class="inline-flex items-center justify-center px-2 py-0.5 mt-1 text-xs font-bold leading-none text-white bg-red-500 rounded-full">${chat.unreadCount}</span>` : ''}
+                        </div>
+                    </div>
+                `;
+                chatList.appendChild(div);
+            }
+
+            // Load Chat
+            async function loadChat(chat) {
+                const resolvedChatId = chat.id || chat._id || chat.userId || chat.user_id || chat.uid || '';
+                if (!resolvedChatId) {
+                    console.error('Cannot load chat without an identifier', chat);
+                    return;
+                }
+
+                // Clear previous chat data if switching chats
+                if (currentChatId !== resolvedChatId) {
+                    pendingMessages = [];
+                    lastFetchedMessages = [];
+                    messagesArea.innerHTML = ''; // Clear visual area immediately
+                }
+
+                currentChatId = resolvedChatId;
+                currentChatStatus = chat.status || 'pending';
+                showChatArea();
+                
+                // Update Header
+                const chatName = chat.userName || 'Unknown User';
+                document.getElementById('chatUserName').textContent = chatName;
+                document.getElementById('chatUserInitials').textContent = chatName.substring(0, 2).toUpperCase();
+                document.getElementById('chatHeader').classList.remove('hidden');
+                
+                const statusEl = document.getElementById('chatUserStatus');
+                const endChatBtn = document.getElementById('endChatBtn');
+                
+                if (currentChatStatus === 'pending' || currentChatStatus === 'waiting') {
+                    statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></span> Pending Request';
+                    if(endChatBtn) endChatBtn.classList.add('hidden');
+                } else if (currentChatStatus === 'ended') {
+                    statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-slate-400"></span> Ended';
+                    if(endChatBtn) endChatBtn.classList.add('hidden');
+                } else {
+                    statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-500"></span> Active';
+                    if(endChatBtn) endChatBtn.classList.remove('hidden');
+                }
+
+                // Handle Input Area based on status
+                const inputArea = document.getElementById('messageInputArea');
+                if (currentChatStatus === 'pending' || currentChatStatus === 'waiting') {
+                    inputArea.classList.add('hidden');
+                    // Show Accept Button in messages area
+                    messagesArea.innerHTML = `
+                        <div class="h-full flex flex-col items-center justify-center p-6 text-center">
+                            <div class="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center mb-4">
+                                <svg class="w-8 h-8 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-bold text-slate-800 mb-2">New Chat Request</h3>
+                            <p class="text-slate-500 mb-6 max-w-xs">This user is requesting live support. Accept the request to start messaging.</p>
+                            ${chat.relatedReportId ? `<div class="mb-6 p-3 bg-slate-50 rounded-lg text-sm text-left w-full max-w-xs border border-slate-200">
+                                <p class="font-bold text-slate-700 mb-1">Related Report:</p>
+                                <p class="text-slate-600">Type: ${chat.relatedReportType || 'Report'}</p>
+                                <p class="text-slate-600 text-xs mt-1">ID: ${chat.relatedReportId}</p>
+                            </div>` : ''}
+                            <button onclick="acceptChat('${resolvedChatId}', this)" class="bg-sky-600 hover:bg-sky-700 text-white px-6 py-3 rounded-xl font-bold shadow-lg shadow-sky-500/20 transition-all hover:scale-105 flex items-center gap-2">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                                </svg>
+                                Accept Chat Request
+                            </button>
+                        </div>
+                    `;
+                } else if (currentChatStatus === 'ended') {
+                    inputArea.classList.add('hidden');
+                    messagesArea.innerHTML = `
+                        <div class="h-full flex flex-col items-center justify-center text-slate-400">
+                            <p class="text-sm">This chat has ended.</p>
+                        </div>
+                    `;
+                    // Load Messages (read-only)
+                    await fetchMessages();
+                } else {
+                    inputArea.classList.remove('hidden');
+                    messagesArea.innerHTML = `
+                        <div class="h-full flex flex-col items-center justify-center text-slate-400">
+                            <p class="text-sm">Loading conversation...</p>
+                        </div>
+                    `;
+                    // Load Messages
+                    await fetchMessages();
+                    // Start polling messages
+                    if (window.messagePollTimeout) clearTimeout(window.messagePollTimeout);
+                    fetchMessages(); // Initial fetch, will trigger subsequent polls
+                }
+            }
+
+            // End Chat Functions
+            window.confirmEndChat = function() {
+                showEndChatModal();
+            };
+
+            window.confirmEndChatAction = function() {
+                console.log('confirmEndChatAction called');
+                closeEndChatModal();
+                if (typeof endChat === 'function') {
+                    endChat();
+                } else {
+                    alert('Error: endChat function not found! Please refresh the page.');
+                }
+            };
+
+            async function endChat() {
+                console.log('endChat called, currentChatId:', currentChatId);
+                if (!currentChatId) {
+                    alert('Error: No active chat selected. Please refresh the page.');
+                    return;
+                }
+
+                try {
+                    const formData = new FormData();
+                    formData.append('action', 'end_chat');
+                    formData.append('chat_id', currentChatId);
+
+                    const response = await fetch('api/support_chat.php', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    const text = await response.text();
+                    console.log('End chat response:', text); // Debug log
+                    
+                    let result;
+                    try {
+                        result = JSON.parse(text);
+                    } catch (e) {
+                        console.error('Invalid JSON response:', text);
+                        // Show the actual text response in the alert for debugging
+                        throw new Error('Server returned invalid response: ' + text.substring(0, 100));
+                    }
+
+                    if (result.success) {
+                        // Update local status
+                        currentChatStatus = 'ended';
+                        
+                        // Update UI
+                        const statusEl = document.getElementById('chatUserStatus');
+                        if (statusEl) statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-slate-400"></span> Ended';
+                        
+                        const endChatBtn = document.getElementById('endChatBtn');
+                        if(endChatBtn) endChatBtn.classList.add('hidden');
+                        
+                        const inputArea = document.getElementById('messageInputArea');
+                        if (inputArea) inputArea.classList.add('hidden');
+                        
+                        // Refresh messages to show system message
+                        await fetchMessages();
+                        
+                        // Refresh chat list to update status there too
+                        if (typeof fetchChats === 'function') fetchChats();
+                    } else {
+                        alert('Failed to end chat: ' + (result.error || 'Unknown error'));
+                    }
+                } catch (error) {
+                    console.error('Error ending chat:', error);
+                    alert('An error occurred while ending the chat: ' + error.message);
+                }
+            }
+
+            // Accept Chat Function (Global)
+            window.acceptChat = async function(chatId, triggerBtn = null) {
+                if (!chatId) {
+                    alert('Chat ID is missing. Please refresh and try again.');
+                    return;
+                }
+
+                const btn = triggerBtn || document.querySelector(`button[onclick*="${chatId}"]`) || document.querySelector('button[onclick^="acceptChat"]');
+                let originalContent = '';
+                
+                try {
+                    const formData = new FormData();
+                    formData.append('chat_id', chatId);
+                    
+                    if(btn) {
+                        // Store original content to restore on error
+                        originalContent = btn.innerHTML;
+                        btn.dataset.originalContent = originalContent;
+                        btn.innerHTML = '<svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg> Accepting...';
+                        btn.disabled = true;
+                    }
+
+                    // Add timeout to fetch
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 30000); // Increased to 30s timeout
+
+                    const response = await fetch('api/support_chat.php?action=accept_chat', {
+                        method: 'POST',
+                        body: formData,
+                        signal: controller.signal
+                    });
+                    
+                    clearTimeout(timeoutId);
+                    
+                    // Check if response is ok
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+
+                    const text = await response.text();
+                    let result;
+                    try {
+                        result = JSON.parse(text);
+                    } catch (e) {
+                        console.error('Invalid JSON response:', text);
+                        throw new Error('Server returned invalid response');
+                    }
+                    
+                    if (result.success) {
+                        const chatName = document.getElementById('chatUserName').textContent || 'Resident';
+                        
+                        // Add to recently accepted set to prevent race conditions
+                        recentlyAcceptedChats.add(chatId);
+                        setTimeout(() => recentlyAcceptedChats.delete(chatId), 15000); // Keep for 15 seconds
+
+                        // Optimistically update UI immediately
+                        const optimisticChat = { 
+                            id: chatId, 
+                            userName: chatName, 
+                            status: 'active',
+                            lastMessageTime: new Date()
+                        };
+                        
+                        // Update local cache if exists
+                        if (Array.isArray(latestChats)) {
+                            const existingIndex = latestChats.findIndex(c => c.id === chatId);
+                            if (existingIndex !== -1) {
+                                latestChats[existingIndex] = { ...latestChats[existingIndex], ...optimisticChat };
+                            }
+                        }
+
+                        // Force load chat with active status
+                        await loadChat(optimisticChat);
+
+                        if (btn) {
+                            btn.innerHTML = 'Chat Accepted';
+                            btn.disabled = true;
+                        }
+                        
+                        // Fetch latest data in background
+                        fetchChats();
+                    } else {
+                        throw new Error(result.error || 'Unknown error');
+                    }
+                } catch (error) {
+                    console.error('Error accepting chat:', error);
+                    
+                    // Handle AbortError or Timeout specifically
+                    if (error.name === 'AbortError' || error.message.includes('aborted')) {
+                        console.log('Request timed out or aborted, checking if chat was accepted anyway...');
+                        // Check if the chat status actually changed
+                        try {
+                            const chats = await fetchChats();
+                            const updatedChat = Array.isArray(chats) ? chats.find(c => c.id === chatId) : null;
+                            
+                            if (updatedChat && updatedChat.status === 'active') {
+                                console.log('Chat was accepted despite timeout');
+                                await loadChat(updatedChat);
+                                if (btn) {
+                                    btn.innerHTML = 'Chat Accepted';
+                                    btn.disabled = true;
+                                }
+                                return; // Exit successfully
+                            }
+                        } catch (checkError) {
+                            console.error('Failed to verify chat status:', checkError);
+                        }
+                        alert('Request timed out. Please check your internet connection and try again.');
+                    } else {
+                        alert('Failed to accept chat: ' + error.message);
+                    }
+
+                    // Restore button if failed
+                    if(btn && originalContent && !btn.disabled) { // Only restore if we didn't succeed above
+                        btn.innerHTML = originalContent;
+                        btn.disabled = false;
+                    }
+                }
+            };
+
+            // Fetch Messages
+            async function fetchMessages() {
+                if (!currentChatId || (currentChatStatus === 'pending' || currentChatStatus === 'waiting')) return;
+                
+                try {
+                    const response = await fetch(`api/support_chat.php?action=get_messages&chat_id=${currentChatId}`);
+                    const result = await response.json();
+                    
+                    if (result.messages) {
+                        lastFetchedMessages = result.messages;
+                        renderMessages(lastFetchedMessages);
+                    } else if (result.error) {
+                        console.error('API Error:', result.error);
+                        // Only show error if we don't have messages yet
+                        if (messagesArea.innerHTML.includes('Loading conversation...')) {
+                            messagesArea.innerHTML = `
+                                <div class="h-full flex flex-col items-center justify-center text-red-400">
+                                    <svg class="w-8 h-8 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                    <p class="text-sm">${result.error}</p>
+                                </div>
+                            `;
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error fetching messages:', error);
+                    // Don't show error UI for transient network errors during polling, just log it
+                } finally {
+                    // Schedule next poll if still active
+                    if (currentChatId && currentChatStatus === 'active') {
+                        window.messagePollTimeout = setTimeout(fetchMessages, 1000);
+                    }
+                }
+            }
+
+            // Render Messages
+            function renderMessages(messages) {
+                messagesArea.innerHTML = '';
+                
+                // Combine fetched messages with pending messages
+                const allMessages = [...messages, ...pendingMessages];
+
+                if (allMessages.length === 0) {
+                    messagesArea.innerHTML = `
+                        <div class="h-full flex flex-col items-center justify-center text-slate-400">
+                            <p class="text-sm">No messages yet. Start the conversation!</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                let lastDate = null;
+                
+                allMessages.forEach(msg => {
+                    // Handle timestamp: Firestore timestamp or ISO string or JS Date
+                    let dateObj;
+                    if (msg.timestamp instanceof Date) {
+                        dateObj = msg.timestamp;
+                    } else if (msg.timestamp && msg.timestamp.seconds) {
+                        dateObj = new Date(msg.timestamp.seconds * 1000);
+                    } else {
+                        dateObj = new Date(msg.timestamp);
+                    }
+                    
+                    const date = dateObj.toLocaleDateString();
+                    if (date !== lastDate) {
+                        const dateDiv = document.createElement('div');
+                        dateDiv.className = 'flex justify-center my-4';
+                        dateDiv.innerHTML = `<span class="bg-slate-100 text-slate-500 text-xs px-3 py-1 rounded-full">${date}</span>`;
+                        messagesArea.appendChild(dateDiv);
+                        lastDate = date;
+                    }
+
+                    const isMe = msg.senderId === '<?php echo $_SESSION['user_id'] ?? ''; ?>';
+                    const isSystem = msg.isSystem === true;
+                    const isPending = msg.isPending === true;
+                    
+                    const div = document.createElement('div');
+                    
+                    if (isSystem) {
+                        div.className = 'flex justify-center mb-4';
+                        div.innerHTML = `<span class="text-xs text-slate-400 italic bg-slate-50 px-3 py-1 rounded-full">${msg.text}</span>`;
+                    } else {
+                        div.className = `flex ${isMe ? 'justify-end' : 'justify-start'} mb-4 ${isPending ? 'opacity-70' : ''}`;
+                        div.innerHTML = `
+                            <div class="max-w-[75%] ${isMe ? 'bg-sky-600 text-white rounded-l-2xl rounded-tr-2xl' : 'bg-white border border-slate-200 text-slate-800 rounded-r-2xl rounded-tl-2xl'} p-3 shadow-sm relative group">
+                                <p class="text-sm leading-relaxed">${msg.text || msg.message}</p>
+                                <span class="text-[10px] ${isMe ? 'text-sky-100' : 'text-slate-400'} block text-right mt-1 opacity-70 flex items-center justify-end gap-1">
+                                    ${dateObj.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                    ${isPending ? '<svg class="w-3 h-3 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>' : ''}
+                                </span>
+                            </div>
+                        `;
+                    }
+                    messagesArea.appendChild(div);
+                });
+                
+                messagesArea.scrollTop = messagesArea.scrollHeight;
+            }
+
+            // Send Message
+            if (messageForm) {
+                messageForm.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const message = messageInput.value.trim();
+                    if (!message || !currentChatId) return;
+                    
+                    // Optimistic Update
+                    const tempId = 'temp-' + Date.now();
+                    const optimisticMsg = {
+                        text: message,
+                        senderId: '<?php echo $_SESSION['user_id'] ?? ''; ?>',
+                        timestamp: new Date(),
+                        isPending: true,
+                        id: tempId
+                    };
+                    
+                    pendingMessages.push(optimisticMsg);
+                    messageInput.value = '';
+                    renderMessages(lastFetchedMessages); // Re-render with pending message
+
+                    try {
+                        const formData = new FormData();
+                        formData.append('chat_id', currentChatId);
+                        formData.append('text', message);
+                        
+                        const response = await fetch('api/support_chat.php?action=send_message', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        
+                        const result = await response.json();
+                        if (result.success) {
+                            // Remove from pending
+                            pendingMessages = pendingMessages.filter(m => m.id !== tempId);
+                            fetchMessages();
+                            fetchChats(); // Update last message in list
+                        } else {
+                            console.error('Failed to send message');
+                            pendingMessages = pendingMessages.filter(m => m.id !== tempId);
+                            renderMessages(lastFetchedMessages);
+                            alert('Failed to send message');
+                        }
+                    } catch (error) {
+                        console.error('Error sending message:', error);
+                        pendingMessages = pendingMessages.filter(m => m.id !== tempId);
+                        renderMessages(lastFetchedMessages);
+                        alert('Error sending message');
+                    }
+                });
+                
+                // Enter to send
+                messageInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        messageForm.dispatchEvent(new Event('submit'));
+                    }
+                });
+            }
+
+            // Initial Load
+            if (document.getElementById('chatList')) {
+                fetchChats();
+                chatPollInterval = setInterval(fetchChats, 5000);
+            }
+        });
+
         // Updated confirmation functions to use modals instead of browser confirm
         window.showApproveConfirmation = function(collection, docId, reporterName, categoryType) {
             console.log('showApproveConfirmation called:', { collection, docId, reporterName, categoryType });
@@ -10314,6 +11019,191 @@ const meta = categories[ds.slug] || {};
         window.confirmDecline = confirmDecline;
         window.updateReportStatus = updateReportStatus;
     </script>
+    <script>
+        // Live Support Badge Logic
+        async function updateLiveSupportBadge() {
+            try {
+                const response = await fetch('api/support_chat.php?action=get_chats');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const result = await response.json();
+                
+                if (Array.isArray(result.chats)) {
+                    // Count pending chats
+                    const pendingCount = result.chats.filter(c => !c.status || c.status === 'pending' || c.status === 'waiting').length;
+                    
+                    const badgeDesktop = document.getElementById('liveSupportBadge');
+                    const badgeMobile = document.getElementById('liveSupportBadgeMobile');
+                    
+                    if (pendingCount > 0) {
+                        if (badgeDesktop) {
+                            badgeDesktop.textContent = pendingCount;
+                            badgeDesktop.classList.remove('hidden');
+                            badgeDesktop.style.display = 'inline-flex'; // Force display
+                        }
+                        if (badgeMobile) {
+                            badgeMobile.textContent = pendingCount;
+                            badgeMobile.classList.remove('hidden');
+                            badgeMobile.style.display = 'inline-flex'; // Force display
+                        }
+                    } else {
+                        if (badgeDesktop) {
+                            badgeDesktop.classList.add('hidden');
+                            badgeDesktop.style.display = 'none'; // Force hide
+                        }
+                        if (badgeMobile) {
+                            badgeMobile.classList.add('hidden');
+                            badgeMobile.style.display = 'none'; // Force hide
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('Error updating live support badge:', error);
+            }
+        }
+
+        // Start polling for badge updates
+        (function() {
+            const startPolling = () => {
+                updateLiveSupportBadge();
+                setInterval(updateLiveSupportBadge, 5000); // Poll every 5 seconds
+            };
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', startPolling);
+            } else {
+                startPolling();
+            }
+        })();
+    </script>
+    <!-- End Chat Confirmation Modal -->
+    <div id="endChatModal" class="fixed inset-0 z-50 hidden" aria-labelledby="modal-title" role="dialog" aria-modal="true">
+        <!-- Backdrop -->
+        <div class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm transition-opacity opacity-0" id="endChatModalBackdrop"></div>
+
+        <div class="fixed inset-0 z-10 overflow-y-auto">
+            <div class="flex min-h-full items-end justify-center p-4 text-center sm:items-center sm:p-0">
+                <!-- Modal Panel -->
+                <div class="relative transform overflow-hidden rounded-2xl bg-white text-left shadow-2xl transition-all sm:my-8 sm:w-full sm:max-w-md opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95" id="endChatModalPanel">
+                    
+                    <!-- Decorative Header Pattern -->
+                    <div class="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-red-400 to-red-600"></div>
+
+                    <div class="bg-white px-4 pb-4 pt-5 sm:p-6 sm:pb-4">
+                        <div class="sm:flex sm:items-start">
+                            <div class="mx-auto flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-full bg-red-100 sm:mx-0 sm:h-10 sm:w-10 mb-4 sm:mb-0">
+                                <svg class="h-6 w-6 text-red-600" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" aria-hidden="true">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                                </svg>
+                            </div>
+                            <div class="mt-3 text-center sm:ml-4 sm:mt-0 sm:text-left w-full">
+                                <h3 class="text-lg font-bold leading-6 text-slate-900" id="modal-title">End Chat Session</h3>
+                                <div class="mt-2">
+                                    <p class="text-sm text-slate-500">Are you sure you want to end this chat session? This action cannot be undone and the user will be notified.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bg-slate-50 px-4 py-3 sm:flex sm:flex-row-reverse sm:px-6 border-t border-slate-100">
+                        <button type="button" onclick="confirmEndChatAction()" class="inline-flex w-full justify-center rounded-xl bg-red-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-red-500 sm:ml-3 sm:w-auto transition-all hover:shadow-lg hover:shadow-red-500/30 active:scale-95">End Chat</button>
+                        <button type="button" onclick="closeEndChatModal()" class="mt-3 inline-flex w-full justify-center rounded-xl bg-white px-3 py-2 text-sm font-semibold text-slate-900 shadow-sm ring-1 ring-inset ring-slate-300 hover:bg-slate-50 sm:mt-0 sm:w-auto transition-all hover:shadow-md active:scale-95">Cancel</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // End Chat Modal Functions
+        function showEndChatModal() {
+            const modal = document.getElementById('endChatModal');
+            const backdrop = document.getElementById('endChatModalBackdrop');
+            const panel = document.getElementById('endChatModalPanel');
+            
+            if (modal && backdrop && panel) {
+                modal.classList.remove('hidden');
+                // Trigger reflow
+                void modal.offsetWidth;
+                
+                // Animate in
+                backdrop.classList.remove('opacity-0');
+                panel.classList.remove('opacity-0', 'translate-y-4', 'sm:translate-y-0', 'sm:scale-95');
+                panel.classList.add('opacity-100', 'translate-y-0', 'sm:scale-100');
+            }
+        }
+
+        function closeEndChatModal() {
+            const modal = document.getElementById('endChatModal');
+            const backdrop = document.getElementById('endChatModalBackdrop');
+            const panel = document.getElementById('endChatModalPanel');
+            
+            if (modal && backdrop && panel) {
+                // Animate out
+                backdrop.classList.add('opacity-0');
+                panel.classList.remove('opacity-100', 'translate-y-0', 'sm:scale-100');
+                panel.classList.add('opacity-0', 'translate-y-4', 'sm:translate-y-0', 'sm:scale-95');
+                
+                setTimeout(() => {
+                    modal.classList.add('hidden');
+                }, 300);
+            }
+        }
+    </script>
+    <script>
+        // Verify Users Badge Logic
+        async function updateVerifyUsersBadge() {
+            try {
+                const response = await fetch('api/get_pending_users_count.php');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const result = await response.json();
+                
+                const count = result.count || 0;
+                
+                const badgeDesktop = document.getElementById('verifyUsersBadge');
+                const badgeMobile = document.getElementById('verifyUsersBadgeMobile');
+                
+                if (count > 0) {
+                    if (badgeDesktop) {
+                        badgeDesktop.textContent = count;
+                        badgeDesktop.classList.remove('hidden');
+                        badgeDesktop.style.display = 'inline-flex';
+                    }
+                    if (badgeMobile) {
+                        badgeMobile.textContent = count;
+                        badgeMobile.classList.remove('hidden');
+                        badgeMobile.style.display = 'inline-flex';
+                    }
+                } else {
+                    if (badgeDesktop) {
+                        badgeDesktop.classList.add('hidden');
+                        badgeDesktop.style.display = 'none';
+                    }
+                    if (badgeMobile) {
+                        badgeMobile.classList.add('hidden');
+                        badgeMobile.style.display = 'none';
+                    }
+                }
+            } catch (error) {
+                console.error('Error updating verify users badge:', error);
+            }
+        }
+
+        // Start polling for verify users badge updates
+        (function() {
+            const startPolling = () => {
+                updateVerifyUsersBadge();
+                setInterval(updateVerifyUsersBadge, 10000); // Poll every 10 seconds
+            };
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', startPolling);
+            } else {
+                startPolling();
+            }
+        })();
+    </script>
 </body>
-</html>
 </html>

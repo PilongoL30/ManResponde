@@ -23,6 +23,7 @@ function send_emergency_notification_directly(string $collection, string $docId)
             'fire_reports' => ['type' => 'fire', 'emoji' => '🔥', 'label' => 'FIRE'],
             'flood_reports' => ['type' => 'flood', 'emoji' => '🌊', 'label' => 'FLOOD'],
             'tanod_reports' => ['type' => 'tanod', 'emoji' => '🚔', 'label' => 'TANOD'],
+            'police_reports' => ['type' => 'police', 'emoji' => '🚓', 'label' => 'POLICE'],
             'other_reports' => ['type' => 'other', 'emoji' => '🚨', 'label' => 'EMERGENCY']
         ];
         
@@ -118,6 +119,7 @@ if (isset($_GET['test_direct'])) {
         <label>Collection:</label>
         <select name="collection">
             <option value="tanod_reports">Tanod Reports</option>
+            <option value="police_reports">Police Reports</option>
             <option value="fire_reports">Fire Reports</option>
             <option value="ambulance_reports">Ambulance Reports</option>
         </select>

@@ -1,6 +1,6 @@
 <?php
-session_start();
 require_once 'db_config.php';
+session_start();
 
 // Function to get authenticated Firebase Storage URL
 function getAuthenticatedStorageUrl($path) {

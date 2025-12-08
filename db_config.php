@@ -1,9 +1,29 @@
 <?php
 // db_config.php
 
+// Load configuration
+require_once __DIR__ . '/config.php';
+
+// Load cache and CSRF systems
+require_once __DIR__ . '/includes/cache.php';
+require_once __DIR__ . '/includes/csrf.php';
+
+// Configure custom session path to avoid permission issues (BEFORE session starts)
+if (session_status() === PHP_SESSION_NONE) {
+    $sessionPath = __DIR__ . '/sessions';
+    if (!is_dir($sessionPath)) {
+        mkdir($sessionPath, 0755, true);
+    }
+    session_save_path($sessionPath);
+    ini_set('session.gc_probability', 1);
+    ini_set('session.gc_divisor', 100);
+}
+
 // Force REST transport for Google Cloud PHP to avoid gRPC instability on Windows
-putenv('GOOGLE_CLOUD_PHP_USE_REST=true');
-$_ENV['GOOGLE_CLOUD_PHP_USE_REST'] = 'true';
+if (FIRESTORE_USE_REST) {
+    putenv('GOOGLE_CLOUD_PHP_USE_REST=true');
+    $_ENV['GOOGLE_CLOUD_PHP_USE_REST'] = 'true';
+}
 
 // Composer autoload for Firebase SDK
 require __DIR__.'/firebase-php-auth/vendor/autoload.php';
@@ -18,13 +38,24 @@ use Google\Auth\Credentials\ServiceAccountCredentials;
  * @return \Kreait\Firebase\Factory
  */
 function initialize_firebase() {
+    // SSL verification based on environment
+    $sslVerify = SSL_VERIFY;
+    
+    // In development on Windows, you may need to disable SSL verification
+    // OR set 'verify' to path of cacert.pem file
+    if (!$sslVerify && IS_DEVELOPMENT) {
+        // Log warning in development when SSL verification is disabled
+        if (DEBUG_MODE) {
+            error_log('WARNING: SSL verification is disabled in development mode');
+        }
+    }
+    
     $httpOptions = HttpClientOptions::default()
         ->withGuzzleConfigOptions([
             'connect_timeout' => 10,
             'read_timeout'    => 30,
             'timeout'         => 60,
-            // For local Windows dev; configure a CA bundle for production
-            'verify'          => false,
+            'verify'          => $sslVerify,
         ]);
 
     return (new Factory)
@@ -35,7 +66,7 @@ function initialize_firebase() {
             'transportConfig' => [
                 'rest' => [
                     'restOptions' => [
-                        'verify'          => false,
+                        'verify'          => $sslVerify,
                         'connect_timeout' => 10,
                         'timeout'         => 60,
                     ],
@@ -114,14 +145,31 @@ function firebase_project_id(): string {
  */
 function firestore_rest_token(): string {
     static $token = null, $exp = 0;
+    
+    // Check static cache first
     if ($token && time() < ($exp - 60)) return $token;
+
+    // Check session cache
+    if (isset($_SESSION['__firestore_token']) && isset($_SESSION['__firestore_token_exp'])) {
+        if (time() < ($_SESSION['__firestore_token_exp'] - 60)) {
+            $token = $_SESSION['__firestore_token'];
+            $exp = $_SESSION['__firestore_token_exp'];
+            return $token;
+        }
+    }
 
     $scopes = ['https://www.googleapis.com/auth/datastore'];
     $creds  = new ServiceAccountCredentials($scopes, service_account_config());
     $resp   = $creds->fetchAuthToken();
     $token  = $resp['access_token'] ?? '';
     $exp    = (int)($resp['expires_at'] ?? (time()+300));
+    
     if (!$token) throw new Exception('Failed to get Firestore access token.');
+    
+    // Update caches
+    $_SESSION['__firestore_token'] = $token;
+    $_SESSION['__firestore_token_exp'] = $exp;
+    
     return $token;
 }
 
@@ -152,9 +200,8 @@ function firestore_rest_request(string $method, string $url, ?array $body = null
         CURLOPT_HTTPHEADER     => $headers,
         CURLOPT_TIMEOUT        => 60,
         CURLOPT_CONNECTTIMEOUT => 10,
-        // For local Windows dev; configure CA for production
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => 0,
+        CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
+        CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
     ];
     if ($body !== null) {
         $opts[CURLOPT_POSTFIELDS] = json_encode($body);
@@ -388,22 +435,6 @@ function firestore_count(string $collection, ?string $statusEquals = null): int 
 }
 
 /**
- * Simple session-based cache functions.
- */
-function cache_get(string $key, int $ttl = 300) {
-    $now = time();
-    $item = $_SESSION['__cache'][$key] ?? null;
-    if ($item && isset($item['t'], $item['v']) && ($now - (int)$item['t']) < $ttl) {
-        return $item['v'];
-    }
-    return null;
-}
-
-function cache_set(string $key, $value): void {
-    $_SESSION['__cache'][$key] = ['t' => time(), 'v' => $value];
-}
-
-/**
  * Count reports in a collection (optionally filtered by status).
  */
 function count_reports(string $collection, ?string $status = null): ?int {
@@ -517,7 +548,7 @@ function get_admin_stats_counts_fast(array $collections): array {
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
-                'Authorization: Bearer ' . get_firebase_access_token()
+                'Authorization: Bearer ' . firestore_rest_token()
             ],
             CURLOPT_TIMEOUT => 5
         ]);
@@ -534,7 +565,7 @@ function get_admin_stats_counts_fast(array $collections): array {
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
-                'Authorization: Bearer ' . get_firebase_access_token()
+                'Authorization: Bearer ' . firestore_rest_token()
             ],
             CURLOPT_TIMEOUT => 5
         ]);
@@ -551,7 +582,7 @@ function get_admin_stats_counts_fast(array $collections): array {
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
-                'Authorization: Bearer ' . get_firebase_access_token()
+                'Authorization: Bearer ' . firestore_rest_token()
             ],
             CURLOPT_TIMEOUT => 5
         ]);
@@ -622,18 +653,24 @@ function get_admin_stats_counts_fallback(array $collections): array {
             $approved = 0;
             $pending = 0;
             $declined = 0;
+            $responded = 0;
             
             if (is_array($response)) {
                 foreach ($response as $row) {
                     if (isset($row['document']['fields']['status'])) {
                         $total++;
                         $status = $row['document']['fields']['status']['stringValue'] ?? '';
-                        if ($status === 'Approved') {
+                        // Case-insensitive check
+                        $statusLower = strtolower($status);
+                        
+                        if ($statusLower === 'approved') {
                             $approved++;
-                        } elseif ($status === 'Pending') {
+                        } elseif ($statusLower === 'pending') {
                             $pending++;
-                        } elseif ($status === 'Declined') {
+                        } elseif ($statusLower === 'declined') {
                             $declined++;
+                        } elseif ($statusLower === 'responded') {
+                            $responded++;
                         }
                     }
                 }
@@ -644,6 +681,7 @@ function get_admin_stats_counts_fallback(array $collections): array {
                 'approved' => $approved,
                 'pending' => $pending,
                 'declined' => $declined,
+                'responded' => $responded,
             ];
             
         } catch (Exception $e) {
@@ -665,9 +703,15 @@ function get_admin_stats_counts_fallback(array $collections): array {
  * Simplified version that falls back to original auth method.
  */
 function get_firebase_access_token(): string {
-    // For now, return empty string to use the original auth method
-    // This avoids issues with complex token generation
-    return '';
+    try {
+        if (function_exists('firestore_rest_token')) {
+            return firestore_rest_token();
+        }
+        return '';
+    } catch (Exception $e) {
+        error_log("Error getting firebase access token: " . $e->getMessage());
+        return '';
+    }
 }
 
 /**
@@ -676,7 +720,8 @@ function get_firebase_access_token(): string {
  */
 function firestore_set_document_fast(string $collection, string $docId, array $data): bool {
     try {
-        $url = firestore_base_url() . '/documents/' . $collection . '/' . $docId;
+        // Fix: Remove extra '/documents' segment as firestore_base_url() already includes it
+        $url = firestore_base_url() . '/' . rawurlencode($collection) . '/' . rawurlencode($docId);
         
         // Convert data to Firestore format
         $firestoreData = [];

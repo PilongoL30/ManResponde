@@ -6,10 +6,11 @@
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
-session_start();
+ob_start(); // Start output buffering
 
 // Include required configuration files
 require_once __DIR__ . '/db_config.php';
+session_start();
 require_once __DIR__ . '/fcm_config.php';
 
 // Check if user is logged in and is an admin
@@ -20,8 +21,23 @@ if (!isset($_SESSION['user_id'])) {
 
 $userRole = $_SESSION['user_role'] ?? 'staff';
 $isAdmin = ($userRole === 'admin');
+$assignedBarangay = $_SESSION['assignedBarangay'] ?? '';
 
-if (!$isAdmin) {
+// Fetch user profile to check categories
+$userProfile = firestore_get_doc_by_id('users', $_SESSION['user_id']);
+$categories = $userProfile['categories'] ?? [];
+// Handle case where categories might be a string or array
+if (is_string($categories)) {
+    $categories = [$categories];
+} elseif (!is_array($categories)) {
+    $categories = [];
+}
+// Convert all categories to lowercase for case-insensitive comparison
+$categories = array_map('strtolower', $categories);
+$isTanod = in_array('tanod', $categories);
+
+// Allow admin or tanod to access
+if (!$isAdmin && !$isTanod) {
     header('Location: dashboard.php');
     exit();
 }
@@ -79,6 +95,7 @@ function sendApprovalNotification($userId) {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>User Registration Verification</title>
+  <link rel="icon" href="responde.png" type="image/png">
   <!-- Tailwind CSS for styling -->
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
@@ -253,6 +270,14 @@ function sendApprovalNotification($userId) {
           <span>Dashboard</span>
         </a>
 
+        <a href="dashboard.php?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z" />
+          </svg>
+          <span>Live Support</span>
+          <span id="liveSupportBadge" class="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
+        </a>
+
         <?php if ($isAdmin): ?>
         <a href="dashboard.php?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
@@ -260,14 +285,19 @@ function sendApprovalNotification($userId) {
           </svg>
           <span>Create Account</span>
         </a>
+        <?php endif; ?>
         
+        <?php if ($isAdmin || $isTanod): ?>
         <a href="verify_users.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-emerald-50 text-emerald-700 font-semibold border-l-4 border-emerald-600">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
             <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
           <span>Verify Users</span>
+          <span id="verifyUsersBadge" class="ml-auto bg-amber-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
         </a>
+        <?php endif; ?>
         
+        <?php if ($isAdmin): ?>
         <button onclick="showExportModal()" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600 w-full text-left">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
             <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
@@ -279,10 +309,10 @@ function sendApprovalNotification($userId) {
       <div class="p-2 border-t border-slate-200/70 pt-4">
         <div class="flex items-center gap-3 mb-4">
           <div class="w-10 h-10 rounded-full bg-sky-500 flex items-center justify-center font-bold text-white ring-2 ring-sky-200">
-            <?php echo strtoupper(substr($_SESSION['user_name'] ?? 'A', 0, 1)); ?>
+            <?php echo strtoupper(substr($_SESSION['user_fullname'] ?? 'U', 0, 1)); ?>
           </div>
           <div>
-            <p class="font-semibold text-slate-800 text-sm"><?php echo htmlspecialchars($_SESSION['user_name'] ?? 'Admin'); ?></p>
+            <p class="font-semibold text-slate-800 text-sm"><?php echo htmlspecialchars($_SESSION['user_fullname'] ?? 'User'); ?></p>
             <p class="text-xs text-slate-500"><?php echo htmlspecialchars(ucfirst($userRole)); ?></p>
           </div>
         </div>
@@ -324,6 +354,14 @@ function sendApprovalNotification($userId) {
               </svg>
               <span>Dashboard</span>
             </a>
+
+            <a href="dashboard.php?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z" />
+              </svg>
+              <span>Live Support</span>
+              <span id="liveSupportBadgeMobile" class="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
+            </a>
             
             <?php if ($isAdmin): ?>
             <a href="dashboard.php?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
@@ -332,14 +370,19 @@ function sendApprovalNotification($userId) {
               </svg>
               <span>Create Account</span>
             </a>
+            <?php endif; ?>
             
+            <?php if ($isAdmin || $isTanod): ?>
             <a href="verify_users.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-emerald-50 text-emerald-700 font-semibold border-l-4 border-emerald-600">
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
               <span>Verify Users</span>
+              <span id="verifyUsersBadgeMobile" class="ml-auto bg-amber-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
             </a>
+            <?php endif; ?>
             
+            <?php if ($isAdmin): ?>
             <button onclick="showExportModal(); closeMobileSidebar();" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600 w-full text-left">
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
@@ -843,23 +886,39 @@ service firebase.storage {
 
       // Load the actual image from Firebase Storage
       try {
+        // Ensure proofPath is a string
+        proofPath = String(proofPath);
         console.log('🔥 Processing Firebase image URL:', proofPath);
         
         // Check if it's already a complete Firebase Storage URL
         let firebaseStorageUrl;
-        if (proofPath.startsWith('https://firebasestorage.googleapis.com/')) {
+        if (proofPath.startsWith('https://firebasestorage.googleapis.com/') || proofPath.startsWith('http')) {
           // It's already a complete URL, use it directly
           firebaseStorageUrl = proofPath;
           console.log('✅ Using complete Firebase URL directly:', firebaseStorageUrl);
         } else {
           // It's a path, convert to Firebase Storage URL
-          const bucket = FIREBASE_CONFIG.storageBucket || 'ibantayv2.firebasestorage.app';
+          const bucket = (typeof FIREBASE_CONFIG !== 'undefined' && FIREBASE_CONFIG.storageBucket) ? FIREBASE_CONFIG.storageBucket : 'ibantayv2.firebasestorage.app';
           const encodedPath = encodeURIComponent(proofPath);
           firebaseStorageUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket}/o/${encodedPath}?alt=media`;
           console.log('🔗 Converted path to Firebase URL:', firebaseStorageUrl);
         }
 
         console.log('🖼️ Final URL to load:', firebaseStorageUrl);
+
+        // Update the link for "Open in New Tab" immediately
+        if (proofImageLink) {
+          proofImageLink.href = firebaseStorageUrl;
+          // Ensure it opens in a new tab
+          proofImageLink.target = "_blank";
+          // Prevent default behavior if href is #
+          proofImageLink.onclick = function(e) {
+             if (this.getAttribute('href') === '#') {
+                 e.preventDefault();
+                 alert('No valid image URL to open.');
+             }
+          };
+        }
 
         // Test URL accessibility before trying to load image
         fetch(firebaseStorageUrl, { method: 'HEAD' })
@@ -876,29 +935,16 @@ service firebase.storage {
           });
 
         // Reset all media elements
-        if (proofImage) {
-          proofImage.src = '';
-          proofImage.classList.add('hidden');
-        }
-        if (proofVideo) {
-          proofVideo.classList.add('hidden');
-          if (proofVideoSource) proofVideoSource.src = '';
-        }
-        if (proofMediaNone) {
-          proofMediaNone.classList.add('hidden');
-        }
-
+        // Note: proofImage, proofVideo, proofMediaNone are not defined in this scope in the original code
+        // We should check if they exist or remove this block if they are not used
+        // Based on the HTML structure, we are injecting HTML into proofContent, so we don't need to reset these variables if they are not global.
+        
         // Function to determine if URL is a video file
         const isVideo = (url) => {
           const videoExtensions = ['.mp4', '.webm', '.ogg', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.m4v', '.3gp'];
           const urlLower = url.toLowerCase();
           return videoExtensions.some(ext => urlLower.includes(ext));
         };
-
-        // Update the link for "Open in New Tab"
-        if (proofImageLink) {
-          proofImageLink.href = firebaseStorageUrl;
-        }
 
         if (isVideo(firebaseStorageUrl)) {
           // Handle video
@@ -942,13 +988,24 @@ service firebase.storage {
         console.error('Error in media loading process:', error);
         proofContent.innerHTML = `
           <div class="text-center text-red-500 py-10">
-            <p>An unexpected error occurred.</p>
+            <p>An unexpected error occurred: ${error.message}</p>
           </div>
         `;
       }
     }; // Close window.viewProof function
 
   </script>
+  <!-- Current User Context -->
+  <script>
+    window.CURRENT_USER = {
+      role: "<?php echo htmlspecialchars($userRole); ?>",
+      isAdmin: <?php echo $isAdmin ? 'true' : 'false'; ?>,
+      isTanod: <?php echo $isTanod ? 'true' : 'false'; ?>,
+      assignedBarangay: "<?php echo htmlspecialchars($assignedBarangay); ?>"
+    };
+    console.log('Current User Context:', window.CURRENT_USER);
+  </script>
+
   <!-- Firebase + real-time logic -->
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
@@ -1246,47 +1303,44 @@ service firebase.storage {
         </div>
       `;
     }
-              </div>
-              <div class="flex justify-between border-b border-slate-100 py-2 col-span-1 md:col-span-2">
-                <span class="font-medium text-slate-500">ID Address</span>
-                <span class="text-slate-700 font-semibold text-right">${permanentAddress || '—'}</span>
-              </div>
-            </div>
-            
-            <!-- Verification Documents -->
-            <div class="bg-slate-50 rounded-xl p-4">
-              <h4 class="text-sm font-semibold text-slate-600 mb-3">Verification Documents</h4>
-              <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                ${frontIdButton}
-                ${backIdButton}
-                ${selfieButton}
-                ${proofButton}
-              </div>
-            </div>
-            
-            ${createdAtStr ? `<div class="text-center py-3 bg-slate-100/60 rounded-2xl">
-              <p class="text-sm text-slate-600 font-medium">📅 Created: ${createdAtStr}</p>
-            </div>` : ''}
-          </div>
-          <div class="border-t border-slate-200/80 pt-5 flex flex-col sm:flex-row gap-3 justify-end">
-            <button class="btn-reject bg-slate-200 hover:bg-slate-300 text-slate-700 font-semibold px-5 py-2.5 rounded-lg transition-colors flex items-center justify-center gap-2" data-id="${u.id}">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
-              </svg>
-              Reject
-            </button>
-            <button class="btn-approve bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-5 py-2.5 rounded-lg shadow-sm hover:shadow-md transition-all duration-200 flex items-center justify-center gap-2" data-id="${u.id}">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-              </svg>
-              Approve
-            </button>
-          </div>
-        </div>
-      `;
+
+    function shouldShowUser(u) {
+      const currentUser = window.CURRENT_USER;
+      // Admin sees all
+      if (currentUser.isAdmin) return true;
+      
+      // Tanod logic
+      if (currentUser.isTanod) {
+          const staffBarangay = (currentUser.assignedBarangay || '').toLowerCase().trim();
+          
+          // If staff has no assigned barangay, they can't verify anyone (safety fallback)
+          if (!staffBarangay) return false;
+
+          const userData = u.data || {};
+          // Check multiple possible fields for barangay
+          const userBarangay = (userData.currentBarangay || userData.barangay || userData.Barangay || '').toLowerCase().trim();
+          const userAddress = (userData.currentAddress || userData.address || u.address || '').toLowerCase().trim();
+
+          // 1. Direct match on barangay field
+          if (userBarangay === staffBarangay) return true;
+
+          // 2. Check if address contains the barangay name (e.g. "Purok 1, Balayong")
+          if (userAddress.includes(staffBarangay)) return true;
+          
+          return false;
+      }
+
+      return false;
     }
 
     function upsertCard(u) {
+      // Filter users based on role and barangay
+      if (!shouldShowUser(u)) {
+        // If user shouldn't be shown, ensure they are removed if they exist (e.g. if data changed)
+        removeCard(u.id);
+        return;
+      }
+
       const existing = vuList.querySelector(`.user-card[data-uid="${u.id}"]`);
       if (existing) {
         existing.outerHTML = userCardHTML(u);
@@ -1334,7 +1388,61 @@ service firebase.storage {
       } else {
         pendingCount.textContent = count.toString();
       }
+
+      // Update Sidebar Badge for Verify Users
+      const badge = document.getElementById('verifyUsersBadge');
+      const mobileBadge = document.getElementById('verifyUsersBadgeMobile');
+      
+      if (count > 0) {
+          if (badge) {
+              badge.textContent = count;
+              badge.classList.remove('hidden');
+          }
+          if (mobileBadge) {
+              mobileBadge.textContent = count;
+              mobileBadge.classList.remove('hidden');
+          }
+      } else {
+          if (badge) badge.classList.add('hidden');
+          if (mobileBadge) mobileBadge.classList.add('hidden');
+      }
     }
+
+    // Live Support Badge Logic
+    async function updateLiveSupportBadge() {
+        try {
+            const response = await fetch('api/support_chat.php?action=get_chats');
+            const result = await response.json();
+            
+            if (Array.isArray(result.chats)) {
+                // Count pending chats
+                const pendingCount = result.chats.filter(c => !c.status || c.status === 'pending' || c.status === 'waiting').length;
+                
+                const badgeDesktop = document.getElementById('liveSupportBadge');
+                const badgeMobile = document.getElementById('liveSupportBadgeMobile');
+                
+                if (pendingCount > 0) {
+                    if (badgeDesktop) {
+                        badgeDesktop.textContent = pendingCount;
+                        badgeDesktop.classList.remove('hidden');
+                    }
+                    if (badgeMobile) {
+                        badgeMobile.textContent = pendingCount;
+                        badgeMobile.classList.remove('hidden');
+                    }
+                } else {
+                    if (badgeDesktop) badgeDesktop.classList.add('hidden');
+                    if (badgeMobile) badgeMobile.classList.add('hidden');
+                }
+            }
+        } catch (error) {
+            console.error('Error updating live support badge:', error);
+        }
+    }
+
+    // Start polling for live support badge updates
+    setInterval(updateLiveSupportBadge, 5000); // Poll every 5 seconds
+    updateLiveSupportBadge(); // Initial call
 
     async function setStatus(id, newStatus) {
       try {
@@ -1402,72 +1510,82 @@ service firebase.storage {
       }
     });
 
-    // Load initial pending users (simple safety net)
+    // Load initial pending users (Fast Mode - Non-blocking)
     async function loadPending() {
-      try {
-        console.log('Starting to load pending users...');
-        
-        // Try multiple queries for different status field variations (without orderBy to avoid index issues)
-        const queries = [
-          query(collection(db, 'users'), where('status', '==', 'pending'), limit(200)),
-          query(collection(db, 'users'), where('accountStatus', '==', 'pending'), limit(200)),
-          query(collection(db, 'users'), where('Status', '==', 'pending'), limit(200)),
-          query(collection(db, 'users'), where('AccountStatus', '==', 'pending'), limit(200))
-        ];
-
-        for (const q of queries) {
-          try {
-            const snap = await getDocs(q);
-            console.log(`Query found ${snap.size} users`);
-            snap.forEach(docSnap => {
-              const data = docSnap.data();
-              const id = docSnap.id;
-              console.log('Found user:', id, data);
-              upsertCard(normalizeUser(id, data));
-            });
-          } catch (queryError) {
-            console.warn('Query failed, trying next:', queryError);
-          }
-        }
-        
-        // Also try loading all users and filter client-side as fallback
-        try {
-          console.log('Trying to load all users as fallback...');
-          const allUsersQuery = query(collection(db, 'users'), limit(500));
-          const allSnap = await getDocs(allUsersQuery);
-          console.log(`Found ${allSnap.size} total users`);
+      console.log('Starting to load pending users (Fast Mode)...');
+      const processedIds = new Set();
+      
+      // Function to process any snapshot immediately
+      const processResult = (snap, sourceName) => {
+          console.log(`Source [${sourceName}] returned ${snap.size} docs`);
+          if (snap.empty) return;
           
-          let pendingFound = 0;
-          allSnap.forEach(docSnap => {
-            const data = docSnap.data();
-            const id = docSnap.id;
-            const status = (data.accountStatus ?? data.status ?? data.Status ?? data.AccountStatus ?? 'pending').toLowerCase();
-            console.log(`User ${id} has status: ${status}`);
-            
-            if (status === 'pending') {
-              pendingFound++;
-              console.log('Adding pending user:', id);
-              upsertCard(normalizeUser(id, data));
-            }
+          let newFound = 0;
+          snap.forEach(docSnap => {
+              const id = docSnap.id;
+              // Avoid duplicates
+              if (!processedIds.has(id)) {
+                  const data = docSnap.data();
+                  // Client-side verification of status to be safe
+                  const status = (data.accountStatus ?? data.status ?? data.Status ?? data.AccountStatus ?? 'pending').toLowerCase();
+                  
+                  if (status === 'pending') {
+                      processedIds.add(id);
+                      upsertCard(normalizeUser(id, data));
+                      newFound++;
+                  }
+              }
           });
-          console.log(`Found ${pendingFound} pending users total`);
-        } catch (allUsersError) {
-          console.warn('All users query failed:', allUsersError);
-        }
-        
-        // Update pending count after initial load
-        updatePendingCount();
-        console.log('Finished loading pending users');
-      } catch (e) {
-        console.error('Initial load error:', e);
-        toast('Failed to load users: ' + e.message, 'error');
-      }
+          
+          if (newFound > 0) {
+              updateEmpty();
+              updatePendingCount();
+          }
+      };
+
+      // Define queries - Fire multiple strategies at once
+      const queries = [
+          // Strategy 1: Direct status query (Fastest if indexed)
+          { name: 'status=pending', q: query(collection(db, 'users'), where('status', '==', 'pending'), limit(50)) },
+          
+          // Strategy 2: Alternative field name
+          { name: 'accountStatus=pending', q: query(collection(db, 'users'), where('accountStatus', '==', 'pending'), limit(50)) },
+          
+          // Strategy 3: Newest users first (Uses auto-created index on registrationDate)
+          // This is crucial for finding recently registered users if the status index is missing
+          { name: 'newest_by_reg', q: query(collection(db, 'users'), orderBy('registrationDate', 'desc'), limit(100)) },
+
+          // Strategy 4: Newest users by createdAt (Alternative timestamp field)
+          { name: 'newest_by_created', q: query(collection(db, 'users'), orderBy('createdAt', 'desc'), limit(100)) },
+          
+          // Strategy 5: Fallback - Get a larger chunk of users (by ID) and filter client-side
+          { name: 'latest_users_fallback', q: query(collection(db, 'users'), limit(500)) }
+      ];
+
+      // Execute all independently - don't wait for one to block the others
+      queries.forEach(({ name, q }) => {
+          getDocs(q)
+            .then(snap => processResult(snap, name))
+            .catch(err => {
+                console.warn(`Query [${name}] failed (likely missing index):`, err);
+            });
+      });
+      
+      // Safety timeout: If nothing loads in 10 seconds, remove the spinner so user isn't stuck
+      setTimeout(() => {
+          const loadingEl = document.getElementById('vuLoading');
+          if (loadingEl) {
+             console.log('Safety timeout reached. Checking if any users found...');
+             updateEmpty(); // This will show "All Caught Up" if no cards found yet
+          }
+      }, 10000);
     }
 
     // Setup real-time listener for all users (filter client-side)
     console.log('Setting up real-time listener...');
     const qAll = query(
       collection(db, 'users'),
+      orderBy('registrationDate', 'desc'),
       limit(500)
     );
     onSnapshot(qAll, (snap) => {

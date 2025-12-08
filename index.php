@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__ . '/db_config.php';
 session_start();
 
 // Check if user is already logged in

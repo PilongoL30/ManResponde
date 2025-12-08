@@ -1,6 +1,8 @@
 <?php
 // logout.php
 
+require_once __DIR__ . '/db_config.php';
+
 // Start the session.
 session_start();
 

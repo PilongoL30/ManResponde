@@ -1,9 +1,9 @@
 <?php
+require_once __DIR__.'/db_config.php';
 // Only start session if not already started
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
-require_once __DIR__.'/db_config.php';
 require_once __DIR__.'/fcm_config.php';
 
 /**
@@ -67,7 +67,8 @@ function check_urgent_reports(array $userCategories = []): array {
         'fire_reports', 
         'flood_reports',
         'other_reports',
-        'tanod_reports'
+        'tanod_reports',
+        'police_reports'
     ];
     
     // Map collection names to category slugs
@@ -76,7 +77,8 @@ function check_urgent_reports(array $userCategories = []): array {
         'fire_reports' => 'fire',
         'flood_reports' => 'flood',
         'other_reports' => 'other',
-        'tanod_reports' => 'tanod'
+        'tanod_reports' => 'tanod',
+        'police_reports' => 'police'
     ];
     
     // Filter collections based on user categories
@@ -89,12 +91,6 @@ function check_urgent_reports(array $userCategories = []): array {
             }
         }
         $reportCollections = $allowedCollections;
-        
-        // Debug logging to verify filtering
-        error_log("✅ URGENT REPORTS FILTERED: User categories: " . implode(', ', $userCategories));
-        error_log("✅ CHECKING ONLY COLLECTIONS: " . implode(', ', $reportCollections));
-    } else {
-        error_log("⚠️ NO USER CATEGORIES - checking all collections (this should not happen for staff)");
     }
     
     try {
@@ -316,7 +312,8 @@ function check_urgent_reports_original(array $userCategories = []): array {
         'fire_reports', 
         'flood_reports',
         'other_reports',
-        'tanod_reports'
+        'tanod_reports',
+        'police_reports'
     ];
     
     // Map collection names to category slugs
@@ -325,7 +322,8 @@ function check_urgent_reports_original(array $userCategories = []): array {
         'fire_reports' => 'fire',
         'flood_reports' => 'flood',
         'other_reports' => 'other',
-        'tanod_reports' => 'tanod'
+        'tanod_reports' => 'tanod',
+        'police_reports' => 'police'
     ];
     
     // Filter collections based on user categories
@@ -457,7 +455,8 @@ function check_and_create_notifications(array $userCategories = []): void {
                 'fire_reports' => '🔥 Fire',
                 'flood_reports' => '🌊 Flood',
                 'other_reports' => '📋 Other',
-                'tanod_reports' => '👮 Tanod'
+                'tanod_reports' => '👮 Tanod',
+                'police_reports' => '🚓 Police'
             ];
             
             $collectionLabel = $collectionLabels[$collection] ?? '📋 Report';
@@ -519,7 +518,8 @@ function get_staff_notifications(int $limit = 20, array $userCategories = []): a
             'fire_reports' => 'fire',
             'flood_reports' => 'flood',
             'other_reports' => 'other',
-            'tanod_reports' => 'tanod'
+            'tanod_reports' => 'tanod',
+            'police_reports' => 'police'
         ];
         
         if (is_array($response)) {
@@ -864,6 +864,7 @@ function send_fcm_notification_to_responders_legacy(string $emergencyType, strin
         'fire' => ['emoji' => '🔥', 'label' => 'FIRE'],
         'flood' => ['emoji' => '🌊', 'label' => 'FLOOD'],
         'tanod' => ['emoji' => '🚔', 'label' => 'TANOD'],
+        'police' => ['emoji' => '🚓', 'label' => 'POLICE'],
         'other' => ['emoji' => '🚨', 'label' => 'EMERGENCY']
     ];
     $emoji = $map[$key]['emoji'] ?? '🚨';
@@ -877,6 +878,7 @@ function send_fcm_notification_to_responders_legacy(string $emergencyType, strin
         'fire' => 'fire_reports',
         'flood' => 'flood_reports',
         'tanod' => 'tanod_reports',
+        'police' => 'police_reports',
         'other' => 'other_reports'
     ];
     $collection = $collectionMap[$key] ?? null;

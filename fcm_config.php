@@ -174,7 +174,7 @@ function test_new_notification_flow(string $collection, string $docId): array {
     $results['reporterId'] = $reporterId;
     
     // Get responders
-    $collectionMap = ['ambulance_reports' => 'ambulance', 'fire_reports' => 'fire', 'flood_reports' => 'flood', 'tanod_reports' => 'tanod', 'other_reports' => 'other'];
+    $collectionMap = ['ambulance_reports' => 'ambulance', 'fire_reports' => 'fire', 'flood_reports' => 'flood', 'tanod_reports' => 'tanod', 'police_reports' => 'police', 'other_reports' => 'other'];
     $emergencyType = $collectionMap[$collection] ?? 'other';
     $responders = get_responders_for_category($emergencyType);
     
@@ -446,6 +446,7 @@ function send_fcm_notification_for_approved_report(string $collection, string $d
             'fire_reports' => ['type' => 'fire', 'emoji' => '🔥', 'label' => 'FIRE'],
             'flood_reports' => ['type' => 'flood', 'emoji' => '🌊', 'label' => 'FLOOD'],
             'tanod_reports' => ['type' => 'tanod', 'emoji' => '🚔', 'label' => 'TANOD'],
+            'police_reports' => ['type' => 'police', 'emoji' => '🚓', 'label' => 'POLICE'],
             'other_reports' => ['type' => 'other', 'emoji' => '🚨', 'label' => 'EMERGENCY']
         ];
         
@@ -617,6 +618,7 @@ function send_fcm_notification_to_user_for_rejected_report(string $collection, s
             'fire_reports' => 'fire',
             'flood_reports' => 'flood',
             'tanod_reports' => 'tanod',
+            'police_reports' => 'police',
             'other_reports' => 'other'
         ];
         $emergencyType = $collectionMap[$collection] ?? 'other';
@@ -627,16 +629,24 @@ function send_fcm_notification_to_user_for_rejected_report(string $collection, s
             'fire' => 'Your fire report was declined. Verify the situation and include precise location / severity details then resubmit if the threat persists.',
             'flood' => 'Your flood report was declined. Add water level, affected people, and exact location then resubmit if still needed.',
             'tanod' => 'Your security (tanod) report was declined. Include what happened, persons involved, and location then resubmit if assistance is still needed.',
+            'police' => 'Your police report was declined. Please provide more details about the incident and location, then resubmit if assistance is still needed.',
             'other' => 'Your report was declined. Please add missing/clear details and resubmit if you still need help.'
         ];
         $body = $bodyMap[$emergencyType] ?? $bodyMap['other'];
+        
+        // Append specific decline reason if provided
+        if (!empty($declineReason)) {
+            $body .= "\n\nReason: " . $declineReason;
+        }
+        
         $data = [
             'type' => 'report_status',
             'reportId' => $docId,
             'collection' => $collection,
             'status' => 'declined',
             'emergencyType' => $emergencyType,
-            'audience' => 'user'
+            'audience' => 'user',
+            'declineReason' => $declineReason
         ];
         return send_fcm_notification_to_user($reporterId, $title, $body, $data);
     } catch (Exception $e) {
@@ -709,6 +719,7 @@ function send_fcm_notification_to_user_for_approved_report(string $collection, s
             'fire_reports' => 'fire',
             'flood_reports' => 'flood',
             'tanod_reports' => 'tanod',
+            'police_reports' => 'police',
             'other_reports' => 'other'
         ];
         
@@ -723,6 +734,7 @@ function send_fcm_notification_to_user_for_approved_report(string $collection, s
             'fire' => 'Your fire emergency report was approved. Fire responders are en route. Move everyone to a safe location and keep clear of the danger area.',
             'flood' => 'Your flood report was approved. Rescue personnel are on the way. Move to higher ground and keep your phone accessible.',
             'tanod' => 'Your security (tanod) report was approved. Barangay tanod personnel are on the way. Stay in a safe, visible area if you can.',
+            'police' => 'Your police report was approved. Police officers are on the way. Stay in a safe location.',
             'other' => 'Your report was approved. Responders are on the way. Stay safe and follow any instructions you receive.'
         ];
         $body = $bodyMap[$emergencyType] ?? $bodyMap['other'];
@@ -1244,6 +1256,7 @@ function send_emergency_notification_directly(string $collection, string $docId)
             'fire_reports' => ['type' => 'fire', 'emoji' => '🔥', 'label' => 'FIRE'],
             'flood_reports' => ['type' => 'flood', 'emoji' => '🌊', 'label' => 'FLOOD'],
             'tanod_reports' => ['type' => 'tanod', 'emoji' => '🚔', 'label' => 'TANOD'],
+            'police_reports' => ['type' => 'police', 'emoji' => '🚓', 'label' => 'POLICE'],
             'other_reports' => ['type' => 'other', 'emoji' => '🚨', 'label' => 'EMERGENCY']
         ];
         
