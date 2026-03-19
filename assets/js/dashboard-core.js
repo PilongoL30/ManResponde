@@ -24,10 +24,11 @@ if (Notification && Notification.permission === 'default') {
     });
 }
 
-    const categories = (window.dashboardConfig && window.dashboardConfig.categories) || window.categories;
+const categories = (window.dashboardConfig && window.dashboardConfig.categories) || window.categories;
 
-    // Helper function for SVG icons in JavaScript
-    function svg_icon(name, className = 'w-6 h-6') {
+// Main Dashboard Module - wrapper removed, using direct execution
+// Helper function for SVG icons in JavaScript
+function svg_icon(name, className = 'w-6 h-6') {
         const icons = {
             'dashboard': '<path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />',
             'truck': '<path stroke-linecap="round" stroke-linejoin="round" d="M8.25 18.75a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h6m-9 0H3.375a1.125 1.125 0 01-1.125-1.125V14.25m17.25 4.5a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h1.125c.621 0 1.125-.504 1.125-1.125V14.25m-17.25 4.5v-1.875a3.375 3.375 0 003.375-3.375h1.5a1.125 1.125 0 011.125 1.125v-1.5a3.375 3.375 0 00-3.375-3.375H9.75V7.5h1.5a3.375 3.375 0 013.375 3.375v1.5a1.125 1.125 0 001.125 1.125h1.5a3.375 3.375 0 003.375-3.375V7.5a1.125 1.125 0 00-1.125-1.125H5.625" />',
@@ -421,6 +422,12 @@ if (Notification && Notification.permission === 'default') {
                     setTimeout(() => {
                         loadNotificationCount();
                     }, 500);
+                }
+
+                // Refresh admin recent activity feed immediately (avoid cache delay)
+                if (typeof window.refreshRecentActivity === 'function') {
+                    window.forceRecentFeedRefresh = true;
+                    window.refreshRecentActivity();
                 }
                 
             } else {
@@ -1034,12 +1041,12 @@ if (Notification && Notification.permission === 'default') {
             staffEmpty.classList.add('hidden');
 
             // Fetch staff data
-            const response = await fetch('api.php', {
+            const formData = new FormData();
+            formData.append('api_action', 'get_staff_data');
+
+            const response = await fetch(window.location.href, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: 'api_action=get_staff_data'
+                body: formData
             });
 
             const result = await response.json();
@@ -1323,6 +1330,7 @@ if (Notification && Notification.permission === 'default') {
                         console.error('Geocoding error:', err);
                         if (mapStatus) mapStatus.textContent = 'Map error';
                     });
+                }
             }
         }
         
@@ -1832,7 +1840,11 @@ if (Notification && Notification.permission === 'default') {
     // Recent Activity Logic
     (function() {
         const list = document.getElementById('activityList');
-        if (!list) return;
+        console.log('[RecentActivity] activityList element:', list ? 'FOUND' : 'NOT FOUND');
+        if (!list) {
+            console.warn('[RecentActivity] activityList not found - Recent Activity features disabled');
+            return;
+        }
 
         const pageSizeEl = document.getElementById('activityPageSize');
         const rangeEl   = document.getElementById('activityRange');
@@ -1874,6 +1886,10 @@ if (Notification && Notification.permission === 'default') {
                 fd.append('search', searchEl ? searchEl.value.trim() : '');
                 fd.append('category', categoryEl ? categoryEl.value : 'all');
                 fd.append('status', statusEl ? statusEl.value : 'all');
+                if (window.forceRecentFeedRefresh === true) {
+                    fd.append('force_refresh', 'true');
+                    window.forceRecentFeedRefresh = false;
+                }
                 fd.append('_t', Date.now());
                 
                 const res = await fetch(window.location.href, {
@@ -1894,6 +1910,25 @@ if (Notification && Notification.permission === 'default') {
                 total = Number(json.total || 0);
                 currentPage = Number(json.page || page);
                 const data = Array.isArray(json.data) ? json.data : [];
+
+                // Staff-like realtime: if the newest (top) item changes during background refresh,
+                // notify admin and keep feed in sync.
+                try {
+                    const top = data[0];
+                    const sig = top ? `${top.collection || ''}:${top.id || ''}:${top.status || ''}:${top.timestamp || top.tsDisplay || ''}` : '';
+                    if (!window.__adminRecentSig) {
+                        window.__adminRecentSig = sig;
+                        window.__adminRecentSigInit = true;
+                    } else if (sig && sig !== window.__adminRecentSig) {
+                        window.__adminRecentSig = sig;
+                        // Only alert on background refresh/polling to avoid firing on filter changes.
+                        if (isBackgroundRefresh && !document.hidden && typeof window.showNotificationWithSound === 'function') {
+                            window.showNotificationWithSound('New report received!', 'info', 'siren');
+                        }
+                    }
+                } catch (e) {
+                    // ignore notify errors
+                }
                 
                 window.recentFeedData = data;
                 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -2143,55 +2178,12 @@ if (Notification && Notification.permission === 'default') {
             loadRecentPage(currentPage);
         };
 
-        // Reduced polling interval to 3 seconds for better realtime feel
-        setInterval(() => {
-            if (!document.hidden) {
-                window.isBackgroundRefresh = true;
-                loadRecentPage(currentPage);
-            }
-        }, 3000);
+        // Firebase Realtime listeners handle updates - no polling needed
+        // Realtime listeners are set up in dashboard.php using modular Firebase SDK
+        console.log('[RecentActivity] ✅ Ready - Firebase Realtime listeners in dashboard.php handle updates');
     })();
 
-// Initialize Firebase for Realtime Updates
-if (window.FIREBASE_CLIENT_CONFIG && typeof firebase !== 'undefined') {
-    try {
-        if (!firebase.apps.length) {
-            firebase.initializeApp(window.FIREBASE_CLIENT_CONFIG);
-        }
-        const db = firebase.firestore();
-        
-        // Listen for new reports in all categories
-        const collections = ['ambulance_reports', 'fire_reports', 'police_reports', 'tanod_reports', 'flood_reports', 'other_reports'];
-        
-        collections.forEach(collection => {
-            db.collection(collection)
-                .where('status', '==', 'Pending')
-                .orderBy('timestamp', 'desc')
-                .limit(1)
-                .onSnapshot(snapshot => {
-                    snapshot.docChanges().forEach(change => {
-                        if (change.type === 'added') {
-                            const data = change.doc.data();
-                            // Only notify if the report is very recent (last 5 minutes) to avoid spam on load
-                            const reportTime = data.timestamp ? (data.timestamp.seconds * 1000) : Date.now();
-                            if (Date.now() - reportTime < 5 * 60 * 1000) {
-                                showNotificationWithSound(`New ${collection.replace('_reports', '')} report received!`, 'info', 'siren');
-                                // Refresh the feed if on dashboard
-                                if (typeof loadRecentActivity === 'function') {
-                                    loadRecentActivity();
-                                }
-                            }
-                        }
-                    });
-                }, error => {
-                    console.log(`Realtime listener error for ${collection}:`, error);
-                });
-        });
-        
-        console.log('Firebase Realtime Listeners initialized');
-    } catch (e) {
-        console.error('Firebase initialization failed:', e);
-    }
-}
+// Note: Firebase Realtime listeners are initialized in dashboard.php using the modular SDK
+// The compat SDK (firebase.initializeApp) is not loaded, so we skip this section
 
 

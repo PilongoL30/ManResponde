@@ -1,7 +1,21 @@
 <?php
 // login.php
 
-require_once __DIR__ . '/db_config.php';
+require_once __DIR__ . '/config.php';
+
+if (session_status() === PHP_SESSION_NONE) {
+    $sessionPath = __DIR__ . '/sessions';
+    if (!is_dir($sessionPath)) {
+        mkdir($sessionPath, 0755, true);
+    }
+    session_save_path($sessionPath);
+    ini_set('session.gc_probability', 1);
+    ini_set('session.gc_divisor', 100);
+}
+
+require_once __DIR__ . '/includes/csrf.php';
+
+$bootstrapError = '';
 
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
@@ -10,27 +24,50 @@ if (session_status() === PHP_SESSION_NONE) {
 use Kreait\Firebase\Exception\Auth\InvalidPassword;
 use Kreait\Firebase\Exception\Auth\UserNotFound;
 
-if (isset($_SESSION['user_id']) && $_SESSION['user_id']) {
+if (!$bootstrapError && isset($_SESSION['user_id']) && $_SESSION['user_id']) {
     header('Location: dashboard.php');
     exit;
 }
 
-$auth = initialize_auth();
-$error_message = '';
+$error_message = $bootstrapError;
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if (!$bootstrapError && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        require_once __DIR__ . '/db_config.php';
+    } catch (Throwable $e) {
+        $bootstrapError = 'System configuration error. Please contact administrator.';
+        error_log('[login] Bootstrap error: ' . $e->getMessage());
+    }
+
+    if ($bootstrapError) {
+        $error_message = $bootstrapError;
+    } else {
     // Verify CSRF token
     if (!csrf_verify_token()) {
+        // Safe debug logging (do not log token/id_token values)
+        try {
+            $hasCsrfPost = isset($_POST[CSRF_TOKEN_NAME]) && $_POST[CSRF_TOKEN_NAME] !== '';
+            $hasCsrfSession = isset($_SESSION[CSRF_TOKEN_NAME]) && $_SESSION[CSRF_TOKEN_NAME] !== '';
+            $isGoogleLogin = !empty($_POST['google_id_token']);
+            error_log('[login] CSRF validation failed: google=' . ($isGoogleLogin ? '1' : '0') .
+                ' post_csrf=' . ($hasCsrfPost ? '1' : '0') .
+                ' sess_csrf=' . ($hasCsrfSession ? '1' : '0') .
+                ' sid=' . session_id());
+        } catch (Throwable $t) {
+            // ignore logging errors
+        }
         $error_message = 'Security token validation failed. Please try again.';
     } else {
         $uid = null;
         $email = null;
 
         try {
+        $auth = initialize_auth();
         // CASE A: Google Sign-In
         if (!empty($_POST['google_id_token'])) {
-            // Add 300 seconds (5 minutes) leeway for clock skew
-            $verifiedIdToken = $auth->verifyIdToken($_POST['google_id_token'], 300);
+            // Add 300 seconds (5 minutes) leeway for clock skew. 
+            // Signature: verifyIdToken($idToken, bool $checkIfRevoked = false, int $leewayInSeconds = 0)
+            $verifiedIdToken = $auth->verifyIdToken($_POST['google_id_token'], false, 300);
             $uid = $verifiedIdToken->claims()->get('sub');
             $email = $verifiedIdToken->claims()->get('email');
         } 
@@ -103,17 +140,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $_SESSION['user_role'] = $role;
             $_SESSION['user_fullname'] = $userData['fullName'] ?? '';
             $_SESSION['assignedBarangay'] = $userData['assignedBarangay'] ?? '';
+            $_SESSION['user_categories'] = is_array(($userData['categories'] ?? null)) ? $userData['categories'] : [];
 
-            header('Location: dashboard');
+            header('Location: dashboard.php');
             exit;
         }
 
     } catch (InvalidPassword | UserNotFound $e) {
         $error_message = 'Invalid credentials.';
     } catch (Throwable $e) {
-        $error_message = $e->getMessage();
+        $rawMessage = $e->getMessage();
+        if (stripos($rawMessage, 'invalid_grant') !== false || stripos($rawMessage, 'Invalid JWT Signature') !== false) {
+            $error_message = 'Server authentication key is invalid or expired. Please replace Firebase service account JSON credentials.';
+        } else {
+            $error_message = $rawMessage;
+        }
     }
     } // End CSRF check
+    }
 }
 
 // Provide local svg_icon helper if not available
@@ -266,7 +310,7 @@ if (!function_exists('svg_icon')) {
                             </div>
                         <?php endif; ?>
 
-                        <form action="login" method="POST" class="space-y-5">
+                        <form action="login.php" method="POST" class="space-y-5">
                             <?php echo csrf_field(); ?>
                             <div>
                                 <label for="identifier" class="field-label">Email or Username</label>
@@ -309,6 +353,12 @@ if (!function_exists('svg_icon')) {
                                 <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" class="w-5 h-5 mr-2" alt="Google">
                                 Sign in with Google
                             </button>
+
+                            <div class="mt-4 text-center">
+                                <a href="index.php" class="text-sm font-medium text-blue-600 hover:text-blue-500 transition-colors">
+                                    &larr; Back to Home
+                                </a>
+                            </div>
 
                             <p class="text-center text-xs text-gray-400">© <?php echo date('Y'); ?> ManResponde. All rights reserved.</p>
                         </form>
@@ -358,6 +408,17 @@ if (!function_exists('svg_icon')) {
             return result.user.getIdToken();
           })
           .then((idToken) => {
+                        // Include CSRF token (required by login.php POST handler)
+                        const csrfField = document.querySelector('input[name="<?php echo CSRF_TOKEN_NAME; ?>"]');
+                        const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+                        const csrfToken = csrfField?.value || csrfMeta?.getAttribute('content') || '';
+
+                        if (!csrfToken) {
+                            // If token is missing, refresh to regenerate session token
+                            window.location.reload();
+                            return;
+                        }
+
             // Submit token to server
             const form = document.createElement('form');
             form.method = 'POST';
@@ -367,8 +428,14 @@ if (!function_exists('svg_icon')) {
             input.type = 'hidden';
             input.name = 'google_id_token';
             input.value = idToken;
+
+                        const csrfInput = document.createElement('input');
+                        csrfInput.type = 'hidden';
+                        csrfInput.name = '<?php echo CSRF_TOKEN_NAME; ?>';
+                        csrfInput.value = csrfToken;
             
             form.appendChild(input);
+                        form.appendChild(csrfInput);
             document.body.appendChild(form);
             form.submit();
           })

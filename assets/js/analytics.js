@@ -8,6 +8,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const ctxResponse = document.getElementById('responseTimeChart').getContext('2d');
 
     let categoryChart, trendChart, responseChart;
+    let firstLoad = true;
 
     // Initialize Charts with default/empty data
     function initCharts() {
@@ -90,6 +91,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const formData = new FormData();
             formData.append('api_action', 'get_analytics_data');
             formData.append('range', range);
+            formData.append('force_refresh', firstLoad ? 'true' : 'false');
 
             const response = await fetch(window.location.href, {
                 method: 'POST',
@@ -100,6 +102,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (result.success) {
                 updateCharts(result.data);
                 updateMetrics(result.data);
+                firstLoad = false;
             } else {
                 console.error('Analytics API error:', result.message);
                 showToast('Failed to load analytics data', 'error');
@@ -129,6 +132,9 @@ document.addEventListener('DOMContentLoaded', () => {
         trendChart.update();
 
         // Update Response Chart
+        if (Array.isArray(data.responseTimeLabels) && data.responseTimeLabels.length > 0) {
+            responseChart.data.labels = data.responseTimeLabels;
+        }
         responseChart.data.datasets[0].data = data.responseTimeData;
         responseChart.update();
     }
@@ -142,7 +148,11 @@ document.addEventListener('DOMContentLoaded', () => {
         animate('totalReportsCount', data.metrics.totalReports);
         animate('responseRate', data.metrics.responseRate, '%');
         animate('avgResponseTime', data.metrics.avgResponseTime, 'm');
-        animate('activeResponders', data.metrics.activeResponders);
+        animate('activeRespondersCount', data.metrics.activeResponders);
+
+        animate('totalReportsTrend', data.metrics.totalReportsTrend, '%');
+        animate('responseRateTrend', data.metrics.responseRateTrend, '%');
+        animate('responseTimeTrend', data.metrics.responseTimeTrend, '%');
     }
 
     // Event Listeners
@@ -155,5 +165,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Initialize
     initCharts();
-    loadAnalyticsData('week');
+    const initialRange = (timeRange && timeRange.value) ? timeRange.value : 'week';
+    loadAnalyticsData(initialRange);
 });

@@ -26,7 +26,20 @@ if (FIRESTORE_USE_REST) {
 }
 
 // Composer autoload for Firebase SDK
-require __DIR__.'/firebase-php-auth/vendor/autoload.php';
+$firebaseAutoloadPath = __DIR__ . '/firebase-php-auth/vendor/autoload.php';
+if (!is_file($firebaseAutoloadPath)) {
+    throw new RuntimeException('Missing Firebase dependency: ' . $firebaseAutoloadPath);
+}
+require $firebaseAutoloadPath;
+
+// Hosting safety fallback: some deployments have incomplete/stale Composer autoload metadata.
+// Ensure the converter class required by newer Kreait releases is available.
+if (!class_exists('Kreait\\Firebase\\Valinor\\Converter\\SnakeCaseToCamelCaseConverter')) {
+    $converterPath = __DIR__ . '/firebase-php-auth/vendor/kreait/firebase-php/src/Firebase/Valinor/Converter/SnakeCaseToCamelCaseConverter.php';
+    if (is_file($converterPath)) {
+        require_once $converterPath;
+    }
+}
 
 use Kreait\Firebase\Factory;
 use Kreait\Firebase\Auth;
@@ -113,7 +126,16 @@ function get_storage_bucket() {
  * Path to service account JSON.
  */
 function service_account_path(): string {
-    // Keep your existing path here
+    $envPath = getenv('FIREBASE_SERVICE_ACCOUNT_PATH');
+    if (is_string($envPath) && trim($envPath) !== '') {
+        return trim($envPath);
+    }
+
+    $googleAppCreds = getenv('GOOGLE_APPLICATION_CREDENTIALS');
+    if (is_string($googleAppCreds) && trim($googleAppCreds) !== '') {
+        return trim($googleAppCreds);
+    }
+
     return __DIR__.'/firebase-php-auth/config/ibantayv2-firebase-adminsdk-fbsvc-0526b0e79f.json';
 }
 
@@ -123,11 +145,38 @@ function service_account_path(): string {
 function service_account_config(): array {
     static $cfg = null;
     if ($cfg === null) {
-        $path = service_account_path();
-        if (!is_file($path)) {
-            throw new Exception('Service account JSON not found at: '.$path);
+        $envJson = getenv('FIREBASE_SERVICE_ACCOUNT_JSON');
+        if (is_string($envJson) && trim($envJson) !== '') {
+            $cfg = json_decode($envJson, true) ?: [];
+        } else {
+            $path = service_account_path();
+            if (!is_file($path)) {
+                throw new Exception('Service account JSON not found at: '.$path);
+            }
+            $cfg = json_decode(file_get_contents($path), true) ?: [];
         }
-        $cfg = json_decode(file_get_contents($path), true) ?: [];
+
+        if (!is_array($cfg) || empty($cfg)) {
+            throw new Exception('Service account JSON is invalid or empty.');
+        }
+
+        if (isset($cfg['private_key']) && is_string($cfg['private_key'])) {
+            if (strpos($cfg['private_key'], '\\n') !== false) {
+                $cfg['private_key'] = str_replace('\\n', "\n", $cfg['private_key']);
+            }
+            $cfg['private_key'] = trim($cfg['private_key']);
+        }
+
+        $required = ['project_id', 'client_email', 'private_key'];
+        foreach ($required as $requiredKey) {
+            if (empty($cfg[$requiredKey]) || !is_string($cfg[$requiredKey])) {
+                throw new Exception('Service account JSON missing required field: '.$requiredKey);
+            }
+        }
+
+        if (!openssl_pkey_get_private($cfg['private_key'])) {
+            throw new Exception('Service account private_key is invalid or malformed.');
+        }
     }
     return $cfg;
 }
@@ -160,7 +209,16 @@ function firestore_rest_token(): string {
 
     $scopes = ['https://www.googleapis.com/auth/datastore'];
     $creds  = new ServiceAccountCredentials($scopes, service_account_config());
-    $resp   = $creds->fetchAuthToken();
+    try {
+        $resp = $creds->fetchAuthToken();
+    } catch (Throwable $e) {
+        $message = $e->getMessage();
+        if (stripos($message, 'invalid_grant') !== false || stripos($message, 'Invalid JWT Signature') !== false) {
+            error_log('Firestore token error: invalid service account signature. Check/rotate Firebase service account JSON key.');
+            throw new Exception('Firebase service account key is invalid or revoked. Please replace JSON credentials and try again.');
+        }
+        throw $e;
+    }
     $token  = $resp['access_token'] ?? '';
     $exp    = (int)($resp['expires_at'] ?? (time()+300));
     
@@ -527,6 +585,42 @@ function get_admin_stats_counts_fast(array $collections): array {
                         'pending_count' => ['count' => (object)[]]
                     ]
                 ]
+            ],
+            'declined_url' => firestore_base_url() . ':runAggregationQuery',
+            'declined_body' => [
+                'structuredAggregationQuery' => [
+                    'structuredQuery' => [
+                        'from' => [['collectionId' => $collection]],
+                        'where' => [
+                            'fieldFilter' => [
+                                'field' => ['fieldPath' => 'status'],
+                                'op' => 'EQUAL',
+                                'value' => ['stringValue' => 'Declined']
+                            ]
+                        ]
+                    ],
+                    'aggregations' => [
+                        'declined_count' => ['count' => (object)[]]
+                    ]
+                ]
+            ],
+            'responded_url' => firestore_base_url() . ':runAggregationQuery',
+            'responded_body' => [
+                'structuredAggregationQuery' => [
+                    'structuredQuery' => [
+                        'from' => [['collectionId' => $collection]],
+                        'where' => [
+                            'fieldFilter' => [
+                                'field' => ['fieldPath' => 'status'],
+                                'op' => 'EQUAL',
+                                'value' => ['stringValue' => 'Responded']
+                            ]
+                        ]
+                    ],
+                    'aggregations' => [
+                        'responded_count' => ['count' => (object)[]]
+                    ]
+                ]
             ]
         ];
     }
@@ -550,7 +644,8 @@ function get_admin_stats_counts_fast(array $collections): array {
                 'Content-Type: application/json',
                 'Authorization: Bearer ' . firestore_rest_token()
             ],
-            CURLOPT_TIMEOUT => 5
+            CURLOPT_TIMEOUT => 3,
+            CURLOPT_CONNECTTIMEOUT => 2
         ]);
         curl_multi_add_handle($multiHandle, $ch1);
         $curlHandles[] = $ch1;
@@ -567,7 +662,8 @@ function get_admin_stats_counts_fast(array $collections): array {
                 'Content-Type: application/json',
                 'Authorization: Bearer ' . firestore_rest_token()
             ],
-            CURLOPT_TIMEOUT => 5
+            CURLOPT_TIMEOUT => 3,
+            CURLOPT_CONNECTTIMEOUT => 2
         ]);
         curl_multi_add_handle($multiHandle, $ch2);
         $curlHandles[] = $ch2;
@@ -584,11 +680,48 @@ function get_admin_stats_counts_fast(array $collections): array {
                 'Content-Type: application/json',
                 'Authorization: Bearer ' . firestore_rest_token()
             ],
-            CURLOPT_TIMEOUT => 5
+            CURLOPT_TIMEOUT => 3,
+            CURLOPT_CONNECTTIMEOUT => 2
         ]);
         curl_multi_add_handle($multiHandle, $ch3);
         $curlHandles[] = $ch3;
         $requestMap[] = ['collection' => $collection, 'type' => 'pending'];
+
+        // Declined count request
+        $ch4 = curl_init();
+        curl_setopt_array($ch4, [
+            CURLOPT_URL => $request['declined_url'],
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode($request['declined_body']),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . firestore_rest_token()
+            ],
+            CURLOPT_TIMEOUT => 3,
+            CURLOPT_CONNECTTIMEOUT => 2
+        ]);
+        curl_multi_add_handle($multiHandle, $ch4);
+        $curlHandles[] = $ch4;
+        $requestMap[] = ['collection' => $collection, 'type' => 'declined'];
+
+        // Responded count request
+        $ch5 = curl_init();
+        curl_setopt_array($ch5, [
+            CURLOPT_URL => $request['responded_url'],
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode($request['responded_body']),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . firestore_rest_token()
+            ],
+            CURLOPT_TIMEOUT => 3,
+            CURLOPT_CONNECTTIMEOUT => 2
+        ]);
+        curl_multi_add_handle($multiHandle, $ch5);
+        $curlHandles[] = $ch5;
+        $requestMap[] = ['collection' => $collection, 'type' => 'responded'];
     }
     
     // Execute all requests in parallel
@@ -605,13 +738,34 @@ function get_admin_stats_counts_fast(array $collections): array {
         $type = $requestMap[$idx]['type'];
         
         if (!isset($results[$collection])) {
-            $results[$collection] = ['total' => 0, 'approved' => 0, 'pending' => 0];
+            $results[$collection] = ['total' => 0, 'approved' => 0, 'pending' => 0, 'declined' => 0, 'responded' => 0];
         }
         
         try {
             $data = json_decode($response, true);
-            if (isset($data['result']['aggregateFields'])) {
-                $count = $data['result']['aggregateFields'][$type . '_count']['integerValue'] ?? 0;
+
+            // Firestore runAggregationQuery often returns an array of result rows.
+            // Normalize both array and object response shapes.
+            $aggregateFields = null;
+            if (is_array($data) && isset($data[0]['result']['aggregateFields'])) {
+                $aggregateFields = $data[0]['result']['aggregateFields'];
+            } elseif (is_array($data) && isset($data['result']['aggregateFields'])) {
+                $aggregateFields = $data['result']['aggregateFields'];
+            }
+
+            if (is_array($aggregateFields)) {
+                $count = $aggregateFields[$type . '_count']['integerValue'] ?? null;
+                if ($count === null) {
+                    foreach ($aggregateFields as $fieldValue) {
+                        if (isset($fieldValue['integerValue'])) {
+                            $count = $fieldValue['integerValue'];
+                            break;
+                        }
+                    }
+                }
+                if ($count === null) {
+                    $count = 0;
+                }
                 $results[$collection][$type] = (int)$count;
             }
         } catch (Exception $e) {
@@ -691,6 +845,7 @@ function get_admin_stats_counts_fallback(array $collections): array {
                 'approved' => firestore_count($collection, 'Approved'),
                 'pending' => firestore_count($collection, 'Pending'),
                 'declined' => firestore_count($collection, 'Declined'),
+                'responded' => firestore_count($collection, 'Responded'),
             ];
         }
     }

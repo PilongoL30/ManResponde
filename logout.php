@@ -1,18 +1,34 @@
 <?php
 // logout.php
 
-require_once __DIR__ . '/db_config.php';
+require_once __DIR__ . '/config.php';
 
-// Start the session.
-session_start();
+if (session_status() === PHP_SESSION_NONE) {
+	$sessionPath = __DIR__ . '/sessions';
+	if (!is_dir($sessionPath)) {
+		mkdir($sessionPath, 0755, true);
+	}
+	session_save_path($sessionPath);
+	ini_set('session.gc_probability', 1);
+	ini_set('session.gc_divisor', 100);
+}
 
-// Unset all of the session variables.
-$_SESSION = array();
+if (session_status() === PHP_SESSION_NONE) {
+	session_start();
+}
 
-// Destroy the session.
+$_SESSION = [];
+
+if (ini_get('session.use_cookies')) {
+	$params = session_get_cookie_params();
+	setcookie(session_name(), '', time() - 42000,
+		$params['path'], $params['domain'],
+		(bool)$params['secure'], (bool)$params['httponly']
+	);
+}
+
 session_destroy();
 
-// Redirect to the login page after logging out.
-header('Location: login');
+header('Location: login.php');
 exit();
 ?>

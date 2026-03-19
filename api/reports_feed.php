@@ -2,7 +2,8 @@
 require_once dirname(__DIR__) . '/db_config.php';
 session_start();
 header('Content-Type: application/json; charset=utf-8');
-// Strong no-cache headers
+// Allow tiny private caching (we also do server-side file caching)
+header('Cache-Control: private, max-age=2');
 
 if (!isset($_SESSION['user_id'])) {
     http_response_code(401);
@@ -114,12 +115,22 @@ if ($collection === '') {
     exit;
 }
 
+// Limit controls (defaults tuned for speed; hard cap to protect server)
+$limit = (int)($_GET['limit'] ?? 100);
+$limit = max(10, min(200, $limit));
+
 $allowed = [];
 if ($isAdmin) {
     foreach ($categories as $meta) $allowed[] = $meta['collection'];
 } else {
-    $profile = get_user_profile_min($userId);
-    $assignedSlugs = array_values(array_filter(array_map('strval', $profile['categories'] ?? [])));
+    $assignedSlugs = $_SESSION['user_categories'] ?? null;
+    if (!is_array($assignedSlugs) || empty($assignedSlugs)) {
+        $profile = get_user_profile_min($userId);
+        $assignedSlugs = array_values(array_filter(array_map('strval', $profile['categories'] ?? [])));
+        if (!empty($assignedSlugs)) {
+            $_SESSION['user_categories'] = $assignedSlugs;
+        }
+    }
     foreach ($assignedSlugs as $slug) {
         if (isset($categories[$slug]['collection'])) $allowed[] = $categories[$slug]['collection'];
     }
@@ -132,8 +143,16 @@ if (!in_array($collection, $allowed, true)) {
 }
 
 try {
-    $items = latest_reports_min($collection, 200);
-    echo json_encode(['items' => $items]);
+    $cacheKey = 'api_reports_feed_' . $collection . '_' . $limit;
+    $cached = cache_get($cacheKey, 3); // 3-second cache to absorb polling bursts
+    if (is_array($cached)) {
+        echo json_encode(['items' => $cached, 'cached' => true]);
+        exit;
+    }
+
+    $items = latest_reports_min($collection, $limit);
+    cache_set($cacheKey, $items, 3);
+    echo json_encode(['items' => $items, 'cached' => false]);
 } catch (Throwable $e) {
     http_response_code(500);
     echo json_encode(['error' => 'server', 'message' => $e->getMessage()]);

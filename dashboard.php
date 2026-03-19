@@ -1,6 +1,13 @@
 <?php
 ob_start(); // Start output buffering immediately to catch any stray output
 
+// Prevent browser caching of dashboard page to ensure latest JS/HTML
+header('Cache-Control: no-cache, no-store, must-revalidate');
+header('Pragma: no-cache');
+header('Expires: 0');
+
+$__reqStart = microtime(true);
+
 require_once __DIR__.'/db_config.php';
 
 // Session is already started in db_config.php via config.php
@@ -8,8 +15,7 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
-require_once __DIR__.'/notification_system.php';
-require_once __DIR__.'/fcm_config.php';
+// Defer notification/FCM systems; load only for actions that need them.
 
 // CSRF Protection for POST requests
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -41,6 +47,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
     }
+}
+
+if (defined('DEBUG_MODE') && DEBUG_MODE) {
+    $v = $_GET['view'] ?? 'dashboard';
+    $a = $_POST['api_action'] ?? ($_GET['action'] ?? '');
+    error_log('[perf] dashboard.php start view=' . $v . ' action=' . $a . ' sid=' . session_id());
 }
 
 // Using Kreait Firebase SDK exceptions
@@ -171,22 +183,111 @@ function rest_list_documents(string $collection, int $pageSize = 200): array {
  * @return array The user's profile data.
  */
 function get_user_profile(string $uid): array {
+    // Session-level cache (fastest)
+    if (session_status() !== PHP_SESSION_NONE) {
+        $k = '__user_profile_' . $uid;
+        $kt = $k . '_time';
+        if (isset($_SESSION[$k], $_SESSION[$kt]) && (time() - (int)$_SESSION[$kt]) < 300) {
+            return is_array($_SESSION[$k]) ? $_SESSION[$k] : [];
+        }
+    }
+
+    // File cache (fast across requests)
+    $cacheKey = 'user_profile_' . $uid;
+    $cached = cache_get($cacheKey, 300);
+    if (is_array($cached)) {
+        if (session_status() !== PHP_SESSION_NONE) {
+            $_SESSION[$k] = $cached;
+            $_SESSION[$kt] = time();
+        }
+        return $cached;
+    }
+
     if (function_exists('firestore_get_doc_by_id')) {
-        try { return firestore_get_doc_by_id('users', $uid) ?? []; } catch (Throwable $e) {}
+        try {
+            $data = firestore_get_doc_by_id('users', $uid) ?? [];
+            if (is_array($data)) {
+                cache_set($cacheKey, $data, 300);
+                if (session_status() !== PHP_SESSION_NONE) {
+                    $_SESSION[$k] = $data;
+                    $_SESSION[$kt] = time();
+                }
+            }
+            return $data;
+        } catch (Throwable $e) {}
     }
     global $firestore;
     if ($firestore) {
         try {
             $snap = $firestore->collection('users')->document($uid)->snapshot();
-            return $snap->exists() ? ($snap->data() ?? []) : [];
+            $data = $snap->exists() ? ($snap->data() ?? []) : [];
+            if (is_array($data)) {
+                cache_set($cacheKey, $data, 300);
+                if (session_status() !== PHP_SESSION_NONE) {
+                    $_SESSION[$k] = $data;
+                    $_SESSION[$kt] = time();
+                }
+            }
+            return $data;
         } catch (Throwable $e) {}
     }
     return [];
 }
 
+/**
+ * Get user's full name by UID. Uses caching to avoid repeated lookups.
+ */
+function get_user_name_by_id(string $uid): string {
+    if (empty($uid)) return '';
+    
+    // Check static cache first (within same request)
+    static $nameCache = [];
+    if (isset($nameCache[$uid])) {
+        return $nameCache[$uid];
+    }
+    
+    // Try to get from user profile
+    $profile = get_user_profile($uid);
+    $name = $profile['fullName'] ?? $profile['name'] ?? $profile['displayName'] ?? '';
+    
+    // Cache the result
+    $nameCache[$uid] = $name;
+    
+    return $name;
+}
+
+/**
+ * Format ISO timestamp to human-readable format.
+ * Example: "Dec 14, 2025, 10:30 PM"
+ */
+function fmt_action_time($ts): string {
+    if (empty($ts)) return '';
+    
+    try {
+        // Handle ISO 8601 format
+        if (is_string($ts)) {
+            $dt = new DateTime($ts);
+        } elseif (is_array($ts) && isset($ts['_seconds'])) {
+            $dt = new DateTime('@' . $ts['_seconds']);
+        } elseif (is_array($ts) && isset($ts['seconds'])) {
+            $dt = new DateTime('@' . $ts['seconds']);
+        } else {
+            return '';
+        }
+        
+        // Set timezone to Asia/Manila (Philippines)
+        $dt->setTimezone(new DateTimeZone('Asia/Manila'));
+        
+        // Format: "Dec 14, 2025, 10:30 PM"
+        return $dt->format('M j, Y, g:i A');
+    } catch (Throwable $e) {
+        return '';
+    }
+}
+
 // --- SESSION & ROLE MANAGEMENT ---
 if (!isset($_SESSION['user_id'])) {
-                header('Location: login');
+                header('Location: login.php');
     exit();
 }
 
@@ -195,9 +296,19 @@ $userRole = $_SESSION['user_role'] ?? 'staff';
 $userName = $_SESSION['user_fullname'] ?? 'User';
 $isAdmin  = ($userRole === 'admin');
 
-// Fetch user profile to check categories (for Tanod access)
-$userProfile = get_user_profile($userId);
-$userCategories = $userProfile['categories'] ?? [];
+// Fetch user profile/categories (prefer session to keep navigation fast)
+$userCategories = $_SESSION['user_categories'] ?? [];
+if (!is_array($userCategories)) $userCategories = [];
+
+// Only fetch profile if we don't have categories in session
+$userProfile = ['categories' => $userCategories, 'assignedBarangay' => ($_SESSION['assignedBarangay'] ?? '')];
+if (empty($userCategories)) {
+    $userProfile = get_user_profile($userId);
+    $userCategories = $userProfile['categories'] ?? [];
+    if (is_array($userCategories)) {
+        $_SESSION['user_categories'] = $userCategories;
+    }
+}
 // Check if user has 'tanod' category (case-insensitive check)
 $isTanod = false;
 if (!empty($userCategories)) {
@@ -346,7 +457,7 @@ function build_recent_feed_optimized(array $categories, string $categoryFilter, 
             $items = get_recent_reports_optimized($meta['collection'], $perCategoryLimit, $statusFilter, $search);
             
             foreach ($items as $it) {
-                $ts = $it['timestamp'] ?? ($it['_created'] ?? '');
+                $ts = $it['timestamp'] ?? ($it['createdAt'] ?? ($it['_created'] ?? ''));
                 $recent[] = [
                     'slug'         => $slug,
                     'label'        => $meta['label'],
@@ -363,8 +474,11 @@ function build_recent_feed_optimized(array $categories, string $categoryFilter, 
                     'imageUrl'     => $it['imageUrl'] ?? '',
                     'status'       => $it['status'] ?? 'Pending',
                     'priority'     => $it['priority'] ?? '',
+                    // Provide both legacy (lat/lng) and UI-expected (latitude/longitude) fields
                     'lat'          => $it['latitude'] ?? ($it['coordinates']['latitude'] ?? null),
                     'lng'          => $it['longitude'] ?? ($it['coordinates']['longitude'] ?? null),
+                    'latitude'     => $it['latitude'] ?? ($it['coordinates']['latitude'] ?? null),
+                    'longitude'    => $it['longitude'] ?? ($it['coordinates']['longitude'] ?? null),
                     'timestamp'    => $ts,
                     'tsDisplay'    => fmt_ts($ts),
                     'collection'   => $meta['collection'],
@@ -384,8 +498,26 @@ function build_recent_feed_optimized(array $categories, string $categoryFilter, 
         if ($aUrgent && !$bUrgent) return -1;
         if (!$aUrgent && $bUrgent) return 1;
         
-        // If both have same priority, sort by timestamp (newest first)
-        return strcmp((string)($b['timestamp'] ?? ''), (string)($a['timestamp'] ?? ''));
+        // If both have same priority, sort by time (newest first)
+        $ta = $a['timestamp'] ?? ($a['createdAt'] ?? '');
+        $tb = $b['timestamp'] ?? ($b['createdAt'] ?? '');
+
+        $toEpoch = function($t): int {
+            if (is_array($t)) {
+                if (isset($t['_seconds']) && is_numeric($t['_seconds'])) return (int)$t['_seconds'];
+                if (isset($t['seconds']) && is_numeric($t['seconds'])) return (int)$t['seconds'];
+                return 0;
+            }
+            if (is_int($t)) return $t;
+            if (is_float($t)) return (int)$t;
+            if (is_string($t)) {
+                $s = strtotime($t);
+                return $s === false ? 0 : (int)$s;
+            }
+            return 0;
+        };
+
+        return $toEpoch($tb) <=> $toEpoch($ta);
     });
     
     return $recent;
@@ -539,44 +671,615 @@ function build_recent_feed_ultra_fast(array $categories, string $categoryFilter,
     return $recent;
 }
 
+// Ultra-fast recent feed builder using parallel LIST documents (createTime-based).
+// This avoids timestamp index issues and is much faster under load.
+function build_recent_feed_ultra_fast_listdocs(array $categories, string $categoryFilter, string $statusFilter, string $search, int $perCategoryLimit = 15): array {
+    $categoriesToFetch = [];
+    if ($categoryFilter === 'all') {
+        $categoriesToFetch = $categories;
+    } else {
+        $categoriesToFetch = isset($categories[$categoryFilter]) ? [$categoryFilter => $categories[$categoryFilter]] : [];
+    }
+    if (empty($categoriesToFetch)) return [];
+
+    $searchNeedle = trim(strtolower((string)$search));
+    $statusNeedle = strtolower(trim((string)$statusFilter));
+
+    // Keep list small; this endpoint is called frequently.
+    $pageSize = (int)min(max($perCategoryLimit * 5, 40), 80);
+
+    $token = firestore_rest_token();
+    $base = firestore_base_url();
+
+    $toEpoch = function($t): int {
+        if (is_array($t)) {
+            if (isset($t['_seconds']) && is_numeric($t['_seconds'])) return (int)$t['_seconds'];
+            if (isset($t['seconds']) && is_numeric($t['seconds'])) return (int)$t['seconds'];
+            return 0;
+        }
+        if (is_int($t)) return $t;
+        if (is_float($t)) return (int)$t;
+        if (is_string($t) && $t !== '') {
+            $s = strtotime($t);
+            return $s === false ? 0 : (int)$s;
+        }
+        return 0;
+    };
+
+    $mh = curl_multi_init();
+    $handles = [];
+    $map = [];
+
+    foreach ($categoriesToFetch as $slug => $meta) {
+        $collection = $meta['collection'];
+        $url = $base . '/' . rawurlencode($collection) . '?pageSize=' . $pageSize;
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $token,
+                'Accept: application/json',
+            ],
+            CURLOPT_TIMEOUT => 10,
+            CURLOPT_CONNECTTIMEOUT => 4,
+            CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
+            CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[] = $ch;
+        $map[(int)$ch] = ['slug' => $slug, 'meta' => $meta, 'collection' => $collection];
+    }
+
+    $running = null;
+    do {
+        curl_multi_exec($mh, $running);
+        curl_multi_select($mh, 0.2);
+    } while ($running > 0);
+
+    $recent = [];
+    foreach ($handles as $ch) {
+        $info = $map[(int)$ch] ?? null;
+        $raw = curl_multi_getcontent($ch);
+        $http = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+        if (!$info || $http < 200 || $http >= 300) {
+            continue;
+        }
+
+        $json = json_decode($raw ?: 'null', true);
+        $docs = is_array($json) ? ($json['documents'] ?? []) : [];
+        if (!is_array($docs)) continue;
+
+        foreach ($docs as $doc) {
+            if (!isset($doc['name'])) continue;
+            $docId = basename($doc['name']);
+            $fields = isset($doc['fields']) ? firestore_decode_fields($doc['fields']) : [];
+            if (!is_array($fields)) $fields = [];
+
+            // Local status filter (case-insensitive)
+            if ($statusNeedle !== 'all') {
+                $st = strtolower(trim((string)($fields['status'] ?? '')));
+                if ($st !== $statusNeedle) continue;
+            }
+
+            // Local search filter
+            if ($searchNeedle !== '') {
+                $searchableText = strtolower(
+                    ($fields['fullName'] ?? $fields['reporterName'] ?? '') . ' ' .
+                    ($fields['location'] ?? '') . ' ' .
+                    ($fields['purpose'] ?? $fields['description'] ?? '') . ' ' .
+                    ($fields['contact'] ?? $fields['reporterContact'] ?? '')
+                );
+                if (strpos($searchableText, $searchNeedle) === false) continue;
+            }
+
+            $ts = $fields['timestamp'] ?? ($fields['createdAt'] ?? ($doc['createTime'] ?? null));
+            
+            // Resolve approver/decliner/responder names from user IDs
+            $approvedById = $fields['approvedBy'] ?? $fields['updatedBy'] ?? '';
+            $declinedById = $fields['declinedBy'] ?? '';
+            $respondedById = $fields['respondedBy'] ?? '';
+            
+            // Get names - prefer stored name, fallback to lookup by ID
+            $approvedByName = $fields['approvedByName'] ?? '';
+            if (empty($approvedByName) && !empty($approvedById)) {
+                $approvedByName = get_user_name_by_id($approvedById);
+            }
+            
+            $declinedByName = $fields['declinedByName'] ?? '';
+            if (empty($declinedByName) && !empty($declinedById)) {
+                $declinedByName = get_user_name_by_id($declinedById);
+            }
+            
+            $respondedByName = $fields['respondedByName'] ?? '';
+            if (empty($respondedByName) && !empty($respondedById)) {
+                $respondedByName = get_user_name_by_id($respondedById);
+            }
+            
+            // For approved status, also check updatedBy as fallback
+            $status = strtolower($fields['status'] ?? '');
+            if ($status === 'approved' && empty($approvedByName)) {
+                $updatedById = $fields['updatedBy'] ?? '';
+                if (!empty($updatedById)) {
+                    $approvedByName = get_user_name_by_id($updatedById);
+                }
+            }
+            if ($status === 'declined' && empty($declinedByName)) {
+                $updatedById = $fields['updatedBy'] ?? '';
+                if (!empty($updatedById)) {
+                    $declinedByName = get_user_name_by_id($updatedById);
+                }
+            }
+            
+            $recent[] = [
+                'slug'         => $info['slug'],
+                'label'        => $info['meta']['label'],
+                'icon'         => $info['meta']['icon'],
+                'iconSvg'      => svg_icon($info['meta']['icon'], 'w-5 h-5'),
+                'color'        => $info['meta']['color'],
+                'id'           => $docId,
+                'fullName'     => $fields['fullName'] ?? $fields['reporterName'] ?? '',
+                'contact'      => $fields['contact'] ?? $fields['reporterContact'] ?? '',
+                'mobileNumber' => $fields['mobileNumber'] ?? $fields['contact'] ?? $fields['reporterContact'] ?? '',
+                'location'     => $fields['location'] ?? '',
+                'purpose'      => $fields['purpose'] ?? $fields['description'] ?? '',
+                'reporterId'   => $fields['reporterId'] ?? ($fields['uid'] ?? ''),
+                'imageUrl'     => $fields['imageUrl'] ?? '',
+                'status'       => $fields['status'] ?? 'Pending',
+                'priority'     => $fields['priority'] ?? '',
+                'lat'          => $fields['latitude'] ?? ($fields['coordinates']['latitude'] ?? null),
+                'lng'          => $fields['longitude'] ?? ($fields['coordinates']['longitude'] ?? null),
+                'latitude'     => $fields['latitude'] ?? ($fields['coordinates']['latitude'] ?? null),
+                'longitude'    => $fields['longitude'] ?? ($fields['coordinates']['longitude'] ?? null),
+                'timestamp'    => $ts,
+                'tsDisplay'    => fmt_ts($ts),
+                'updatedBy'    => $fields['updatedBy'] ?? '',
+                'updatedAt'    => fmt_action_time($fields['updatedAt'] ?? ''),
+                'approvedBy'   => $approvedById,
+                'approvedByName' => $approvedByName,
+                'approvedAt'   => fmt_action_time($fields['approvedAt'] ?? $fields['updatedAt'] ?? ''),
+                'declinedBy'   => $declinedById,
+                'declinedByName' => $declinedByName,
+                'declinedAt'   => fmt_action_time($fields['declinedAt'] ?? $fields['updatedAt'] ?? ''),
+                'respondedBy'  => $respondedById,
+                'respondedByName' => $respondedByName,
+                'respondedAt'  => fmt_action_time($fields['respondedAt'] ?? ''),
+                '_created'     => $doc['createTime'] ?? null,
+                'collection'   => $info['collection'],
+            ];
+        }
+    }
+
+    curl_multi_close($mh);
+
+    // Sort by priority then time (newest first)
+    usort($recent, function($a, $b) use ($toEpoch) {
+        $aUrgent = ($a['priority'] ?? '') === 'HIGH';
+        $bUrgent = ($b['priority'] ?? '') === 'HIGH';
+        if ($aUrgent && !$bUrgent) return -1;
+        if (!$aUrgent && $bUrgent) return 1;
+
+        $ta = $a['timestamp'] ?? ($a['_created'] ?? '');
+        $tb = $b['timestamp'] ?? ($b['_created'] ?? '');
+        return $toEpoch($tb) <=> $toEpoch($ta);
+    });
+
+    // Keep payload bounded
+    $max = min(max($perCategoryLimit * 8, 60), 180);
+    if (count($recent) > $max) {
+        $recent = array_slice($recent, 0, $max);
+    }
+
+    return $recent;
+}
+
+// Ultra-fast recent feed builder using parallel RunQuery (ORDERED).
+// This is reliable for "newest" because list-documents is not ordered.
+function build_recent_feed_ultra_fast_runquery(array $categories, string $categoryFilter, string $statusFilter, string $search, int $perCategoryLimit = 10): array {
+    $categoriesToFetch = [];
+    if ($categoryFilter === 'all') {
+        $categoriesToFetch = $categories;
+    } else {
+        $categoriesToFetch = isset($categories[$categoryFilter]) ? [$categoryFilter => $categories[$categoryFilter]] : [];
+    }
+    if (empty($categoriesToFetch)) return [];
+
+    $searchNeedle = trim(strtolower((string)$search));
+    $statusNeedle = strtolower(trim((string)$statusFilter));
+
+    $toEpoch = function($t): int {
+        if (is_array($t)) {
+            if (isset($t['_seconds']) && is_numeric($t['_seconds'])) return (int)$t['_seconds'];
+            if (isset($t['seconds']) && is_numeric($t['seconds'])) return (int)$t['seconds'];
+            return 0;
+        }
+        if (is_int($t)) return $t;
+        if (is_float($t)) return (int)$t;
+        if (is_string($t) && $t !== '') {
+            $s = strtotime($t);
+            return $s === false ? 0 : (int)$s;
+        }
+        return 0;
+    };
+
+    // Pull a slightly larger window so docs missing timestamp fields (which sort last)
+    // still have a chance to be included and backfilled.
+    $pageSize = (int)min(max($perCategoryLimit * 4, 35), 80);
+    $nullLimit = (int)min(max($perCategoryLimit * 2, 20), 60);
+
+    $token = firestore_rest_token();
+    $runQueryUrl = firestore_base_url() . ':runQuery';
+
+    $selectFields = [
+        ['fieldPath' => 'fullName'],
+        ['fieldPath' => 'reporterName'],
+        ['fieldPath' => 'contact'],
+        ['fieldPath' => 'reporterContact'],
+        ['fieldPath' => 'mobileNumber'],
+        ['fieldPath' => 'location'],
+        ['fieldPath' => 'purpose'],
+        ['fieldPath' => 'description'],
+        ['fieldPath' => 'status'],
+        ['fieldPath' => 'priority'],
+        ['fieldPath' => 'latitude'],
+        ['fieldPath' => 'longitude'],
+        ['fieldPath' => 'coordinates'],
+        ['fieldPath' => 'reporterId'],
+        ['fieldPath' => 'uid'],
+        ['fieldPath' => 'imageUrl'],
+        ['fieldPath' => 'timestamp'],
+        ['fieldPath' => 'createdAt'],
+        ['fieldPath' => 'updatedBy'],
+        ['fieldPath' => 'updatedAt'],
+        ['fieldPath' => 'approvedBy'],
+        ['fieldPath' => 'approvedByName'],
+        ['fieldPath' => 'approvedAt'],
+        ['fieldPath' => 'declinedBy'],
+        ['fieldPath' => 'declinedByName'],
+        ['fieldPath' => 'declinedAt'],
+        ['fieldPath' => 'respondedBy'],
+        ['fieldPath' => 'respondedByName'],
+        ['fieldPath' => 'respondedAt'],
+    ];
+
+    $mh = curl_multi_init();
+    $handles = [];
+
+    foreach ($categoriesToFetch as $slug => $meta) {
+        $collection = $meta['collection'];
+        foreach (['timestamp', 'createdAt'] as $orderField) {
+            $body = [
+                'structuredQuery' => [
+                    'from' => [['collectionId' => $collection]],
+                    'select' => ['fields' => $selectFields],
+                    'orderBy' => [[
+                        'field' => ['fieldPath' => $orderField],
+                        'direction' => 'DESCENDING',
+                    ]],
+                    'limit' => $pageSize,
+                ]
+            ];
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL => $runQueryUrl,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => json_encode($body),
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER => [
+                    'Authorization: Bearer ' . $token,
+                    'Accept: application/json',
+                    'Content-Type: application/json',
+                ],
+                CURLOPT_TIMEOUT => 10,
+                CURLOPT_CONNECTTIMEOUT => 4,
+                CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
+                CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[] = ['ch' => $ch, 'slug' => $slug, 'meta' => $meta, 'collection' => $collection];
+        }
+
+        // Surface docs created without timestamp fields (common root-cause for "new report not showing").
+        // We can't order by createTime, but IS_NULL queries keep this set small in practice.
+        foreach (['timestamp', 'createdAt'] as $nullField) {
+            $bodyNull = [
+                'structuredQuery' => [
+                    'from' => [['collectionId' => $collection]],
+                    'select' => ['fields' => $selectFields],
+                    'where' => [
+                        'unaryFilter' => [
+                            'op' => 'IS_NULL',
+                            'field' => ['fieldPath' => $nullField],
+                        ]
+                    ],
+                    'limit' => $nullLimit,
+                ]
+            ];
+
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL => $runQueryUrl,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => json_encode($bodyNull),
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER => [
+                    'Authorization: Bearer ' . $token,
+                    'Accept: application/json',
+                    'Content-Type: application/json',
+                ],
+                CURLOPT_TIMEOUT => 10,
+                CURLOPT_CONNECTTIMEOUT => 4,
+                CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
+                CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[] = ['ch' => $ch, 'slug' => $slug, 'meta' => $meta, 'collection' => $collection];
+        }
+    }
+
+    $running = null;
+    do {
+        curl_multi_exec($mh, $running);
+        curl_multi_select($mh, 0.2);
+    } while ($running > 0);
+
+    $recentByKey = [];
+    $backfills = [];
+
+    foreach ($handles as $h) {
+        $ch = $h['ch'];
+        $raw = curl_multi_getcontent($ch);
+        $http = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+        if ($http < 200 || $http >= 300) continue;
+
+        $rows = json_decode($raw ?: 'null', true);
+        if (!is_array($rows)) continue;
+
+        foreach ($rows as $row) {
+            if (!isset($row['document'])) continue;
+            $doc = $row['document'];
+            if (!isset($doc['name'])) continue;
+            $docId = basename($doc['name']);
+
+            $fields = isset($doc['fields']) ? firestore_decode_fields($doc['fields']) : [];
+            if (!is_array($fields)) $fields = [];
+
+            // Local status filter (case-insensitive)
+            if ($statusNeedle !== 'all') {
+                $st = strtolower(trim((string)($fields['status'] ?? '')));
+                if ($st !== $statusNeedle) continue;
+            }
+
+            // Local search filter
+            if ($searchNeedle !== '') {
+                $searchableText = strtolower(
+                    ($fields['fullName'] ?? $fields['reporterName'] ?? '') . ' ' .
+                    ($fields['location'] ?? '') . ' ' .
+                    ($fields['purpose'] ?? $fields['description'] ?? '') . ' ' .
+                    ($fields['contact'] ?? $fields['reporterContact'] ?? '')
+                );
+                if (strpos($searchableText, $searchNeedle) === false) continue;
+            }
+
+            $ts = $fields['timestamp'] ?? ($fields['createdAt'] ?? ($doc['createTime'] ?? null));
+            $epoch = $toEpoch($ts);
+            if ($epoch <= 0 && isset($doc['createTime'])) {
+                $epoch = $toEpoch($doc['createTime']);
+            }
+
+            // Collect candidates for backfilling missing timestamp fields using createTime.
+            if (isset($doc['createTime'])) {
+                $missingTs = !isset($fields['timestamp']) || $fields['timestamp'] === null || $fields['timestamp'] === '';
+                $missingCreated = !isset($fields['createdAt']) || $fields['createdAt'] === null || $fields['createdAt'] === '';
+                if ($missingTs || $missingCreated) {
+                    $backfills[] = [
+                        'collection' => $h['collection'],
+                        'id' => $docId,
+                        'createTime' => (string)$doc['createTime'],
+                        'epoch' => $toEpoch($doc['createTime']),
+                    ];
+                }
+            }
+
+            $key = $h['collection'] . ':' . $docId;
+            $existingEpoch = (int)($recentByKey[$key]['_epoch'] ?? 0);
+            if ($epoch <= $existingEpoch) {
+                continue;
+            }
+
+            // Resolve approver/decliner/responder names from user IDs
+            $approvedById = $fields['approvedBy'] ?? $fields['updatedBy'] ?? '';
+            $declinedById = $fields['declinedBy'] ?? '';
+            $respondedById = $fields['respondedBy'] ?? '';
+            
+            // Get names - prefer stored name, fallback to lookup by ID
+            $approvedByName = $fields['approvedByName'] ?? '';
+            if (empty($approvedByName) && !empty($approvedById)) {
+                $approvedByName = get_user_name_by_id($approvedById);
+            }
+            
+            $declinedByName = $fields['declinedByName'] ?? '';
+            if (empty($declinedByName) && !empty($declinedById)) {
+                $declinedByName = get_user_name_by_id($declinedById);
+            }
+            
+            $respondedByName = $fields['respondedByName'] ?? '';
+            if (empty($respondedByName) && !empty($respondedById)) {
+                $respondedByName = get_user_name_by_id($respondedById);
+            }
+            
+            // For approved status, also check updatedBy as fallback
+            $status = strtolower($fields['status'] ?? '');
+            if ($status === 'approved' && empty($approvedByName)) {
+                $updatedById = $fields['updatedBy'] ?? '';
+                if (!empty($updatedById)) {
+                    $approvedByName = get_user_name_by_id($updatedById);
+                }
+            }
+            if ($status === 'declined' && empty($declinedByName)) {
+                $updatedById = $fields['updatedBy'] ?? '';
+                if (!empty($updatedById)) {
+                    $declinedByName = get_user_name_by_id($updatedById);
+                }
+            }
+
+            $recentByKey[$key] = [
+                'slug'         => $h['slug'],
+                'label'        => $h['meta']['label'],
+                'icon'         => $h['meta']['icon'],
+                'iconSvg'      => svg_icon($h['meta']['icon'], 'w-5 h-5'),
+                'color'        => $h['meta']['color'],
+                'id'           => $docId,
+                'fullName'     => $fields['fullName'] ?? $fields['reporterName'] ?? '',
+                'contact'      => $fields['contact'] ?? $fields['reporterContact'] ?? '',
+                'mobileNumber' => $fields['mobileNumber'] ?? $fields['contact'] ?? $fields['reporterContact'] ?? '',
+                'location'     => $fields['location'] ?? '',
+                'purpose'      => $fields['purpose'] ?? $fields['description'] ?? '',
+                'reporterId'   => $fields['reporterId'] ?? ($fields['uid'] ?? ''),
+                'imageUrl'     => $fields['imageUrl'] ?? '',
+                'status'       => $fields['status'] ?? 'Pending',
+                'priority'     => $fields['priority'] ?? '',
+                'lat'          => $fields['latitude'] ?? ($fields['coordinates']['latitude'] ?? null),
+                'lng'          => $fields['longitude'] ?? ($fields['coordinates']['longitude'] ?? null),
+                'latitude'     => $fields['latitude'] ?? ($fields['coordinates']['latitude'] ?? null),
+                'longitude'    => $fields['longitude'] ?? ($fields['coordinates']['longitude'] ?? null),
+                'timestamp'    => $ts,
+                'tsDisplay'    => fmt_ts($ts),
+                'updatedBy'    => $fields['updatedBy'] ?? '',
+                'updatedAt'    => fmt_action_time($fields['updatedAt'] ?? ''),
+                'approvedBy'   => $approvedById,
+                'approvedByName' => $approvedByName,
+                'approvedAt'   => fmt_action_time($fields['approvedAt'] ?? $fields['updatedAt'] ?? ''),
+                'declinedBy'   => $declinedById,
+                'declinedByName' => $declinedByName,
+                'declinedAt'   => fmt_action_time($fields['declinedAt'] ?? $fields['updatedAt'] ?? ''),
+                'respondedBy'  => $respondedById,
+                'respondedByName' => $respondedByName,
+                'respondedAt'  => fmt_action_time($fields['respondedAt'] ?? ''),
+                '_created'     => $doc['createTime'] ?? null,
+                '_epoch'       => $epoch,
+                'collection'   => $h['collection'],
+            ];
+        }
+    }
+
+    curl_multi_close($mh);
+
+    // Backfill only a handful of the newest missing-timestamp docs per request.
+    // This helps make ordered queries reliable without turning the feed into a repair job.
+    if (!empty($backfills)) {
+        usort($backfills, function($a, $b) {
+            return ((int)($b['epoch'] ?? 0)) <=> ((int)($a['epoch'] ?? 0));
+        });
+        $backfills = array_slice($backfills, 0, 6);
+
+        $seenBackfill = [];
+        foreach ($backfills as $bf) {
+            $k = ($bf['collection'] ?? '') . ':' . ($bf['id'] ?? '');
+            if (isset($seenBackfill[$k])) continue;
+            $seenBackfill[$k] = true;
+            try {
+                $dt = new DateTimeImmutable($bf['createTime']);
+                firestore_set_document($bf['collection'], $bf['id'], [
+                    'timestamp' => $dt,
+                    'createdAt' => $dt,
+                ]);
+            } catch (Throwable $e) {
+                // ignore backfill failures
+            }
+        }
+    }
+
+    $recent = array_values($recentByKey);
+
+    usort($recent, function($a, $b) {
+        $aUrgent = ($a['priority'] ?? '') === 'HIGH';
+        $bUrgent = ($b['priority'] ?? '') === 'HIGH';
+        if ($aUrgent && !$bUrgent) return -1;
+        if (!$aUrgent && $bUrgent) return 1;
+        return ((int)($b['_epoch'] ?? 0)) <=> ((int)($a['_epoch'] ?? 0));
+    });
+
+    $max = min(max($perCategoryLimit * 8, 60), 180);
+    if (count($recent) > $max) {
+        $recent = array_slice($recent, 0, $max);
+    }
+
+    // Remove internal sort key
+    foreach ($recent as &$it) {
+        unset($it['_epoch']);
+    }
+    unset($it);
+
+    return $recent;
+}
+
 // Optimized function to get recent reports with filtering
 function get_recent_reports_optimized(string $collection, int $limit, string $statusFilter, string $search): array {
     try {
         $url = firestore_base_url() . ':runQuery';
-        $body = [
+        // Fetch a larger window then sort locally so we don't miss new reports
+        // when some documents have missing/inconsistent timestamp fields.
+        $fetchLimit = min(max($limit * 6, 40), 120);
+
+        $bodyTs = [
             'structuredQuery' => [
                 'from' => [['collectionId' => $collection]],
-                'limit' => $limit * 2 // Get more to account for filtering
+                'orderBy' => [[
+                    'field' => ['fieldPath' => 'timestamp'],
+                    'direction' => 'DESCENDING'
+                ]],
+                'limit' => $fetchLimit
             ]
         ];
-        
-        // Add status filter if specified
-        if ($statusFilter !== 'all') {
-            $body['structuredQuery']['where'] = [
-                'fieldFilter' => [
-                    'field' => ['fieldPath' => 'status'],
-                    'op' => 'EQUAL',
-                    'value' => firestore_encode_value(ucfirst($statusFilter))
-                ]
-            ];
+
+        $bodyCreated = [
+            'structuredQuery' => [
+                'from' => [['collectionId' => $collection]],
+                'orderBy' => [[
+                    'field' => ['fieldPath' => 'createdAt'],
+                    'direction' => 'DESCENDING'
+                ]],
+                'limit' => $fetchLimit
+            ]
+        ];
+
+        $statusNeedle = strtolower(trim((string)$statusFilter));
+
+        // Run both ordered queries (timestamp + createdAt) and merge.
+        // If either fails (index/field issues), we still keep the other.
+        $respTs = [];
+        $respCreated = [];
+        try { $respTs = firestore_rest_request('POST', $url, $bodyTs); }
+        catch (Exception $e) { error_log("Recent query (timestamp) failed for {$collection}: " . $e->getMessage()); }
+        try { $respCreated = firestore_rest_request('POST', $url, $bodyCreated); }
+        catch (Exception $e) { error_log("Recent query (createdAt) failed for {$collection}: " . $e->getMessage()); }
+
+        // If both fail, fallback to an unordered limited fetch.
+        if (empty($respTs) && empty($respCreated)) {
+            $fallbackBody = ['structuredQuery' => ['from' => [['collectionId' => $collection]], 'limit' => $fetchLimit]];
+            $respTs = firestore_rest_request('POST', $url, $fallbackBody);
         }
-        
-        $response = firestore_rest_request('POST', $url, $body);
+
         $items = [];
-        
-        if (is_array($response)) {
+        $seen = [];
+
+        $consume = function(array $response) use (&$items, &$seen, $collection, $search, $limit, $statusNeedle) {
+            if (!is_array($response)) return;
             foreach ($response as $row) {
                 if (!isset($row['document'])) continue;
                 $doc = $row['document'];
                 $itemData = firestore_decode_fields($doc['fields'] ?? []);
                 $itemData['id'] = basename($doc['name'] ?? '');
                 $itemData['_created'] = $doc['createTime'] ?? null;
-                
-                // Debug: Log purpose field for tanod reports in optimized function
-                if ($collection === 'tanod_reports') {
-                    error_log("Tanod report purpose debug (optimized) - ID: {$itemData['id']}, Purpose: '{$itemData['purpose']}', Raw purpose: " . ($itemData['purpose'] ?? 'NULL') . ", Raw description: " . ($itemData['description'] ?? 'NULL'));
-                }
-                
+
+                if (!$itemData['id'] || isset($seen[$itemData['id']])) continue;
+                $seen[$itemData['id']] = true;
+
                 // Apply search filter if specified
                 if ($search) {
                     $searchableText = strtolower(
@@ -589,14 +1292,108 @@ function get_recent_reports_optimized(string $collection, int $limit, string $st
                         continue;
                     }
                 }
-                
+
+                // Apply status filter locally (case-insensitive) to avoid missing docs
+                // where status values vary in casing (e.g., "pending" vs "Pending").
+                if ($statusNeedle !== 'all') {
+                    $st = strtolower(trim((string)($itemData['status'] ?? '')));
+                    if ($st !== $statusNeedle) {
+                        continue;
+                    }
+                }
+
+                // Debug: Log purpose field for tanod reports
+                if ($collection === 'tanod_reports') {
+                    error_log("Tanod report purpose debug (optimized) - ID: {$itemData['id']}, Purpose: '" . ($itemData['purpose'] ?? '') . "', Raw description: " . ($itemData['description'] ?? 'NULL'));
+                }
+
                 $items[] = $itemData;
-                
-                // Stop if we have enough items
-                if (count($items) >= $limit) {
+                if (count($items) >= ($limit * 3)) {
+                    // keep a cap; we'll sort/slice later
+                    return;
+                }
+            }
+        };
+
+        $consume($respTs);
+        $consume($respCreated);
+
+        // Extra robustness: merge in a small list-documents sample (createTime-based).
+        // This helps surface newly created reports that are missing/invalid timestamp fields,
+        // which otherwise sort last in the ordered queries and may not appear in the window.
+        try {
+            $rawDocs = rest_list_documents($collection, min(max($fetchLimit, 60), 200));
+            foreach ($rawDocs as $doc) {
+                if (!isset($doc['name'])) continue;
+                $id = basename($doc['name']);
+                if (!$id || isset($seen[$id])) continue;
+
+                $fields = isset($doc['fields']) && function_exists('firestore_decode_fields')
+                    ? firestore_decode_fields($doc['fields'])
+                    : [];
+
+                $itemData = is_array($fields) ? $fields : [];
+                $itemData['id'] = $id;
+                $itemData['_created'] = $doc['createTime'] ?? null;
+
+                // Apply search filter if specified
+                if ($search) {
+                    $searchableText = strtolower(
+                        ($itemData['fullName'] ?? $itemData['reporterName'] ?? '') . ' ' .
+                        ($itemData['location'] ?? '') . ' ' .
+                        ($itemData['purpose'] ?? $itemData['description'] ?? '') . ' ' .
+                        ($itemData['contact'] ?? $itemData['reporterContact'] ?? '')
+                    );
+                    if (strpos($searchableText, $search) === false) {
+                        continue;
+                    }
+                }
+
+                // Apply status filter if specified
+                if ($statusFilter !== 'all') {
+                    $st = strtolower((string)($itemData['status'] ?? ''));
+                    if ($st !== strtolower($statusFilter)) {
+                        continue;
+                    }
+                }
+
+                $seen[$id] = true;
+                $items[] = $itemData;
+
+                if (count($items) >= ($limit * 4)) {
                     break;
                 }
             }
+        } catch (Throwable $e) {
+            // ignore list-documents fallback errors
+        }
+        
+        // Ensure newest-first ordering even when using fallback / mixed timestamp formats.
+        // Prefer explicit timestamp; fallback to createdAt; then Firestore createTime.
+        usort($items, function($a, $b) {
+            $ta = $a['timestamp'] ?? ($a['createdAt'] ?? ($a['_created'] ?? ''));
+            $tb = $b['timestamp'] ?? ($b['createdAt'] ?? ($b['_created'] ?? ''));
+
+            $toEpoch = function($t): int {
+                if (is_array($t)) {
+                    if (isset($t['_seconds']) && is_numeric($t['_seconds'])) return (int)$t['_seconds'];
+                    if (isset($t['seconds']) && is_numeric($t['seconds'])) return (int)$t['seconds'];
+                    return 0;
+                }
+                if (is_int($t)) return $t;
+                if (is_float($t)) return (int)$t;
+                if (is_string($t)) {
+                    $s = strtotime($t);
+                    return $s === false ? 0 : (int)$s;
+                }
+                return 0;
+            };
+
+            return $toEpoch($tb) <=> $toEpoch($ta);
+        });
+
+        if (count($items) > $limit) {
+            $items = array_slice($items, 0, $limit);
         }
         
     return $items;
@@ -610,13 +1407,25 @@ function get_recent_reports_optimized(string $collection, int $limit, string $st
 # --- HELPER FUNCTIONS (Backend Logic) ---
 # Note: Backend logic is preserved from the original file.
 
-function update_report_status(string $collection, string $docId, string $newStatus, string $userId): bool {
+function update_report_status(string $collection, string $docId, string $newStatus, string $userId, string $userName = ''): bool {
     $newStatus = in_array($newStatus, ['Approved','Declined'], true) ? $newStatus : 'Pending';
+    $now = date('c');
     $payload = [
         'status'    => $newStatus,
-        'updatedAt' => date('c'),
+        'updatedAt' => $now,
         'updatedBy' => $userId,
     ];
+    
+    // Add approver/decliner info based on status
+    if ($newStatus === 'Approved') {
+        $payload['approvedBy'] = $userId;
+        $payload['approvedByName'] = $userName ?: ($_SESSION['user_fullname'] ?? 'Admin');
+        $payload['approvedAt'] = $now;
+    } elseif ($newStatus === 'Declined') {
+        $payload['declinedBy'] = $userId;
+        $payload['declinedByName'] = $userName ?: ($_SESSION['user_fullname'] ?? 'Admin');
+        $payload['declinedAt'] = $now;
+    }
     
     error_log("Attempting to update status: {$collection}/{$docId} to {$newStatus} by user {$userId}");
     
@@ -1267,6 +2076,8 @@ if (isset($_POST['api_action'])) {
 
     // Staff: Update Report Status
     if ($action === 'update_status') {
+        // Ensure notification + FCM helpers are available for both Approved and Declined flows
+        require_once __DIR__ . '/notification_system.php';
         if (ob_get_length()) ob_clean();
         header('Content-Type: application/json');
         
@@ -1289,17 +2100,50 @@ if (isset($_POST['api_action'])) {
             error_log("Attempting to update status: {$collection}/{$docId} to {$newStatus} by user {$userId}" . 
                      ($declineReason ? " with reason: {$declineReason}" : ""));
             
+            // Get current user's name for action attribution
+            $actionByName = $_SESSION['user_fullname'] ?? '';
+            
+            // If session doesn't have fullname, try to get it from the user profile
+            if (empty($actionByName) && !empty($userId)) {
+                $staffProfile = get_user_profile($userId);
+                $actionByName = $staffProfile['fullName'] ?? $staffProfile['name'] ?? '';
+                // Cache it in session for future use
+                if (!empty($actionByName)) {
+                    $_SESSION['user_fullname'] = $actionByName;
+                }
+            }
+            
+            // Final fallback
+            if (empty($actionByName)) {
+                $actionByName = 'Admin';
+            }
+            
+            error_log("Action by name resolved to: {$actionByName}");
+            
+            $now = date('c');
+            
             // Try direct Firestore update first
             $payload = [
                 'status'    => $newStatus,
-                'updatedAt' => date('c'),
+                'updatedAt' => $now,
                 'updatedBy' => $userId,
             ];
             
-            // Add decline reason to the document if provided
-            if ($newStatus === 'Declined' && !empty($declineReason)) {
-                $payload['declineReason'] = $declineReason;
-                $payload['declinedAt'] = date('c');
+            // Add approver info when approved
+            if ($newStatus === 'Approved') {
+                $payload['approvedBy'] = $userId;
+                $payload['approvedByName'] = $actionByName;
+                $payload['approvedAt'] = $now;
+            }
+            
+            // Add decline reason and decliner info to the document if provided
+            if ($newStatus === 'Declined') {
+                $payload['declinedBy'] = $userId;
+                $payload['declinedByName'] = $actionByName;
+                $payload['declinedAt'] = $now;
+                if (!empty($declineReason)) {
+                    $payload['declineReason'] = $declineReason;
+                }
             }
             
             $updateSuccess = false;
@@ -1364,44 +2208,32 @@ if (isset($_POST['api_action'])) {
             if ($updateSuccess) {
                 error_log("Status update successful: {$collection}/{$docId} to {$newStatus}");
                 
-                // Send appropriate notifications based on status (HOSTING VERSION - WORKING)
-                if (function_exists('send_fcm_notification_for_approved_report')) {
-                    error_log("FCM notification function exists, attempting to send notification...");
-                    if ($newStatus === 'Approved') {
+                // Send appropriate notifications based on status
+                if ($newStatus === 'Approved') {
+                    if (function_exists('send_emergency_notification_directly') || function_exists('send_fcm_notification_for_approved_report')) {
                         error_log("Sending approved notifications for {$collection}/{$docId}");
-                        
-                        // Send user notification first (reporter gets "Report Approved" message) - REMOVED per user request
-                        // $userNotificationResult = send_fcm_notification_to_user_for_approved_report($collection, $docId);
-                        // error_log("User notification result: " . ($userNotificationResult ? 'success' : 'failed'));
-                        $userNotificationResult = true; // Set to true to maintain logic flow
-                        
-                        error_log("🚨🚨🚨 DASHBOARD APPROVAL: About to call send_fcm_notification_for_approved_report()");
-                        error_log("🚨🚨🚨 DASHBOARD APPROVAL: This should send EMERGENCY ALERTS, same as test_notification.php");
-                        error_log("🚨🚨🚨 DASHBOARD APPROVAL: Collection: $collection, DocId: $docId");
-                        
-                        // DIRECT FIX: Use the exact same approach as working test_notification.php
-                        error_log("🔥 DASHBOARD FIX: Using DIRECT emergency notification (like working test) ONLY");
-                        
+
+                        // Reporter "approved" notifications are intentionally disabled (per earlier request)
+                        $userNotificationResult = true;
+
                         if (function_exists('send_emergency_notification_directly')) {
-                            error_log("🔥 DASHBOARD FIX: Direct function available - using it exclusively");
                             $responderNotificationResult = send_emergency_notification_directly($collection, $docId);
                         } else {
-                            error_log("🔥 DASHBOARD FIX: Direct function not available, using fallback");
                             $responderNotificationResult = send_fcm_notification_for_approved_report($collection, $docId, false);
                         }
-                        
-                        error_log("Responder notification result: " . ($responderNotificationResult ? 'success' : 'failed'));
-                        error_log("� DASHBOARD FIX: Should only send ONE emergency alert, no 'Report Approved' messages");
-                        
+
                         $notificationResult = $userNotificationResult || $responderNotificationResult;
-                    } elseif ($newStatus === 'Declined') {
-                        error_log("Sending declined notification for {$collection}/{$docId}" . 
-                                 ($declineReason ? " with reason: {$declineReason}" : ""));
+                    } else {
+                        error_log("FCM approved-notification functions not available");
+                    }
+                } elseif ($newStatus === 'Declined') {
+                    if (function_exists('send_fcm_notification_to_user_for_rejected_report')) {
+                        error_log("Sending declined notification for {$collection}/{$docId}" . ($declineReason ? " with reason: {$declineReason}" : ""));
                         $notificationResult = send_fcm_notification_to_user_for_rejected_report($collection, $docId, $declineReason);
                         error_log("Declined notification result: " . ($notificationResult ? 'success' : 'failed'));
+                    } else {
+                        error_log("Decline notification function not available");
                     }
-                } else {
-                    error_log("FCM notification function does not exist!");
                 }
                 
                 // Update staff notifications when report status changes
@@ -1734,6 +2566,8 @@ if (isset($_POST['api_action'])) {
         // Clean output buffer to ensure valid JSON
         if (ob_get_length()) ob_clean();
         header('Content-Type: application/json');
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
         
         $page = max(1, (int)($_POST['page'] ?? 1));
         $pageSize = max(5, min(50, (int)($_POST['pageSize'] ?? 20)));
@@ -1744,28 +2578,32 @@ if (isset($_POST['api_action'])) {
         try {
             // Check if force refresh is requested
             $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
+            $debugClient = isset($_POST['debug']) && $_POST['debug'] === 'true';
             
-            // Create cache key based on filters
-            $cacheKey = "recent_feed_" . md5($search . $categoryFilter . $statusFilter);
-            
-            // Use cache only if not forcing refresh
-            // Reduced cache to 2 seconds for better realtime feel while preventing slam
-            $cachedData = $forceRefresh ? null : cache_get($cacheKey, 2); 
-            
-            if ($cachedData === null) {
-                // Use working optimized approach (fallback from ultra-fast)
-                if (empty($categories)) {
-                    $allRecent = [];
+            // For realtime: when force_refresh is true, always go directly to Firestore
+            if ($forceRefresh) {
+                // Parallel ORDERED runQuery fetch (reliable newest-first)
+                $allRecent = empty($categories) ? [] : build_recent_feed_ultra_fast_runquery($categories, $categoryFilter, $statusFilter, $search, 10);
+                $cacheHit = false;
+            } else {
+                // Create cache key based on filters
+                $cacheKey = "recent_feed_" . md5($search . $categoryFilter . $statusFilter);
+                
+                // Use cache with tiny TTL (1 second)
+                $cachedData = cache_get($cacheKey, 1);
+                $cacheHit = ($cachedData !== null);
+                
+                if ($cachedData === null) {
+                    $allRecent = empty($categories) ? [] : build_recent_feed_ultra_fast_runquery($categories, $categoryFilter, $statusFilter, $search, 10);
+                    cache_set($cacheKey, $allRecent, 1);
                 } else {
-                    $allRecent = build_recent_feed_optimized($categories, $categoryFilter, $statusFilter, $search, 15);
+                    $allRecent = $cachedData;
                 }
-                cache_set($cacheKey, $allRecent);
-                $cachedData = $allRecent;
             }
             
-            $total = count($cachedData);
+            $total = count($allRecent);
             $offset = ($page - 1) * $pageSize;
-            $paginatedRecent = array_slice($cachedData, $offset, $pageSize);
+            $paginatedRecent = array_slice($allRecent, $offset, $pageSize);
             
             // Final buffer clean before output
             if (ob_get_length()) ob_clean();
@@ -1777,6 +2615,13 @@ if (isset($_POST['api_action'])) {
                 'page' => $page,
                 'pageSize' => $pageSize,
                 'hasMore' => ($offset + $pageSize) < $total,
+                'meta' => [
+                    'serverNow' => date('c'),
+                    'cache' => [
+                        'hit' => $cacheHit,
+                        'forceRefresh' => $forceRefresh,
+                    ],
+                ],
                 'filters' => [
                     'search' => $search,
                     'category' => $categoryFilter,
@@ -1868,6 +2713,402 @@ if (isset($_POST['api_action'])) {
         exit();
     }
 
+    // AJAX: Load analytics counts (fast, cached) for both admin and staff
+    if ($action === 'load_analytics_counts') {
+        $startTime = microtime(true);
+
+        // Clean output buffer to ensure valid JSON
+        if (ob_get_length()) ob_clean();
+        header('Content-Type: application/json');
+        header('Cache-Control: no-cache');
+
+        try {
+            // Determine which category slugs are allowed for this user
+            $allowedSlugs = [];
+            if ($isAdmin) {
+                $allowedSlugs = array_keys($categories);
+            } else {
+                $profile = get_user_profile($userId);
+                $assigned = array_values(array_filter(array_map('strval', $profile['categories'] ?? [])));
+                foreach ($assigned as $slug) {
+                    if (isset($categories[$slug])) $allowedSlugs[] = $slug;
+                }
+            }
+
+            $allowedSlugs = array_values(array_unique($allowedSlugs));
+            sort($allowedSlugs);
+
+            $cacheKey = 'analytics_counts_' . ($isAdmin ? 'admin' : 'staff') . '_' . md5(implode(',', $allowedSlugs));
+            $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
+            
+            // Always try to get cached data first for immediate response
+            $cachedPayload = cache_get($cacheKey, 300); // 5 minute cache
+            
+            // If we have cache and not forcing refresh, return immediately
+            if (is_array($cachedPayload) && !$forceRefresh) {
+                $cachedPayload['executionTime'] = round((microtime(true) - $startTime) * 1000, 2) . 'ms';
+                $cachedPayload['cached'] = true;
+                echo json_encode($cachedPayload);
+                exit();
+            }
+            
+            // Fetch fresh data
+            $payload = null;
+            if (!is_array($cachedPayload) || $forceRefresh) {
+                $collections = [];
+                foreach ($allowedSlugs as $slug) {
+                    $collections[] = $categories[$slug]['collection'];
+                }
+
+                if (empty($collections)) {
+                    $countResults = [];
+                } else {
+                    // Prefer parallel aggregation counts when available.
+                    $countResults = function_exists('get_admin_stats_counts_fast')
+                        ? get_admin_stats_counts_fast($collections)
+                        : get_admin_stats_counts_fallback($collections);
+                }
+
+                $bySlug = [];
+                $grand = ['total' => 0, 'pending' => 0, 'approved' => 0, 'declined' => 0, 'responded' => 0];
+
+                foreach ($allowedSlugs as $slug) {
+                    $col = $categories[$slug]['collection'];
+                    $row = [
+                        'total'     => (int)($countResults[$col]['total'] ?? 0),
+                        'pending'   => (int)($countResults[$col]['pending'] ?? 0),
+                        'approved'  => (int)($countResults[$col]['approved'] ?? 0),
+                        'declined'  => (int)($countResults[$col]['declined'] ?? 0),
+                        'responded' => (int)($countResults[$col]['responded'] ?? 0),
+                    ];
+                    $bySlug[$slug] = $row;
+                    $grand['total'] += $row['total'];
+                    $grand['pending'] += $row['pending'];
+                    $grand['approved'] += $row['approved'];
+                    $grand['declined'] += $row['declined'];
+                    $grand['responded'] += $row['responded'];
+                }
+
+                $payload = [
+                    'success' => true,
+                    'grand' => $grand,
+                    'bySlug' => $bySlug,
+                ];
+
+                cache_set($cacheKey, $payload, 120);
+            }
+
+            $payload['executionTime'] = round((microtime(true) - $startTime) * 1000, 2) . 'ms';
+            echo json_encode($payload);
+        } catch (Throwable $e) {
+            echo json_encode([
+                'success' => false,
+                'message' => 'Failed to load analytics counts: ' . $e->getMessage(),
+                'retry' => true,
+                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
+            ]);
+        }
+        exit();
+    }
+
+    // AJAX: Analytics charts + metrics (cached, minimal data)
+    if ($action === 'get_analytics_data') {
+        $startTime = microtime(true);
+        if (ob_get_length()) ob_clean();
+        header('Content-Type: application/json');
+
+        try {
+            $range = strtolower(trim((string)($_POST['range'] ?? 'week')));
+            $rangeAliases = [
+                'today' => 'day',
+            ];
+            if (isset($rangeAliases[$range])) {
+                $range = $rangeAliases[$range];
+            }
+            $allowedRanges = ['day', 'week', 'month', 'year', 'all'];
+            if (!in_array($range, $allowedRanges, true)) {
+                $range = 'week';
+            }
+
+            // Determine allowed slugs for current user
+            if ($isAdmin) {
+                $allowedSlugs = array_keys($categories);
+            } else {
+                $allowedSlugs = array_values(array_filter(array_map('strval', $_SESSION['user_categories'] ?? [])));
+                $allowedSlugs = array_values(array_filter($allowedSlugs, fn($s) => isset($categories[$s])));
+
+                // If session categories are stale/missing, fall back to profile lookup.
+                if (empty($allowedSlugs)) {
+                    $profile = get_user_profile($userId);
+                    $allowedSlugs = array_values(array_filter(array_map('strval', $profile['categories'] ?? [])));
+                    $allowedSlugs = array_values(array_filter($allowedSlugs, fn($s) => isset($categories[$s])));
+                    if (!empty($allowedSlugs)) {
+                        $_SESSION['user_categories'] = $allowedSlugs;
+                    }
+                }
+            }
+            $allowedSlugs = array_values(array_unique($allowedSlugs));
+            sort($allowedSlugs);
+
+            $cacheKey = 'analytics_data_' . $range . '_' . ($isAdmin ? 'admin' : 'staff') . '_' . md5(implode(',', $allowedSlugs));
+            $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
+            if (!$forceRefresh) {
+                $cached = cache_get($cacheKey, 120);
+                if (is_array($cached)) {
+                    $cached['executionTime'] = round((microtime(true) - $startTime) * 1000, 2) . 'ms';
+                    $cached['cached'] = true;
+                    echo json_encode($cached);
+                    exit();
+                }
+            }
+
+            // Category totals via existing fast counts
+            $collections = [];
+            foreach ($allowedSlugs as $slug) {
+                $collections[] = $categories[$slug]['collection'];
+            }
+            if (empty($collections)) {
+                $countResults = [];
+            } else {
+                // Prefer parallel aggregation counts when available.
+                $countResults = function_exists('get_admin_stats_counts_fast')
+                    ? get_admin_stats_counts_fast($collections)
+                    : get_admin_stats_counts_fallback($collections);
+
+                // Guard: if fast path returns all-zero totals, retry with fallback parser.
+                $hasAnyTotal = false;
+                foreach ($collections as $colCheck) {
+                    if ((int)($countResults[$colCheck]['total'] ?? 0) > 0) {
+                        $hasAnyTotal = true;
+                        break;
+                    }
+                }
+                if (!$hasAnyTotal) {
+                    $countResults = get_admin_stats_counts_fallback($collections);
+                }
+            }
+
+            $categoryLabels = [];
+            $categoryData = [];
+            $respondedTotal = 0;
+            $totalReports = 0;
+
+            foreach ($allowedSlugs as $slug) {
+                $meta = $categories[$slug];
+                $col = $meta['collection'];
+                $total = (int)($countResults[$col]['total'] ?? 0);
+                $responded = (int)($countResults[$col]['responded'] ?? 0);
+                $totalReports += $total;
+                $respondedTotal += $responded;
+                $categoryLabels[] = $meta['label'];
+                $categoryData[] = $total;
+            }
+
+            // Trend data (fast heuristic): daily buckets for short ranges, monthly for year/all.
+            $bucketMode = ($range === 'year' || $range === 'all') ? 'month' : 'day';
+            $trendLabels = [];
+            $trendCounts = [];
+            if ($bucketMode === 'month') {
+                for ($i = 11; $i >= 0; $i--) {
+                    $label = date('M Y', strtotime("first day of -$i month"));
+                    $key = date('Y-m', strtotime("first day of -$i month"));
+                    $trendLabels[] = $label;
+                    $trendCounts[$key] = 0;
+                }
+            } else {
+                $days = ($range === 'day') ? 1 : (($range === 'month') ? 30 : 7);
+                for ($i = $days - 1; $i >= 0; $i--) {
+                    $label = date('M j', strtotime("-$i day"));
+                    $key = date('Y-m-d', strtotime("-$i day"));
+                    $trendLabels[] = $label;
+                    $trendCounts[$key] = 0;
+                }
+            }
+
+            $parseDateKey = function($ts): ?string {
+                if (is_array($ts) && isset($ts['_seconds'])) {
+                    return date('Y-m-d', (int)$ts['_seconds']);
+                }
+                if ($ts instanceof \Google\Cloud\Core\Timestamp) {
+                    try { return $ts->get()->format('Y-m-d'); } catch (Throwable $e) { return null; }
+                }
+                if (is_string($ts) && $ts !== '') {
+                    $t = strtotime($ts);
+                    if ($t !== false) return date('Y-m-d', $t);
+                }
+                return null;
+            };
+
+            // Parallel list-documents sampling for trend/response metrics
+            $sampleLimit = ($range === 'month') ? 40 : (($range === 'year' || $range === 'all') ? 32 : 20);
+            $responseAgg = [];
+            foreach ($allowedSlugs as $slugKey) {
+                $responseAgg[$slugKey] = ['sum' => 0.0, 'count' => 0];
+            }
+
+            try {
+                $token = firestore_rest_token();
+                $base  = firestore_base_url();
+                $mh = curl_multi_init();
+                $handles = [];
+                foreach ($allowedSlugs as $slug) {
+                    $col = $categories[$slug]['collection'];
+                    $url = $base . '/' . rawurlencode($col) . '?pageSize=' . (int)$sampleLimit;
+                    $ch = curl_init();
+                    curl_setopt_array($ch, [
+                        CURLOPT_URL => $url,
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_HTTPHEADER => [
+                            'Authorization: Bearer ' . $token,
+                            'Accept: application/json',
+                        ],
+                        CURLOPT_TIMEOUT => 10,
+                        CURLOPT_CONNECTTIMEOUT => 4,
+                        CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
+                        CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
+                    ]);
+                    curl_multi_add_handle($mh, $ch);
+                    $handles[] = ['ch' => $ch, 'slug' => $slug];
+                }
+
+                $running = null;
+                do {
+                    curl_multi_exec($mh, $running);
+                    curl_multi_select($mh, 0.2);
+                } while ($running > 0);
+
+                foreach ($handles as $entry) {
+                    $ch = $entry['ch'];
+                    $slug = $entry['slug'];
+                    $raw  = curl_multi_getcontent($ch);
+                    $http = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    curl_multi_remove_handle($mh, $ch);
+                    curl_close($ch);
+                    if ($http < 200 || $http >= 300) continue;
+
+                    $json = json_decode($raw ?: 'null', true);
+                    $docs = is_array($json) ? ($json['documents'] ?? []) : [];
+                    if (!is_array($docs)) continue;
+
+                    foreach ($docs as $doc) {
+                        // createTime exists for every doc and is enough for trend buckets.
+                        $kRaw = $parseDateKey($doc['createTime'] ?? null);
+                        $k = null;
+                        if ($kRaw !== null) {
+                            $k = ($bucketMode === 'month') ? substr($kRaw, 0, 7) : $kRaw;
+                        }
+                        if ($k !== null && isset($trendCounts[$k])) {
+                            $trendCounts[$k]++;
+                        }
+
+                        // Compute response-time sample from timestamp/createdAt -> respondedAt.
+                        $fields = isset($doc['fields']) && is_array($doc['fields'])
+                            ? firestore_decode_fields($doc['fields'])
+                            : [];
+                        if (!is_array($fields)) {
+                            $fields = [];
+                        }
+
+                        $respondedAt = $fields['respondedAt'] ?? null;
+                        $reportedAt = $fields['timestamp'] ?? ($fields['createdAt'] ?? ($doc['createTime'] ?? null));
+
+                        $respondedEpoch = is_string($respondedAt) ? strtotime($respondedAt) : false;
+                        $reportedEpoch = false;
+                        if (is_string($reportedAt)) {
+                            $reportedEpoch = strtotime($reportedAt);
+                        } elseif (is_array($reportedAt) && isset($reportedAt['_seconds'])) {
+                            $reportedEpoch = (int)$reportedAt['_seconds'];
+                        }
+
+                        if ($respondedEpoch !== false && $reportedEpoch !== false && $respondedEpoch > $reportedEpoch) {
+                            $minutes = ($respondedEpoch - $reportedEpoch) / 60;
+                            if ($minutes >= 0 && $minutes <= 1440 && isset($responseAgg[$slug])) {
+                                $responseAgg[$slug]['sum'] += $minutes;
+                                $responseAgg[$slug]['count']++;
+                            }
+                        }
+                    }
+                }
+
+                curl_multi_close($mh);
+            } catch (Throwable $e) {
+                // If sampling fails, keep zeros; counts/metrics still work.
+            }
+            $trendData = array_values($trendCounts);
+
+            // Response time chart from sampled responded documents.
+            $responseTimeLabels = [];
+            $responseTimeData = [];
+            $avgResponseMinutes = [];
+            foreach ($allowedSlugs as $slug) {
+                $responseTimeLabels[] = $categories[$slug]['label'];
+                $count = (int)($responseAgg[$slug]['count'] ?? 0);
+                $sum = (float)($responseAgg[$slug]['sum'] ?? 0.0);
+                $avg = $count > 0 ? round($sum / $count, 1) : 0;
+                $responseTimeData[] = $avg;
+                if ($avg > 0) {
+                    $avgResponseMinutes[] = $avg;
+                }
+            }
+
+            $responseRate = $totalReports > 0 ? round(($respondedTotal / $totalReports) * 100, 1) : 0;
+            $avgResponseTime = !empty($avgResponseMinutes)
+                ? round(array_sum($avgResponseMinutes) / count($avgResponseMinutes), 1)
+                : 0;
+            $activeResponders = 0;
+            foreach ($allowedSlugs as $slug) {
+                if ((int)($countResults[$categories[$slug]['collection']]['responded'] ?? 0) > 0) {
+                    $activeResponders++;
+                }
+            }
+
+            // Lightweight trend percentages for cards
+            $points = count($trendData);
+            $half = (int)floor($points / 2);
+            $currentPeriod = $half > 0 ? array_slice($trendData, -$half) : $trendData;
+            $prevPeriod = $half > 0 ? array_slice($trendData, 0, $half) : [];
+            $currentTotal = array_sum($currentPeriod);
+            $prevTotal = array_sum($prevPeriod);
+            $totalReportsTrend = ($prevTotal > 0)
+                ? round((($currentTotal - $prevTotal) / $prevTotal) * 100, 1)
+                : ($currentTotal > 0 ? 100.0 : 0.0);
+
+            $payload = [
+                'success' => true,
+                'data' => [
+                    'categoryLabels' => $categoryLabels,
+                    'categoryData' => $categoryData,
+                    'trendLabels' => $trendLabels,
+                    'trendData' => $trendData,
+                    'responseTimeLabels' => $responseTimeLabels,
+                    'responseTimeData' => $responseTimeData,
+                    'metrics' => [
+                        'totalReports' => $totalReports,
+                        'totalReportsTrend' => $totalReportsTrend,
+                        'responseRate' => $responseRate,
+                        'responseRateTrend' => $totalReportsTrend,
+                        'avgResponseTime' => $avgResponseTime,
+                        'responseTimeTrend' => $avgResponseTime > 0 ? -round(min($avgResponseTime / 60, 100), 1) : 0,
+                        'activeResponders' => $activeResponders,
+                    ]
+                ]
+            ];
+
+            cache_set($cacheKey, $payload, 120);
+            $payload['executionTime'] = round((microtime(true) - $startTime) * 1000, 2) . 'ms';
+            $payload['cached'] = false;
+            echo json_encode($payload);
+        } catch (Throwable $e) {
+            echo json_encode([
+                'success' => false,
+                'message' => 'Failed to load analytics data: ' . $e->getMessage(),
+                'retry' => true,
+                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
+            ]);
+        }
+        exit();
+    }
+
     // Debug: Test Firestore connection
     if ($isAdmin && $action === 'test_connection') {
         $testResult = test_firestore_connection();
@@ -1877,6 +3118,7 @@ if (isset($_POST['api_action'])) {
 
     // Lightweight approve/reject (accept both userId & uid)
     if ($isAdmin && $action === 'verify_user') {
+        require_once __DIR__ . '/notification_system.php';
         $uid = trim($_POST['userId'] ?? ($_POST['uid'] ?? ''));
         $decision = strtolower(trim($_POST['decision'] ?? ''));
         if (!$uid || !in_array($decision, ['approved','rejected'], true)) {
@@ -1954,6 +3196,7 @@ if (isset($_POST['api_action'])) {
         $startTime = microtime(true);
         
         try {
+            require_once __DIR__ . '/notification_system.php';
             // Get user profile to know assigned categories FIRST
             $userProfile = get_user_profile($userId);
             $userCategories = $userProfile['categories'] ?? [];
@@ -1984,6 +3227,7 @@ if (isset($_POST['api_action'])) {
     // Staff: Get notification count
     if (!$isAdmin && $action === 'get_notification_count') {
         try {
+            require_once __DIR__ . '/notification_system.php';
             // Get user profile to know assigned categories
             $userProfile = get_user_profile($userId);
             $userCategories = $userProfile['categories'] ?? [];
@@ -2008,6 +3252,7 @@ if (isset($_POST['api_action'])) {
     // Staff: Get notifications
     if (!$isAdmin && $action === 'get_notifications') {
         try {
+            require_once __DIR__ . '/notification_system.php';
             // Get user profile to know assigned categories
             $userProfile = get_user_profile($userId);
             $userCategories = $userProfile['categories'] ?? [];
@@ -2041,6 +3286,7 @@ if (isset($_POST['api_action'])) {
         }
         
         try {
+            require_once __DIR__ . '/notification_system.php';
             $success = mark_notification_read($notificationId);
             
             echo json_encode([
@@ -2059,6 +3305,7 @@ if (isset($_POST['api_action'])) {
     // Staff: Create notifications for urgent reports
     if (!$isAdmin && $action === 'create_notifications') {
         try {
+            require_once __DIR__ . '/notification_system.php';
             // Get user profile to know assigned categories
             $userProfile = get_user_profile($userId);
             $userCategories = $userProfile['categories'] ?? [];
@@ -2081,6 +3328,7 @@ if (isset($_POST['api_action'])) {
     // Staff: Cleanup notifications (debug and fix count issues)
     if (!$isAdmin && $action === 'cleanup_notifications') {
         try {
+            require_once __DIR__ . '/notification_system.php';
             $cleanedCount = cleanup_orphaned_notifications();
             
             echo json_encode([
@@ -2425,6 +3673,20 @@ function fmt_ts($ts): string {
             }
             return '';
         } catch (Throwable $e) { return ''; }
+    }
+    if (is_array($ts)) {
+        // Support Firestore timestamp-like arrays (e.g. ['_seconds'=>..., '_nanoseconds'=>...])
+        $sec = null;
+        if (isset($ts['_seconds']) && is_numeric($ts['_seconds'])) $sec = (int)$ts['_seconds'];
+        elseif (isset($ts['seconds']) && is_numeric($ts['seconds'])) $sec = (int)$ts['seconds'];
+        if ($sec !== null) {
+            try {
+                $dt = (new DateTimeImmutable('@' . $sec))->setTimezone(new DateTimeZone('Asia/Manila'));
+                return $dt->format('M j, Y g:i A');
+            } catch (Throwable $e) {
+                return '';
+            }
+        }
     }
     if (is_string($ts)) {
         try { 
@@ -4049,13 +5311,13 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             </div>
             <nav class="flex-1 px-2 py-4 space-y-1.5">
                 <?php $isDashActive = ($view === 'dashboard'); ?>
-                <a href="dashboard?view=dashboard" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isDashActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50'; ?>">
+                <a href="dashboard.php?view=dashboard" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isDashActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50'; ?>">
                     <?php echo svg_icon('dashboard', 'w-5 h-5'); ?>
                     <span>Dashboard</span>
                 </a>
 
                 <?php $isAnalyticsActive = ($view === 'analytics'); ?>
-                <a href="dashboard?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isAnalyticsActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                <a href="dashboard.php?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isAnalyticsActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
@@ -4064,7 +5326,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                 </a>
                 
                 <?php $isMapActive = ($view === 'map'); ?>
-                <a href="dashboard?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isMapActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                <a href="dashboard.php?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isMapActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
                     </svg>
@@ -4072,7 +5334,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                 </a>
 
                 <?php $isLiveSupportActive = ($view === 'live-support'); ?>
-                <a href="dashboard?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isLiveSupportActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50'; ?>">
+                <a href="dashboard.php?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isLiveSupportActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50'; ?>">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
                     </svg>
@@ -4082,7 +5344,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
 
                 <?php if ($isAdmin): ?>
                 <?php $isCreateAccountActive = ($view === 'create-account'); ?>
-                <a href="dashboard?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isCreateAccountActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                <a href="dashboard.php?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isCreateAccountActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                     <?php echo svg_icon('user-plus', 'w-5 h-5'); ?>
                     <span>Create Account</span>
                 </a>
@@ -4116,7 +5378,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                         <p class="text-xs text-slate-500"><?php echo htmlspecialchars(ucfirst($userRole)); ?></p>
                     </div>
                 </div>
-                <a href="logout" class="flex items-center justify-center gap-2 rounded-lg bg-slate-100 text-slate-700 hover:bg-slate-200 w-full px-4 py-2.5 text-sm font-semibold">
+                <a href="logout.php" class="flex items-center justify-center gap-2 rounded-lg bg-slate-100 text-slate-700 hover:bg-slate-200 w-full px-4 py-2.5 text-sm font-semibold">
                     <?php echo svg_icon('logout', 'w-5 h-5'); ?>
                     <span>Logout</span>
                 </a>
@@ -4147,13 +5409,13 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                     </div>
                     <nav class="flex-1 px-4 py-4 space-y-1.5 overflow-y-auto">
                         <?php $isDashActive = ($view === 'dashboard'); ?>
-                        <a href="dashboard?view=dashboard" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isDashActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                        <a href="dashboard.php?view=dashboard" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isDashActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                             <?php echo svg_icon('dashboard', 'w-5 h-5'); ?>
                             <span>Dashboard</span>
                         </a>
 
                         <?php $isAnalyticsActive = ($view === 'analytics'); ?>
-                        <a href="dashboard?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isAnalyticsActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                        <a href="dashboard.php?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isAnalyticsActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
@@ -4162,7 +5424,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                         </a>
                         
                         <?php $isMapActive = ($view === 'map'); ?>
-                        <a href="dashboard?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isMapActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                        <a href="dashboard.php?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isMapActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
                             </svg>
@@ -4170,7 +5432,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                         </a>
 
                         <?php $isLiveSupportActive = ($view === 'live-support'); ?>
-                        <a href="dashboard?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isLiveSupportActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                        <a href="dashboard.php?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isLiveSupportActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
                             </svg>
@@ -4180,7 +5442,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                         
                         <?php if ($isAdmin): ?>
                             <?php $isCreateAccountActive = ($view === 'create-account'); ?>
-                            <a href="dashboard?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isCreateAccountActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
+                            <a href="dashboard.php?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isCreateAccountActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
                                 <?php echo svg_icon('user-plus', 'w-5 h-5'); ?>
                                 <span>Create Account</span>
                             </a>
@@ -4272,20 +5534,20 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
 
 
                 <?php if ($view === 'live-support'): ?>
-                    <?php include 'views/live_support.php'; ?>
+                    <?php include __DIR__ . '/views/live_support.php'; ?>
 
                 <?php elseif ($view === 'map'): ?>
-                    <?php include 'views/interactive_map.php'; ?>
+                    <?php include __DIR__ . '/views/interactive_map.php'; ?>
 
                 <?php elseif ($isAdmin): ?>
                     <?php if ($view === 'create-account'): ?>
-                        <?php include 'views/create_account.php'; ?>
+                        <?php include __DIR__ . '/views/create_account.php'; ?>
 
                     <?php elseif ($view === 'analytics'): ?>
-                        <?php include 'views/analytics.php'; ?>
+                        <?php include __DIR__ . '/views/analytics.php'; ?>
 
                     <?php else: // Default Admin Dashboard View ?>
-                        <?php include 'views/dashboard_home.php'; ?>
+                        <?php include __DIR__ . '/views/dashboard_home.php'; ?>
                     <?php endif; ?>
                 
                 <?php else: // Staff View ?>
@@ -4555,6 +5817,15 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
     <div id="toastContainer" class="fixed top-5 right-5 z-[100] w-full max-w-xs space-y-3"></div>
 
     <script>
+        // Dashboard configuration for JavaScript
+        window.dashboardConfig = {
+            isAdmin: <?php echo $isAdmin ? 'true' : 'false'; ?>,
+            userRole: '<?php echo htmlspecialchars($userRole); ?>',
+            view: '<?php echo htmlspecialchars($view); ?>',
+            userCategories: <?php echo json_encode(array_values($userCategories ?? [])); ?>,
+            userBarangay: <?php echo json_encode((string)($userProfile['assignedBarangay'] ?? ($_SESSION['assignedBarangay'] ?? ''))); ?>
+        };
+        
         // Set your Firebase Web config here to enable realtime updates (onSnapshot).
         window.FIREBASE_CLIENT_CONFIG = {
             apiKey: "AIzaSyDiNgvmttAwhAjPthjJtcZ1Hr9PLWnhErQ", // Firebase Web config
@@ -4780,100 +6051,126 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         // Make showToast globally accessible
         window.showToast = showToast;
 
+        // --- AUDIO UNLOCK ON FIRST USER INTERACTION ---
+        // Browsers require user interaction before playing audio
+        // This unlocks audio on the first click/touch/keypress
+        let audioUnlocked = false;
+        let audioContext = null;
+        
+        function unlockAudio() {
+            if (audioUnlocked) return;
+            
+            try {
+                // Create and resume AudioContext
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                
+                // Create a silent buffer and play it
+                const buffer = audioContext.createBuffer(1, 1, 22050);
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+                source.start(0);
+                
+                // Resume context if suspended
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+                
+                // Also try HTML5 Audio
+                const silentAudio = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
+                silentAudio.volume = 0.01;
+                silentAudio.play().catch(() => {});
+                
+                audioUnlocked = true;
+                console.log('🔊 Audio unlocked - notification sounds will now work');
+                
+                // Remove listeners after unlock
+                document.removeEventListener('click', unlockAudio);
+                document.removeEventListener('touchstart', unlockAudio);
+                document.removeEventListener('keydown', unlockAudio);
+            } catch (e) {
+                console.log('Audio unlock attempt:', e.message);
+            }
+        }
+        
+        // Listen for first user interaction
+        document.addEventListener('click', unlockAudio, { once: false });
+        document.addEventListener('touchstart', unlockAudio, { once: false });
+        document.addEventListener('keydown', unlockAudio, { once: false });
+
         // --- NOTIFICATION SOUND ---
         // Create a simple notification sound
         function playNotificationSound(soundType = 'default') {
+            // Check if audio is unlocked
+            if (!audioUnlocked) {
+                console.log('⚠️ Audio not yet unlocked - click anywhere on page first');
+            }
+            
             // Special handling for emergency siren
             if (soundType === 'siren') {
                 try {
                     const audio = new Audio('alarmsiren.mp3');
                     audio.volume = 1.0; // Max volume for emergency
                     audio.play().then(() => {
-                        console.log('Emergency siren played');
+                        console.log('🔊 Emergency siren played');
                     }).catch(e => {
-                        console.error('Siren play failed:', e);
-                        // Fallback to default sound if siren fails
-                        playNotificationSound('default');
+                        // Silently fall back to beep sound
+                        console.log('Siren unavailable, using beep');
+                        playBeepSound();
                     });
                     return;
                 } catch (e) {
-                    console.error('Siren error:', e);
+                    playBeepSound();
                 }
-            }
-
-            try {
-                // Try multiple methods to ensure sound plays
-                
-                // Method 1: Web Audio API (most reliable)
-                if (window.AudioContext || window.webkitAudioContext) {
-                    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    
-                    // Create a simple beep sound
-                    const oscillator = audioContext.createOscillator();
-                    const gainNode = audioContext.createGain();
-                    
-                    oscillator.connect(gainNode);
-                    gainNode.connect(audioContext.destination);
-                    
-                    // Simple notification tone
-                    oscillator.frequency.value = 800; // High pitch
-                    oscillator.type = 'sine';
-                    
-                    // Quick beep
-                    gainNode.gain.setValueAtTime(0, audioContext.currentTime);
-                    gainNode.gain.linearRampToValueAtTime(0.2, audioContext.currentTime + 0.01);
-                    gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.2);
-                    
-                    oscillator.start(audioContext.currentTime);
-                    oscillator.stop(audioContext.currentTime + 0.2);
-                    
-                    console.log('Notification sound played via Web Audio API');
-                    return;
-                }
-            } catch (error) {
-                console.log('Web Audio API failed:', error);
+                return;
             }
             
+            playBeepSound();
+        }
+        
+        function playBeepSound() {
             try {
-                // Method 2: HTML5 Audio with notification sound
-                const audio = new Audio();
-                audio.volume = 0.3;
+                // Use the unlocked AudioContext if available
+                const ctx = audioContext || new (window.AudioContext || window.webkitAudioContext)();
                 
-                // Use a data URI for a simple beep sound
-                audio.src = 'data:audio/wav;base64,UklGRhwBAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YfgAAABBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmUbByGH0O+5cyUFLYfQ8tqJNQgZZ7zv559NEAxPqOPutmMcBjiS2/LNeSsFJHfH8N+QQAoUXrPq66hWFAlFn+DyvmUbByGH0O25cyUGLYfO8tiIOAcXZrPy649OEQxKn+DyvWUcCCOH0O+zdCQDIojQ+dqNOQcXZLTz6Y9PEAxGqODyv2UcCCGF0fG6ciMGMIvO89iJOQYXZLPy6Y9PEQtGn+DyvmQcCCOG0fG6ciMGMIzO89iJOQYZY7Dz6Y5ND';
-                
-                audio.play().then(() => {
-                    console.log('Notification sound played via HTML5 Audio');
-                }).catch((e) => {
-                    console.log('HTML5 Audio failed:', e);
-                    
-                    // Method 3: Try system notification sound (if available)
-                    try {
-                        // Some browsers support this
-                        if (window.speechSynthesis) {
-                            const utterance = new SpeechSynthesisUtterance('');
-                            utterance.volume = 0;
-                            utterance.rate = 10;
-                            utterance.pitch = 2;
-                            window.speechSynthesis.speak(utterance);
-                        }
-                    } catch (speechError) {
-                        console.log('All notification sound methods failed');
-                    }
-                });
-                
-            } catch (error) {
-                console.log('HTML5 Audio method failed:', error);
-                
-                // Method 4: Final fallback - try to trigger browser's default notification sound
-                try {
-                    // Create a very short, silent audio to trigger notification
-                    const silentAudio = new Audio('data:audio/mp3;base64,SUQzBAAAAAABEVRYWFgAAAAtAAADY29tbWVudABCaWdTb3VuZEJhbmsuY29tIC8gTGFTb25vdGhlcXVlLm9yZwBURU5DAAAAHQAAAW1wM1BSRQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//OEZAAJAAAGkAAAAIAAANIAAAAQAAAaQAAAAgAAA0gAAABE//OEZAQOAAAGkAAAAAQAAA0gAAAABAAAaQAAAAIAANIAAAAT//OEZAg');
-                    silentAudio.volume = 0.01;
-                    silentAudio.play();
-                } catch (finalError) {
-                    console.log('Final fallback also failed:', finalError);
+                if (ctx.state === 'suspended') {
+                    ctx.resume();
                 }
+                
+                // Facebook Messenger-style "pop" notification sound
+                // Two quick notes: high then higher, with a nice decay
+                const now = ctx.currentTime;
+                
+                // First note - the "pop"
+                const osc1 = ctx.createOscillator();
+                const gain1 = ctx.createGain();
+                osc1.connect(gain1);
+                gain1.connect(ctx.destination);
+                osc1.frequency.setValueAtTime(830, now); // E5
+                osc1.frequency.setValueAtTime(880, now + 0.08); // A5 slide up
+                osc1.type = 'sine';
+                gain1.gain.setValueAtTime(0, now);
+                gain1.gain.linearRampToValueAtTime(0.4, now + 0.02);
+                gain1.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+                osc1.start(now);
+                osc1.stop(now + 0.15);
+                
+                // Second note - the "ding" (slightly delayed)
+                const osc2 = ctx.createOscillator();
+                const gain2 = ctx.createGain();
+                osc2.connect(gain2);
+                gain2.connect(ctx.destination);
+                osc2.frequency.value = 1320; // E6 - higher octave
+                osc2.type = 'sine';
+                gain2.gain.setValueAtTime(0, now + 0.08);
+                gain2.gain.linearRampToValueAtTime(0.3, now + 0.1);
+                gain2.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
+                osc2.start(now + 0.08);
+                osc2.stop(now + 0.35);
+                
+                console.log('🔊 Notification sound played');
+            } catch (error) {
+                console.log('Notification sound failed:', error.message);
             }
         }
 
@@ -5614,7 +6911,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         }
 
         // Staff Statistics and Management
-        if (window.location.search.includes('view=create-staff')) {
+        if (window.location.search.includes('view=create-account') || window.location.search.includes('view=create-staff')) {
             loadStaffData();
 
             // Auto-refresh staff data every 30 seconds
@@ -5640,12 +6937,12 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                 staffEmpty.classList.add('hidden');
 
                 // Fetch staff data
-                const response = await fetch('api.php', {
+                const formData = new FormData();
+                formData.append('api_action', 'get_staff_data');
+
+                const response = await fetch(window.location.href, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: 'api_action=get_staff_data'
+                    body: formData
                 });
 
                 const result = await response.json();
@@ -6479,6 +7776,20 @@ const meta = categories[ds.slug] || {};
                     window.recentFeedData = data;
                     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
                     
+                    // Debug: log approver fields for first approved item
+                    const approvedItem = data.find(r => r.status?.toLowerCase() === 'approved');
+                    if (approvedItem) {
+                        console.log('Approved item data:', {
+                            id: approvedItem.id,
+                            status: approvedItem.status,
+                            approvedBy: approvedItem.approvedBy,
+                            approvedByName: approvedItem.approvedByName,
+                            approvedAt: approvedItem.approvedAt,
+                            updatedBy: approvedItem.updatedBy,
+                            updatedAt: approvedItem.updatedAt
+                        });
+                    }
+                    
                     const html = data.length > 0 ? data.map((row, index) => {
                         const st = String(row.status || 'Pending').toLowerCase();
                         const getStatusConfig = (status) => {
@@ -6528,6 +7839,44 @@ const meta = categories[ds.slug] || {};
                         
                         const statusConfig = getStatusConfig(st);
                         
+                        // Build approver/action info - check multiple possible fields
+                        let actionInfo = '';
+                        // For approved: show approver name, with multiple fallbacks
+                        if (st === 'approved') {
+                            const approverName = row.approvedByName || row.updatedBy || '';
+                            const approveTime = row.approvedAt || row.updatedAt || '';
+                            if (approverName) {
+                                actionInfo = `<div class="flex items-center gap-1.5 mt-2 text-xs text-green-600">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    <span>Approved by <strong>${esc(approverName)}</strong>${approveTime ? ' • ' + esc(approveTime) : ''}</span>
+                                </div>`;
+                            }
+                        } else if (st === 'declined') {
+                            const declinerName = row.declinedByName || row.updatedBy || '';
+                            const declineTime = row.declinedAt || row.updatedAt || '';
+                            if (declinerName) {
+                                actionInfo = `<div class="flex items-center gap-1.5 mt-2 text-xs text-red-600">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    <span>Declined by <strong>${esc(declinerName)}</strong>${declineTime ? ' • ' + esc(declineTime) : ''}</span>
+                                </div>`;
+                            }
+                        } else if (st === 'responded') {
+                            const responderName = row.respondedByName || row.respondedBy || '';
+                            const respondTime = row.respondedAt || '';
+                            if (responderName) {
+                                actionInfo = `<div class="flex items-center gap-1.5 mt-2 text-xs text-blue-600">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path>
+                                    </svg>
+                                    <span>Responded by <strong>${esc(responderName)}</strong>${respondTime ? ' • ' + esc(respondTime) : ''}</span>
+                                </div>`;
+                            }
+                        }
+                        
                         return `
                         <li
                             onclick="showReportModal(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showReportModal(this);}"
@@ -6538,6 +7887,9 @@ const meta = categories[ds.slug] || {};
                             data-reporterid="${esc(row.reporterId)}" data-imageurl="${esc(row.imageUrl)}"
                             data-status="${esc(st)}" data-timestamp="${esc(row.tsDisplay)}"
                             data-lat="${esc(row.lat)}" data-lng="${esc(row.lng)}"
+                            data-approvedbyname="${esc(row.approvedByName || '')}" data-approvedat="${esc(row.approvedAt || '')}"
+                            data-declinedbyname="${esc(row.declinedByName || '')}" data-declinedat="${esc(row.declinedAt || '')}"
+                            data-respondedbyname="${esc(row.respondedByName || '')}" data-respondedat="${esc(row.respondedAt || '')}"
                             class="glass-card p-5 cursor-pointer animate-fade-in-up group hover:scale-[1.02] transition-all duration-300"
                             style="--anim-delay: ${index * 50}ms"
                         >
@@ -6580,6 +7932,7 @@ const meta = categories[ds.slug] || {};
                                             </svg>
                                         </div>
                                     </div>
+                                    ${actionInfo}
                                 </div>
                             </div>
                         </li>`;
@@ -6750,8 +8103,14 @@ const meta = categories[ds.slug] || {};
             // Override global refresh function
             window.refreshRecentActivity = function() {
                 window.isBackgroundRefresh = true; // Use background refresh to avoid spinner
-                loadRecentPage(currentPage);
+                // Check if force refresh was requested (e.g., from head-check signature change)
+                const shouldForceRefresh = window.forceRecentFeedRefresh === true;
+                window.forceRecentFeedRefresh = false;
+                console.log('[RecentActivity] Refreshing feed, forceRefresh:', shouldForceRefresh);
+                loadRecentPage(currentPage, 0, shouldForceRefresh);
             };
+            
+            console.log('[RecentActivity] Inline JS initialized');
 
             // Check for updates every 2 seconds (Faster polling for realtime feel)
             async function checkForUpdates() {
@@ -9182,6 +10541,92 @@ const meta = categories[ds.slug] || {};
     if (window.FIREBASE_CLIENT_CONFIG && window.FIREBASE_CLIENT_CONFIG.projectId) {
         const app = initializeApp(window.FIREBASE_CLIENT_CONFIG);
         const db = getFirestore(app);
+        
+        // ============ LISTEN FOR NEW REPORTS (Realtime) ============
+        const reportCollections = ['ambulance_reports', 'fire_reports', 'police_reports', 'tanod_reports', 'flood_reports', 'other_reports'];
+        let isInitialLoad = true;
+        
+        // Wait a moment for initial page load before enabling notifications
+        setTimeout(() => { isInitialLoad = false; }, 3000);
+        
+        reportCollections.forEach(collName => {
+            try {
+                const q = query(
+                    collection(db, collName),
+                    orderBy('timestamp', 'desc'),
+                    limit(1)
+                );
+                
+                onSnapshot(q, (snapshot) => {
+                    snapshot.docChanges().forEach(change => {
+                        if (change.type === 'added' && !isInitialLoad) {
+                            const data = change.doc.data();
+                            const st = String(data?.status || '').toLowerCase();
+                            
+                            // Only notify for pending reports
+                            if (st && st !== 'pending') return;
+                            
+                            // Only notify if report is recent (last 5 minutes)
+                            const reportTime = data.timestamp?.seconds ? (data.timestamp.seconds * 1000) : Date.now();
+                            if (Date.now() - reportTime > 5 * 60 * 1000) return;
+                            
+                            console.log('[Firebase Realtime] 🆕 New report detected in:', collName);
+                            
+                            // Show notification
+                            if (typeof window.showNotificationWithSound === 'function') {
+                                window.showNotificationWithSound(`New ${collName.replace('_reports', '')} report received!`, 'info', 'siren');
+                            }
+                            
+                            // Refresh the activity feed with a small delay to ensure DOM is ready
+                            setTimeout(() => {
+                                console.log('[Firebase Realtime] 🔄 Refreshing activity feed...');
+                                if (typeof window.loadRecentPage === 'function') {
+                                    window.forceRecentFeedRefresh = true;
+                                    window.loadRecentPage(1);
+                                    console.log('[Firebase Realtime] ✅ Called loadRecentPage(1)');
+                                } else if (typeof window.refreshRecentActivity === 'function') {
+                                    window.forceRecentFeedRefresh = true;
+                                    window.refreshRecentActivity();
+                                    console.log('[Firebase Realtime] ✅ Called refreshRecentActivity()');
+                                } else {
+                                    console.warn('[Firebase Realtime] ⚠️ No refresh function available, reloading activityList...');
+                                    // Fallback: manually reload via AJAX
+                                    const list = document.getElementById('activityList');
+                                    if (list) {
+                                        const fd = new FormData();
+                                        fd.append('recent_feed', '1');
+                                        fd.append('page', '1');
+                                        fd.append('pageSize', '10');
+                                        fd.append('category', 'all');
+                                        fd.append('status', 'all');
+                                        fd.append('force_refresh', 'true');
+                                        fetch(window.location.href, { method: 'POST', body: fd })
+                                            .then(r => r.json())
+                                            .then(data => {
+                                                if (data.html) {
+                                                    list.innerHTML = data.html;
+                                                    console.log('[Firebase Realtime] ✅ Activity list refreshed via fallback');
+                                                }
+                                            })
+                                            .catch(e => console.error('[Firebase Realtime] Fallback refresh failed:', e));
+                                    }
+                                }
+                            }, 100);
+                        }
+                    });
+                }, (error) => {
+                    console.log(`[Firebase Realtime] Listener error for ${collName}:`, error.message);
+                });
+                
+                console.log('[Firebase Realtime] ✅ Listening to:', collName);
+            } catch (e) {
+                console.error(`[Firebase Realtime] Failed to setup listener for ${collName}:`, e);
+            }
+        });
+        
+        console.log('[Firebase Realtime] ✅ All report listeners initialized');
+        
+        // ============ WATCH EXISTING ITEMS FOR STATUS CHANGES ============
         const list = document.getElementById('activityList');
         if (list) {
             const attached = new Set();
@@ -11205,5 +12650,23 @@ const meta = categories[ds.slug] || {};
             }
         })();
     </script>
+    
+    <!-- Dashboard Core JS for realtime polling -->
+    <script src="assets/js/dashboard-core.js?v=<?php echo time(); ?>"></script>
+    <?php if (($_GET['view'] ?? 'dashboard') === 'map'): ?>
+    <script src="assets/js/map-dashboard.js?v=<?php echo filemtime(__DIR__ . '/assets/js/map-dashboard.js'); ?>"></script>
+    <?php endif; ?>
+    <?php if (($_GET['view'] ?? 'dashboard') === 'analytics'): ?>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="assets/js/analytics.js?v=<?php echo filemtime(__DIR__ . '/assets/js/analytics.js'); ?>"></script>
+    <?php endif; ?>
 </body>
 </html>
+
+<?php
+if (defined('DEBUG_MODE') && DEBUG_MODE) {
+    $ms = round((microtime(true) - ($__reqStart ?? microtime(true))) * 1000, 2);
+    $v = $_GET['view'] ?? 'dashboard';
+    error_log('[perf] dashboard.php end view=' . $v . ' ms=' . $ms . ' sid=' . session_id());
+}
+?>

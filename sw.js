@@ -1,7 +1,7 @@
 // ManResponde Service Worker
 // Progressive Web App - Offline Support
 
-const CACHE_NAME = 'manresponde-v1';
+const CACHE_NAME = 'manresponde-v11';
 const CACHE_URLS = [
     '/ManResponde/dashboard.php',
     '/ManResponde/responde.png',
@@ -44,23 +44,43 @@ self.addEventListener('activate', (event) => {
 
 // Fetch event - serve from cache when offline
 self.addEventListener('fetch', (event) => {
+    const req = event.request;
+    const url = new URL(req.url);
+
+    // Never cache non-GET requests (e.g. POST polling like recent_feed).
+    if (req.method !== 'GET') {
+        event.respondWith(fetch(req));
+        return;
+    }
+
+    // Avoid caching dynamic dashboard/API responses.
+    // (dashboard.php uses POST api_action for JSON; but keep GET navigations cacheable.)
+    const isSameOrigin = url.origin === self.location.origin;
+    const isDashboard = isSameOrigin && url.pathname.endsWith('/dashboard.php');
+    const hasQuery = url.search && url.search.length > 0;
+
+    // If it's dashboard.php with query params (views, etc), or any same-origin request with
+    // obvious API-like query markers, just do network-first without writing to cache.
+    const looksDynamic = (isDashboard && hasQuery) || url.searchParams.has('api_action') || url.searchParams.has('action');
+
+    if (looksDynamic) {
+        event.respondWith(
+            fetch(req).catch(() => caches.match(req))
+        );
+        return;
+    }
+
+    // Default: network-first for GET, cache on success, fallback to cache when offline.
     event.respondWith(
-        fetch(event.request)
+        fetch(req)
             .then((response) => {
-                // Clone the response
                 const responseClone = response.clone();
-                
-                // Cache the fetched response
                 caches.open(CACHE_NAME).then((cache) => {
-                    cache.put(event.request, responseClone);
+                    cache.put(req, responseClone);
                 });
-                
                 return response;
             })
-            .catch(() => {
-                // If fetch fails, try cache
-                return caches.match(event.request);
-            })
+            .catch(() => caches.match(req))
     );
 });
 

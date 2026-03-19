@@ -1,0 +1,12 @@
+# Runtime/cache artifacts
+cache/
+sessions/
+logs/*.log
+
+# Local Firebase service account keys (never commit)
+ibantayv2-firebase-adminsdk-*.json
+firebase-php-auth/config/*-firebase-adminsdk-*.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

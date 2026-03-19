@@ -97,7 +97,7 @@
             projectId: "ibantayv2"
         };
     </script>
-    <script src="assets/js/dashboard-core.js"></script>
+    <script src="assets/js/dashboard-core.js?v=<?php echo filemtime(__DIR__ . '/../assets/js/dashboard-core.js'); ?>"></script>
     
     <script>
     // Ensure theme preference is applied ASAP
@@ -332,12 +332,12 @@
                 staffEmpty.classList.add('hidden');
 
                 // Fetch staff data
-                const response = await fetch('api.php', {
+                const formData = new FormData();
+                formData.append('api_action', 'get_staff_data');
+
+                const response = await fetch(window.location.href, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: 'api_action=get_staff_data'
+                    body: formData
                 });
 
                 const result = await response.json();

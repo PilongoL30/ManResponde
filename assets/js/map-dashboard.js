@@ -40,24 +40,18 @@ document.addEventListener('DOMContentLoaded', function() {
         // Only show loading on first load if empty
         if(loading && allReports.length === 0) loading.classList.remove('hidden');
 
-        let fetchedReports = [];
-        const promises = Object.entries(categories).map(async ([slug, collection]) => {
-            try {
-                const response = await fetch(`api/reports_feed.php?collection=${collection}`);
-                const data = await response.json();
-                if (data.items) {
-                    return data.items.map(item => ({ ...item, category: slug }));
-                }
-                return [];
-            } catch (error) {
-                console.error(`Error fetching ${slug}:`, error);
-                return [];
-            }
-        });
-
         try {
-            const results = await Promise.all(promises);
-            fetchedReports = results.flat();
+            const response = await fetch('api/map_feed.php?limit=40', {
+                credentials: 'same-origin'
+            });
+            if (!response.ok) {
+                throw new Error(`Map feed request failed with status ${response.status}`);
+            }
+            const data = await response.json();
+            if (data && data.error) {
+                throw new Error(data.message || data.error);
+            }
+            const fetchedReports = Array.isArray(data.items) ? data.items : [];
             
             // Update global data
             allReports = fetchedReports;
@@ -66,6 +60,10 @@ document.addEventListener('DOMContentLoaded', function() {
             updateMarkers();
         } catch (err) {
             console.error('Error loading map data:', err);
+            const loadingLabel = document.querySelector('#mapLoading span');
+            if (loadingLabel) {
+                loadingLabel.textContent = 'Failed to load map data. Retrying...';
+            }
         } finally {
             if(loading) loading.classList.add('hidden');
         }
@@ -343,7 +341,7 @@ function openReportModal(reportId) {
     // Configure View Button (if we had a dedicated page, we'd link it here)
     // For now, we can just make it close the modal or link to dashboard with query param
     if (viewBtn) {
-        viewBtn.href = `dashboard?view=dashboard&highlight=${report.id}`;
+        viewBtn.href = `dashboard.php?view=dashboard&highlight=${report.id}`;
         viewBtn.onclick = function() {
             // Optional: Switch to dashboard view logic if needed
             // window.location.href = ...

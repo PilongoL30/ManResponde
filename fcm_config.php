@@ -44,17 +44,7 @@ define('FCM_NOTIFICATION_ICON', 'ic_ibantay_logo');
  */
 function get_fcm_access_token(): ?string {
     try {
-        if (!file_exists(FCM_SERVICE_ACCOUNT_PATH)) {
-            error_log("Service account file not found: " . FCM_SERVICE_ACCOUNT_PATH);
-            return null;
-        }
-        
-        $serviceAccount = json_decode(file_get_contents(FCM_SERVICE_ACCOUNT_PATH), true);
-        
-        if (!$serviceAccount) {
-            error_log("Invalid service account JSON file");
-            return null;
-        }
+        $serviceAccount = service_account_config();
         
         // Create JWT token
         $header = [
@@ -74,12 +64,17 @@ function get_fcm_access_token(): ?string {
         $payloadEncoded = base64url_encode(json_encode($payload));
         
         $signature = '';
-        openssl_sign(
+        $signed = openssl_sign(
             $headerEncoded . '.' . $payloadEncoded,
             $signature,
             $serviceAccount['private_key'],
             'SHA256'
         );
+
+        if (!$signed) {
+            error_log("Failed to sign JWT with configured Firebase private key");
+            return null;
+        }
         
         $signatureEncoded = base64url_encode($signature);
         $jwt = $headerEncoded . '.' . $payloadEncoded . '.' . $signatureEncoded;
@@ -271,8 +266,8 @@ function send_fcm_notification_to_user(string $uid, string $title, string $body,
     
     error_log("📱 FCM_TRACE: send_fcm_notification_to_user() called for UID: $uid, Title: $title");
     
-    // NUCLEAR BLOCKER: Block ANY notification with "Report Approved", "Approved", "✅" or similar
-    $blockedPhrases = ['Report Approved', 'report approved', 'REPORT APPROVED', 'Approved', 'approved', '✅', 'Report Status', 'report status'];
+    // NUCLEAR BLOCKER: Block ANY "Report Approved" style notification (but do not block declines)
+    $blockedPhrases = ['Report Approved', 'report approved', 'REPORT APPROVED'];
     foreach ($blockedPhrases as $phrase) {
         if (stripos($title, $phrase) !== false || stripos($body, $phrase) !== false) {
             error_log("🚨🚨🚨 NUCLEAR BLOCK: Notification containing '$phrase' COMPLETELY BLOCKED");
@@ -295,14 +290,16 @@ function send_fcm_notification_to_user(string $uid, string $title, string $body,
         }
     }
     
-    // Check if this is for a responder - block user-style notifications entirely
+    // Check if this is for a responder - historically blocked user-style report messages to avoid confusion.
+    // Allow declines so responder/staff/admin reporters can still be notified when their own report is declined.
     $userDocCheck = firestore_get_doc_by_id('users', $uid);
     if ($userDocCheck && ($userDocCheck['role'] ?? '') === 'responder') {
         $audience = $data['audience'] ?? 'user';
         $isUserStyle = ($audience === 'user');
         $looksLikeUserReport = stripos($title, 'report') !== false || strpos($title, '✅') !== false || strpos($title, '❌') !== false;
-        if ($isUserStyle || $looksLikeUserReport) {
-            error_log("🚫 FCM BLOCKED: User-style notification to responder $uid blocked (title='$title', audience='$audience'). Use send_emergency_fcm_notification() instead.");
+        $isDecline = (stripos($title, 'declined') !== false) || (($data['status'] ?? '') === 'declined');
+        if (($isUserStyle || $looksLikeUserReport) && !$isDecline) {
+            error_log("🚫 FCM BLOCKED: User-style notification to responder $uid blocked (title='$title', audience='$audience'). Use send_emergency_fcm_notification() for emergencies.");
             return true; // pretend success; do not send
         }
         
@@ -326,15 +323,19 @@ function send_fcm_notification_to_user(string $uid, string $title, string $body,
         
         $fcmToken = $userDoc['fcmToken'];
         
-        // EXTRA PROTECTION: If this token belongs to any responder, block user-style send
+        // EXTRA PROTECTION: avoid sending "Report Approved" to responder tokens (declines are allowed)
         $audience = $data['audience'] ?? 'user';
-        $looksLikeUserReport = stripos($title, 'report') !== false || strpos($title, '✅') !== false || strpos($title, '❌') !== false;
-        if ($audience === 'user' && $looksLikeUserReport && token_belongs_to_responder($fcmToken)) {
-            error_log("🚫 FCM BLOCKED: Token belongs to responder; blocking user-style notification to protect responders from 'Report Approved/Declined'.");
-            return true;
+        $isDecline = (stripos($title, 'declined') !== false) || (($data['status'] ?? '') === 'declined');
+        if (!$isDecline && $audience === 'user' && token_belongs_to_responder($fcmToken)) {
+            if (stripos($title, 'approved') !== false || stripos($body, 'approved') !== false || strpos($title, '✅') !== false) {
+                error_log("🚫 FCM BLOCKED: Token belongs to responder; blocking approval-style user notification.");
+                return true;
+            }
         }
         
         // Prepare notification payload with both notification and data sections for better client compatibility
+        // IMPORTANT: do not clobber caller-provided audience (admin/staff/reporters may reuse this).
+        $audienceFinal = $data['audience'] ?? 'user';
         $message = [
             'message' => [
                 'token' => $fcmToken,
@@ -345,7 +346,7 @@ function send_fcm_notification_to_user(string $uid, string $title, string $body,
                 'data' => array_merge($data, [
                     'title' => $title,
                     'body' => $body,
-                    'audience' => 'user',
+                    'audience' => $audienceFinal,
                     'click_action' => 'FLUTTER_NOTIFICATION_CLICK',
                     'timestamp' => (string)time()
                 ]),
@@ -606,12 +607,8 @@ function send_fcm_notification_to_user_for_rejected_report(string $collection, s
             error_log("FCM: No reporter ID found in report for rejected notification");
             return false;
         }
-        // Block if reporter is a responder (no user-style notifications to responders)
+        // Allow declines for all reporter roles (including responder/staff/admin) so the reporter is informed.
         $reporterDoc = firestore_get_doc_by_id('users', $reporterId);
-        if ($reporterDoc && ($reporterDoc['role'] ?? '') === 'responder') {
-            error_log("🚫 FCM BLOCKED: Reporter $reporterId is a responder - blocking user-style 'Report Declined' notification");
-            return true;
-        }
         // Map collection to emergency type (needed by client to render properly)
         $collectionMap = [
             'ambulance_reports' => 'ambulance',
@@ -645,7 +642,7 @@ function send_fcm_notification_to_user_for_rejected_report(string $collection, s
             'collection' => $collection,
             'status' => 'declined',
             'emergencyType' => $emergencyType,
-            'audience' => 'user',
+            'audience' => 'reporter',
             'declineReason' => $declineReason
         ];
         return send_fcm_notification_to_user($reporterId, $title, $body, $data);

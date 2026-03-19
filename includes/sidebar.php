@@ -17,7 +17,7 @@
                 <div class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4 px-4">Main Menu</div>
                 
                 <?php $active = ($view === 'dashboard' || empty($view)) ? 'active' : ''; ?>
-                <a href="dashboard?view=dashboard" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
+                <a href="dashboard.php?view=dashboard" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
                     <div class="absolute inset-0 bg-blue-50 opacity-0 group-hover:opacity-100 transition-opacity"></div>
                     <i class="fas fa-th-large w-6 text-center group-hover:scale-110 transition-transform relative z-10"></i>
                     <span class="font-medium relative z-10">Dashboard</span>
@@ -25,21 +25,21 @@
                 </a>
 
                 <?php $active = ($view === 'analytics') ? 'active' : ''; ?>
-                <a href="dashboard?view=analytics" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
+                <a href="dashboard.php?view=analytics" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
                     <div class="absolute inset-0 bg-blue-50 opacity-0 group-hover:opacity-100 transition-opacity"></div>
                     <i class="fas fa-chart-pie w-6 text-center group-hover:scale-110 transition-transform relative z-10"></i>
                     <span class="font-medium relative z-10">Analytics</span>
                 </a>
 
                 <?php $active = ($view === 'map') ? 'active' : ''; ?>
-                <a href="dashboard?view=map" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
+                <a href="dashboard.php?view=map" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
                     <div class="absolute inset-0 bg-blue-50 opacity-0 group-hover:opacity-100 transition-opacity"></div>
                     <i class="fas fa-map-marked-alt w-6 text-center group-hover:scale-110 transition-transform relative z-10"></i>
                     <span class="font-medium relative z-10">Interactive Map</span>
                 </a>
 
                 <?php $active = ($view === 'live-support') ? 'active' : ''; ?>
-                <a href="dashboard?view=live-support" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
+                <a href="dashboard.php?view=live-support" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
                     <div class="absolute inset-0 bg-blue-50 opacity-0 group-hover:opacity-100 transition-opacity"></div>
                     <i class="fas fa-headset w-6 text-center group-hover:scale-110 transition-transform relative z-10"></i>
                     <span class="font-medium relative z-10">Live Support</span>
@@ -48,7 +48,7 @@
 
                 <?php if ($isAdmin): ?>
                 <?php $active = ($view === 'create-account') ? 'active' : ''; ?>
-                <a href="dashboard?view=create-account" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
+                <a href="dashboard.php?view=create-account" class="nav-item <?php echo $active; ?> flex items-center gap-3 px-4 py-3.5 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all group relative overflow-hidden">
                     <div class="absolute inset-0 bg-blue-50 opacity-0 group-hover:opacity-100 transition-opacity"></div>
                     <i class="fas fa-user-plus w-6 text-center group-hover:scale-110 transition-transform relative z-10"></i>
                     <span class="font-medium relative z-10">Create Account</span>
