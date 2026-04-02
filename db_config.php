@@ -604,6 +604,24 @@ function get_admin_stats_counts_fast(array $collections): array {
                     ]
                 ]
             ],
+            'responding_url' => firestore_base_url() . ':runAggregationQuery',
+            'responding_body' => [
+                'structuredAggregationQuery' => [
+                    'structuredQuery' => [
+                        'from' => [['collectionId' => $collection]],
+                        'where' => [
+                            'fieldFilter' => [
+                                'field' => ['fieldPath' => 'status'],
+                                'op' => 'EQUAL',
+                                'value' => ['stringValue' => 'Responding']
+                            ]
+                        ]
+                    ],
+                    'aggregations' => [
+                        'responding_count' => ['count' => (object)[]]
+                    ]
+                ]
+            ],
             'responded_url' => firestore_base_url() . ':runAggregationQuery',
             'responded_body' => [
                 'structuredAggregationQuery' => [
@@ -722,6 +740,24 @@ function get_admin_stats_counts_fast(array $collections): array {
         curl_multi_add_handle($multiHandle, $ch5);
         $curlHandles[] = $ch5;
         $requestMap[] = ['collection' => $collection, 'type' => 'responded'];
+        
+        // Responding count request
+        $ch6 = curl_init();
+        curl_setopt_array($ch6, [
+            CURLOPT_URL => $request['responding_url'],
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode($request['responding_body']),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . firestore_rest_token()
+            ],
+            CURLOPT_TIMEOUT => 3,
+            CURLOPT_CONNECTTIMEOUT => 2
+        ]);
+        curl_multi_add_handle($multiHandle, $ch6);
+        $curlHandles[] = $ch6;
+        $requestMap[] = ['collection' => $collection, 'type' => 'responding'];
     }
     
     // Execute all requests in parallel
@@ -738,7 +774,7 @@ function get_admin_stats_counts_fast(array $collections): array {
         $type = $requestMap[$idx]['type'];
         
         if (!isset($results[$collection])) {
-            $results[$collection] = ['total' => 0, 'approved' => 0, 'pending' => 0, 'declined' => 0, 'responded' => 0];
+            $results[$collection] = ['total' => 0, 'approved' => 0, 'pending' => 0, 'declined' => 0, 'responding' => 0, 'responded' => 0];
         }
         
         try {
@@ -807,8 +843,9 @@ function get_admin_stats_counts_fallback(array $collections): array {
             $approved = 0;
             $pending = 0;
             $declined = 0;
+            $responding = 0;
             $responded = 0;
-            
+
             if (is_array($response)) {
                 foreach ($response as $row) {
                     if (isset($row['document']['fields']['status'])) {
@@ -816,28 +853,31 @@ function get_admin_stats_counts_fallback(array $collections): array {
                         $status = $row['document']['fields']['status']['stringValue'] ?? '';
                         // Case-insensitive check
                         $statusLower = strtolower($status);
-                        
+
                         if ($statusLower === 'approved') {
                             $approved++;
                         } elseif ($statusLower === 'pending') {
                             $pending++;
                         } elseif ($statusLower === 'declined') {
                             $declined++;
+                        } elseif ($statusLower === 'responding') {
+                            $responding++;
                         } elseif ($statusLower === 'responded') {
                             $responded++;
                         }
                     }
                 }
             }
-            
+
             $results[$collection] = [
                 'total' => $total,
                 'approved' => $approved,
                 'pending' => $pending,
                 'declined' => $declined,
+                'responding' => $responding,
                 'responded' => $responded,
             ];
-            
+
         } catch (Exception $e) {
             // Fallback to individual counts if the batch approach fails
             $results[$collection] = [
@@ -845,6 +885,7 @@ function get_admin_stats_counts_fallback(array $collections): array {
                 'approved' => firestore_count($collection, 'Approved'),
                 'pending' => firestore_count($collection, 'Pending'),
                 'declined' => firestore_count($collection, 'Declined'),
+                'responding' => firestore_count($collection, 'Responding'),
                 'responded' => firestore_count($collection, 'Responded'),
             ];
         }

@@ -832,6 +832,7 @@ function svg_icon(name, className = 'w-6 h-6') {
             setTimeout(async () => {
                 const formData = new FormData();
                 formData.append('api_action', 'load_staff_data');
+                    formData.append('force_refresh', 'true');
                 
                 try {
                     const response = await fetch(window.location.href, {
@@ -1015,7 +1016,7 @@ function svg_icon(name, className = 'w-6 h-6') {
     }
 
     // Staff Statistics and Management
-    if (window.location.search.includes('view=create-staff')) {
+    if (window.location.search.includes('view=create-account') || window.location.search.includes('view=create-staff')) {
         loadStaffData();
 
         // Auto-refresh staff data every 30 seconds
@@ -1091,9 +1092,15 @@ function svg_icon(name, className = 'w-6 h-6') {
 
         staffEmpty.classList.add('hidden');
 
-        // Generate staff list HTML
+        // Generate staff/responder list HTML
         const staffHtml = staff.map(staffMember => {
-            const isActive = staffMember.status === 'active';
+            const normalizedStatus = String(staffMember.status || '').toLowerCase();
+            const isActive = normalizedStatus === 'active' || normalizedStatus === 'approved';
+            const normalizedRole = String(staffMember.role || 'staff').toLowerCase();
+            const roleLabel = normalizedRole === 'responder' ? 'Responder' : 'Staff';
+            const roleBadgeClass = normalizedRole === 'responder'
+                ? 'bg-violet-100 text-violet-700'
+                : 'bg-sky-100 text-sky-700';
             const categoryCount = staffMember.categories ? staffMember.categories.length : 0;
 
             return `
@@ -1104,7 +1111,10 @@ function svg_icon(name, className = 'w-6 h-6') {
                                 ${staffMember.name ? staffMember.name.charAt(0).toUpperCase() : '?'}
                             </div>
                             <div>
-                                <h4 class="font-semibold text-slate-800">${staffMember.name || 'Unknown'}</h4>
+                                <div class="flex items-center gap-2">
+                                    <h4 class="font-semibold text-slate-800">${staffMember.name || 'Unknown'}</h4>
+                                    <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${roleBadgeClass}">${roleLabel}</span>
+                                </div>
                                 <p class="text-sm text-slate-600">${staffMember.email || 'No email'}</p>
                             </div>
                         </div>
@@ -1578,16 +1588,22 @@ function svg_icon(name, className = 'w-6 h-6') {
         }
         
         const actionsContainer = document.getElementById('m_actions');
-        const isFinal = st === 'approved' || st === 'declined';
+        const isFinal = st === 'approved' || st === 'declined' || st === 'responded';
         const isResponded = st === 'responded';
-        
+        const isResponding = st === 'responding';
+
         const approveBtnClass = isFinal ? 'btn-disabled' : 'btn-approve';
         const declineBtnClass = isFinal ? 'btn-disabled' : 'btn-decline';
+        const respondingBtnClass = (isFinal || isResponded || isResponding) ? 'btn-disabled' : 'btn-responded';
         const respondedBtnClass = (isFinal || isResponded) ? 'btn-disabled' : 'btn-responded';
         const disabledAttr = isFinal ? 'disabled' : '';
+        const respondingDisabledAttr = (isFinal || isResponded || isResponding) ? 'disabled' : '';
         const respondedDisabledAttr = (isFinal || isResponded) ? 'disabled' : '';
 
         actionsContainer.innerHTML = `
+            <button type="button" class="btn ${respondingBtnClass}" ${respondingDisabledAttr} title="Mark as Responding" onclick="updateReportStatus('${ds.collection}', '${ds.id}', 'Responding')">
+                ${svg_icon('clock', 'w-4 h-4')}<span>Responding</span>
+            </button>
             <button type="button" class="btn ${respondedBtnClass}" ${respondedDisabledAttr} title="Mark as Responded" onclick="updateReportStatus('${ds.collection}', '${ds.id}', 'Responded')">
                 ${svg_icon('truck', 'w-4 h-4')}<span>Responded</span>
             </button>

@@ -1733,35 +1733,44 @@ if (isset($_POST['api_action'])) {
         }
     }
 
-    // Admin: Get Staff Data
+    // Admin: Get Staff and Responder Data
     if ($isAdmin && $action === 'get_staff_data') {
         try {
-            // Get all users with role 'staff' using REST API
             $url = firestore_base_url() . ':runQuery';
-            $body = [
-                'structuredQuery' => [
-                    'from' => [['collectionId' => 'users']],
-                    'where' => [
-                        'fieldFilter' => [
-                            'field' => ['fieldPath' => 'role'],
-                            'op' => 'EQUAL',
-                            'value' => firestore_encode_value('staff')
+            $fetchUsersByRole = function(string $role) use ($url): array {
+                $body = [
+                    'structuredQuery' => [
+                        'from' => [['collectionId' => 'users']],
+                        'where' => [
+                            'fieldFilter' => [
+                                'field' => ['fieldPath' => 'role'],
+                                'op' => 'EQUAL',
+                                'value' => firestore_encode_value($role)
+                            ]
                         ]
                     ]
-                ]
-            ];
+                ];
 
-            $response = firestore_rest_request('POST', $url, $body);
-            $staffUsers = [];
+                $response = firestore_rest_request('POST', $url, $body);
+                $users = [];
 
-            if (isset($response[0]['document'])) {
-                foreach ($response as $doc) {
-                    if (isset($doc['document'])) {
-                        $userId = basename($doc['document']['name']);
-                        $userData = firestore_decode_fields($doc['document']['fields'] ?? []);
-                        $staffUsers[$userId] = $userData;
+                if (isset($response[0]['document'])) {
+                    foreach ($response as $doc) {
+                        if (!isset($doc['document'])) continue;
+                        $docName = $doc['document']['name'] ?? '';
+                        if ($docName === '') continue;
+                        $docId = basename($docName);
+                        $docData = firestore_decode_fields($doc['document']['fields'] ?? []);
+                        $users[$docId] = $docData;
                     }
                 }
+
+                return $users;
+            };
+
+            $accountUsers = $fetchUsersByRole('staff');
+            foreach ($fetchUsersByRole('responder') as $docId => $docData) {
+                $accountUsers[$docId] = $docData;
             }
 
             $totalStaff = 0;
@@ -1769,12 +1778,13 @@ if (isset($_POST['api_action'])) {
             $reportsAssigned = 0;
             $staffList = [];
 
-            if ($staffUsers) {
-                foreach ($staffUsers as $userId => $userData) {
+            if ($accountUsers) {
+                foreach ($accountUsers as $userId => $userData) {
                     $totalStaff++;
 
                     // Check if staff is active (not disabled/removed)
-                    if (isset($userData['status']) && $userData['status'] === 'approved') {
+                    $normalizedStatus = strtolower((string)($userData['status'] ?? ''));
+                    if ($normalizedStatus === 'approved' || $normalizedStatus === 'active') {
                         $activeStaff++;
                     }
 
@@ -1789,6 +1799,7 @@ if (isset($_POST['api_action'])) {
                         'name' => $userData['fullName'] ?? 'Unknown',
                         'email' => $userData['email'] ?? '',
                         'username' => $userData['username'] ?? '',
+                        'role' => strtolower((string)($userData['role'] ?? 'staff')),
                         'status' => $userData['status'] ?? 'inactive',
                         'categories' => $userData['categories'] ?? [],
                         'createdAt' => $userData['createdAt'] ?? null,
@@ -1796,6 +1807,10 @@ if (isset($_POST['api_action'])) {
                     ];
                 }
             }
+
+            usort($staffList, static function(array $left, array $right): int {
+                return strcasecmp((string)($left['name'] ?? ''), (string)($right['name'] ?? ''));
+            });
 
             $response = [
                 'success' => true,
@@ -2770,7 +2785,7 @@ if (isset($_POST['api_action'])) {
                 }
 
                 $bySlug = [];
-                $grand = ['total' => 0, 'pending' => 0, 'approved' => 0, 'declined' => 0, 'responded' => 0];
+                $grand = ['total' => 0, 'pending' => 0, 'approved' => 0, 'declined' => 0, 'responding' => 0, 'responded' => 0];
 
                 foreach ($allowedSlugs as $slug) {
                     $col = $categories[$slug]['collection'];
@@ -2779,6 +2794,7 @@ if (isset($_POST['api_action'])) {
                         'pending'   => (int)($countResults[$col]['pending'] ?? 0),
                         'approved'  => (int)($countResults[$col]['approved'] ?? 0),
                         'declined'  => (int)($countResults[$col]['declined'] ?? 0),
+                        'responding'=> (int)($countResults[$col]['responding'] ?? 0),
                         'responded' => (int)($countResults[$col]['responded'] ?? 0),
                     ];
                     $bySlug[$slug] = $row;
@@ -2786,6 +2802,7 @@ if (isset($_POST['api_action'])) {
                     $grand['pending'] += $row['pending'];
                     $grand['approved'] += $row['approved'];
                     $grand['declined'] += $row['declined'];
+                    $grand['responding'] += $row['responding'];
                     $grand['responded'] += $row['responded'];
                 }
 
@@ -2890,6 +2907,7 @@ if (isset($_POST['api_action'])) {
 
             $categoryLabels = [];
             $categoryData = [];
+            $respondingTotal = 0;
             $respondedTotal = 0;
             $totalReports = 0;
 
@@ -2897,8 +2915,10 @@ if (isset($_POST['api_action'])) {
                 $meta = $categories[$slug];
                 $col = $meta['collection'];
                 $total = (int)($countResults[$col]['total'] ?? 0);
+                $responding = (int)($countResults[$col]['responding'] ?? 0);
                 $responded = (int)($countResults[$col]['responded'] ?? 0);
                 $totalReports += $total;
+                $respondingTotal += $responding;
                 $respondedTotal += $responded;
                 $categoryLabels[] = $meta['label'];
                 $categoryData[] = $total;
@@ -3147,6 +3167,7 @@ if (isset($_POST['api_action'])) {
     // Staff: Load assigned reports data (optimized for performance)
     if (!$isAdmin && $action === 'load_staff_data') {
         $startTime = microtime(true);
+        $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
         
         try {
             $profile  = get_user_profile($userId);
@@ -3155,7 +3176,11 @@ if (isset($_POST['api_action'])) {
             $cards = [];
             foreach ($assigned as $slug) {
                 if (!isset($categories[$slug])) continue;
-                $reports = list_latest_reports($categories[$slug]['collection'], 50);
+                $collection = $categories[$slug]['collection'];
+                if ($forceRefresh) {
+                    cache_delete("reports_{$collection}_50");
+                }
+                $reports = list_latest_reports($collection, 50, !$forceRefresh);
                 
                 // Sort reports by timestamp (newest first)
                 usort($reports, function($a, $b) {
@@ -3177,6 +3202,9 @@ if (isset($_POST['api_action'])) {
                     'profile' => $profile,
                     'assigned' => $assigned,
                     'cards' => $cards,
+                ],
+                'meta' => [
+                    'forceRefresh' => $forceRefresh,
                 ],
                 'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
             ]);
@@ -3759,7 +3787,8 @@ function render_report_table(array $list, string $collection, array $categories)
         $displayStatus = $it['status'] ?: 'Pending';
         $isApproved = ($st === 'approved');
         $isDeclined = ($st === 'declined');
-        $isFinal = $isApproved || $isDeclined;
+        $isResponded = ($st === 'responded');
+        $isFinal = $isApproved || $isDeclined || $isResponded;
         $tDisplay = fmt_ts($it['timestamp']);
         $imgUrl = $it['imageUrl'] ?? '';
         
@@ -6728,6 +6757,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                 setTimeout(async () => {
                     const formData = createFormDataWithCsrf();
                     formData.append('api_action', 'load_staff_data');
+                    formData.append('force_refresh', 'true');
                     
                     try {
                         const response = await fetch(window.location.href, {
@@ -6987,9 +7017,15 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
 
             staffEmpty.classList.add('hidden');
 
-            // Generate staff list HTML
+            // Generate staff/responder list HTML
             const staffHtml = staff.map(staffMember => {
-                const isActive = staffMember.status === 'active';
+                const normalizedStatus = String(staffMember.status || '').toLowerCase();
+                const isActive = normalizedStatus === 'active' || normalizedStatus === 'approved';
+                const normalizedRole = String(staffMember.role || 'staff').toLowerCase();
+                const roleLabel = normalizedRole === 'responder' ? 'Responder' : 'Staff';
+                const roleBadgeClass = normalizedRole === 'responder'
+                    ? 'bg-violet-100 text-violet-700'
+                    : 'bg-sky-100 text-sky-700';
                 const categoryCount = staffMember.categories ? staffMember.categories.length : 0;
 
                 return `
@@ -7000,7 +7036,10 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                                     ${staffMember.name ? staffMember.name.charAt(0).toUpperCase() : '?'}
                                 </div>
                                 <div>
-                                    <h4 class="font-semibold text-slate-800">${staffMember.name || 'Unknown'}</h4>
+                                    <div class="flex items-center gap-2">
+                                        <h4 class="font-semibold text-slate-800">${staffMember.name || 'Unknown'}</h4>
+                                        <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${roleBadgeClass}">${roleLabel}</span>
+                                    </div>
                                     <p class="text-sm text-slate-600">${staffMember.email || 'No email'}</p>
                                 </div>
                             </div>
@@ -7431,7 +7470,7 @@ const meta = categories[ds.slug] || {};
             }
             
             const actionsContainer = document.getElementById('m_actions');
-            const isFinal = st === 'approved' || st === 'declined';
+            const isFinal = st === 'approved' || st === 'declined' || st === 'responded';
             
             const approveBtnClass = isFinal ? 'btn-disabled' : 'btn-approve';
             const declineBtnClass = isFinal ? 'btn-disabled' : 'btn-decline';
@@ -7810,6 +7849,14 @@ const meta = categories[ds.slug] || {};
                                         borderColor: 'border-red-200',
                                         label: 'Declined'
                                     };
+                                case 'responding':
+                                    return {
+                                        bgColor: 'from-purple-500 to-fuchsia-600',
+                                        textColor: 'text-purple-700',
+                                        dotColor: 'bg-purple-500',
+                                        borderColor: 'border-purple-200',
+                                        label: 'Responding'
+                                    };
                                 case 'responded':
                                     return {
                                         bgColor: 'from-blue-500 to-cyan-600',
@@ -8156,25 +8203,27 @@ const meta = categories[ds.slug] || {};
 
         // KPI Helper Functions for Overview Section
         function getKpiAggregatesFromStats(stats) {
-            let totalPending = 0, totalApproved = 0, totalDeclined = 0, totalResponded = 0, grandTotal = 0;
-            
+            let totalPending = 0, totalApproved = 0, totalDeclined = 0, totalResponding = 0, totalResponded = 0, grandTotal = 0;
+
             Object.values(stats).forEach(stat => {
                 totalPending += parseInt(stat.pending || 0);
                 totalApproved += parseInt(stat.approved || 0);
                 totalDeclined += parseInt(stat.declined || 0);
+                totalResponding += parseInt(stat.responding || 0);
                 totalResponded += parseInt(stat.responded || 0);
                 grandTotal += parseInt(stat.total || 0);
             });
-            
+
             return {
                 pending: totalPending,
                 approved: totalApproved,
                 declined: totalDeclined,
+                responding: totalResponding,
                 responded: totalResponded,
                 total: grandTotal
             };
         }
-        
+
         function pushKpiHistory(aggregates) {
             try {
                 const history = JSON.parse(localStorage.getItem('kpiHistory') || '[]');
@@ -8238,6 +8287,7 @@ const meta = categories[ds.slug] || {};
                 const kpis = [
                     { key: 'pending', label: 'Pending', value: aggregates.pending, color: 'amber' },
                     { key: 'approved', label: 'Approved', value: aggregates.approved, color: 'emerald' },
+                    { key: 'responding', label: 'Responding', value: aggregates.responding, color: 'purple' },
                     { key: 'responded', label: 'Responded', value: aggregates.responded, color: 'cyan' },
                     { key: 'declined', label: 'Declined', value: aggregates.declined, color: 'rose' },
                     { key: 'total', label: 'Total', value: aggregates.total, color: 'slate' }
@@ -8332,19 +8382,19 @@ const meta = categories[ds.slug] || {};
                         
                         // Render stats cards
                         Object.entries(categories).forEach(([slug, meta]) => {
-                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0, responded: 0 };
+                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0, responding: 0, responded: 0 };
                             const total = Math.max(0, parseInt(stat.total) || 0);
                             const approved = Math.max(0, parseInt(stat.approved) || 0);
                             const pending = Math.max(0, parseInt(stat.pending) || 0);
                             const declined = Math.max(0, parseInt(stat.declined) || 0);
+                            const responding = Math.max(0, parseInt(stat.responding) || 0);
                             const responded = Math.max(0, parseInt(stat.responded) || 0);
-                            
+
                             const approvedPct = total > 0 ? Math.round((approved / total) * 100) : 0;
                             const pendingPct = total > 0 ? Math.round((pending / total) * 100) : 0;
                             const declinedPct = total > 0 ? Math.round((declined / total) * 100) : 0;
-                            const respondedPct = total > 0 ? Math.round((responded / total) * 100) : 0;
-                            
-                            const card = document.createElement('div');
+                            const respondingPct = total > 0 ? Math.round((responding / total) * 100) : 0;
+                            const respondedPct = total > 0 ? Math.round((responded / total) * 100) : 0;                            const card = document.createElement('div');
                             card.className = 'stat-card p-5';
                             card.innerHTML = `
                                 <div class="flex items-center gap-4 mb-4">
@@ -8386,6 +8436,7 @@ const meta = categories[ds.slug] || {};
                                     <div class="progress-track">
                                         <span class="progress-seg pending" data-w="${pendingPct}%"></span>
                                         <span class="progress-seg approved" data-w="${approvedPct}%"></span>
+                                        <span class="progress-seg responding" style="background-color: #9333ea;" data-w="${respondingPct}%"></span>
                                         <span class="progress-seg responded" style="background-color: #06b6d4;" data-w="${respondedPct}%"></span>
                                         <span class="progress-seg declined" data-w="${declinedPct}%"></span>
                                     </div>
@@ -8397,6 +8448,10 @@ const meta = categories[ds.slug] || {};
                                         <div class="flex items-center gap-1">
                                             <span class="inline-block w-2 h-2 rounded-full bg-emerald-500"></span>
                                             <span>${approvedPct}% Appr</span>
+                                        </div>
+                                        <div class="flex items-center gap-1">
+                                            <span class="inline-block w-2 h-2 rounded-full" style="background-color: #9333ea;"></span>
+                                            <span>${respondingPct}% Rdng</span>
                                         </div>
                                         <div class="flex items-center gap-1">
                                             <span class="inline-block w-2 h-2 rounded-full bg-cyan-500"></span>
@@ -8593,15 +8648,19 @@ const meta = categories[ds.slug] || {};
                         
                         // Render stats cards
                         Object.entries(categories).forEach(([slug, meta]) => {
-                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0 };
+                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0, responding: 0, responded: 0 };
                             const total = Math.max(0, parseInt(stat.total) || 0);
                             const approved = Math.max(0, parseInt(stat.approved) || 0);
                             const pending = Math.max(0, parseInt(stat.pending) || 0);
                             const declined = Math.max(0, parseInt(stat.declined) || 0);
-                            
+                            const responding = Math.max(0, parseInt(stat.responding) || 0);
+                            const responded = Math.max(0, parseInt(stat.responded) || 0);
+
                             const approvedPct = total > 0 ? Math.round((approved / total) * 100) : 0;
                             const pendingPct = total > 0 ? Math.round((pending / total) * 100) : 0;
                             const declinedPct = total > 0 ? Math.round((declined / total) * 100) : 0;
+                            const respondingPct = total > 0 ? Math.round((responding / total) * 100) : 0;
+                            const respondedPct = total > 0 ? Math.round((responded / total) * 100) : 0;
                             
                             const card = document.createElement('div');
                             card.className = 'stat-card p-5';
@@ -9531,6 +9590,7 @@ const meta = categories[ds.slug] || {};
                 // Load staff data
                 const formData = new FormData();
                 formData.append('api_action', 'load_staff_data');
+                formData.append('force_refresh', 'true');
                 
                 const response = await fetch(window.location.href, {
                     method: 'POST',
@@ -9613,6 +9673,7 @@ const meta = categories[ds.slug] || {};
                         // Reload full staff data
                         const fullDataForm = new FormData();
                         fullDataForm.append('api_action', 'load_staff_data');
+                        fullDataForm.append('force_refresh', 'true');
                         
                         const fullResponse = await fetch(window.location.href, {
                             method: 'POST',
@@ -9769,7 +9830,9 @@ const meta = categories[ds.slug] || {};
         window.refreshStaffReports = async function() {
                 try {
                     const formData = createFormDataWithCsrf();
-                    formData.append('api_action', 'load_staff_data');                const response = await fetch(window.location.href, {
+                    formData.append('api_action', 'load_staff_data');
+                    formData.append('force_refresh', 'true');
+                    const response = await fetch(window.location.href, {
                     method: 'POST',
                     body: formData
                 });
@@ -9803,6 +9866,7 @@ const meta = categories[ds.slug] || {};
                 // Force immediate refresh without checking last update time
                 const formData = new FormData();
                 formData.append('api_action', 'load_staff_data');
+                formData.append('force_refresh', 'true');
                 
                 const response = await fetch(window.location.href, {
                     method: 'POST',
@@ -9837,6 +9901,7 @@ const meta = categories[ds.slug] || {};
                 // Immediate refresh with minimal delay
                 const formData = new FormData();
                 formData.append('api_action', 'load_staff_data');
+                formData.append('force_refresh', 'true');
                 
                 const response = await fetch(window.location.href, {
                     method: 'POST',
@@ -9886,6 +9951,7 @@ const meta = categories[ds.slug] || {};
                 const pendingItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'pending');
                 const approvedItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'approved');
                 const declinedItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'declined');
+                const respondingItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'responding');
                 const respondedItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'responded');
                 // Emergency alerts section removed
                 let emergencySection = '';
@@ -9917,6 +9983,10 @@ const meta = categories[ds.slug] || {};
                             <button type="button" class="seg-btn" data-tab="declined" onclick="switchTab('${slug}', 'declined')">
                                 <span class="seg-label">Declined</span>
                                 <span class="tab-count">${declinedItems.length}</span>
+                            </button>
+                            <button type="button" class="seg-btn" data-tab="responding" onclick="switchTab('${slug}', 'responding')">
+                                <span class="seg-label">Responding</span>
+                                <span class="tab-count">${respondingItems.length}</span>
                             </button>
                             <button type="button" class="seg-btn" data-tab="responded" onclick="switchTab('${slug}', 'responded')">
                                 <span class="seg-label">Responded</span>
@@ -10459,7 +10529,8 @@ const meta = categories[ds.slug] || {};
                 const displayStatus = it.status || 'Pending';
                 const isApproved = (st === 'approved');
                 const isDeclined = (st === 'declined');
-                const isFinal = isApproved || isDeclined;
+                const isResponded = (st === 'responded');
+                const isFinal = isApproved || isDeclined || isResponded;
                 const tDisplay = it.tsDisplay || formatFirebaseTimestamp(it.timestamp);
                 const imgUrl = it.imageUrl || '';
                 
@@ -11954,6 +12025,39 @@ const meta = categories[ds.slug] || {};
                 }
             }
 
+            function normalizeChatCategory(value) {
+                const v = String(value || '').trim().toLowerCase();
+                if (!v) return '';
+                if (v.includes('ambulance')) return 'ambulance';
+                if (v.includes('fire')) return 'fire';
+                if (v.includes('tanod')) return 'tanod';
+                if (v.includes('barangay') || v.includes('brgy')) return 'barangay';
+                return v;
+            }
+
+            function getChatCategory(chat) {
+                return normalizeChatCategory(
+                    chat.chatCategory || chat.category || chat.relatedReportType || chat.reportType || chat.type || ''
+                );
+            }
+
+            const pendingCategorySelections = {};
+
+            window.setPendingChatCategory = function(chatId, category, buttonEl = null) {
+                if (!chatId) return;
+                pendingCategorySelections[chatId] = normalizeChatCategory(category);
+
+                const group = document.querySelector(`[data-chat-category-group="${chatId}"]`);
+                if (!group) return;
+
+                group.querySelectorAll('button[data-category]').forEach(btn => {
+                    const isActive = btn.dataset.category === pendingCategorySelections[chatId];
+                    btn.className = isActive
+                        ? 'px-3 py-1.5 rounded-full text-xs font-semibold border bg-sky-600 text-white border-sky-600 transition-all'
+                        : 'px-3 py-1.5 rounded-full text-xs font-semibold border bg-white text-slate-700 border-slate-300 hover:border-sky-400 hover:text-sky-700 transition-all';
+                });
+            };
+
             function renderChatItem(chat) {
                 const chatId = chat.id || chat._id || chat.userId || chat.user_id || chat.uid || '';
                 if (!chatId) {
@@ -11969,6 +12073,13 @@ const meta = categories[ds.slug] || {};
                 const time = chat.lastMessageTime ? new Date(chat.lastMessageTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '';
                 const isPending = !chat.status || chat.status === 'pending' || chat.status === 'waiting';
                 const isEnded = chat.status === 'ended';
+                const chatCategory = getChatCategory(chat);
+                const chatCategoryLabel = {
+                    ambulance: '🚑 Ambulance',
+                    fire: '🔥 Fire',
+                    tanod: '👮 Tanod',
+                    barangay: '🏘️ Barangay'
+                }[chatCategory] || '';
                 
                 const chatName = chat.userName || 'Unknown User';
                 const chatInitials = chatName.substring(0, 2).toUpperCase();
@@ -11979,9 +12090,9 @@ const meta = categories[ds.slug] || {};
 
                 div.innerHTML = `
                     <div class="flex items-center gap-3">
-                        <div class="w-10 h-10 rounded-full ${avatarClass} flex items-center justify-center font-bold text-sm relative">
+                        <div class="w-10 h-10 rounded-full ${avatarClass} flex items-center justify-center font-bold text-sm relative overflow-visible shadow-none ring-0">
                             ${chatInitials}
-                            ${isPending ? '<span class="absolute -top-1 -right-1 w-3 h-3 bg-amber-500 rounded-full border-2 border-white"></span>' : ''}
+                            ${isPending ? '<span class="absolute -top-1 -right-1 w-3 h-3 bg-amber-500 rounded-full border border-white"></span>' : ''}
                         </div>
                         <div class="flex-1 min-w-0">
                             <div class="flex justify-between items-start">
@@ -11989,6 +12100,7 @@ const meta = categories[ds.slug] || {};
                                 <span class="text-xs text-slate-400 whitespace-nowrap ml-2">${time}</span>
                             </div>
                             <p class="text-xs text-slate-500 truncate mt-0.5 ${isPending ? 'font-semibold text-slate-700' : ''}">${lastMessage}</p>
+                            ${chatCategoryLabel ? `<span class="inline-flex items-center px-2 py-0.5 mt-1 text-[10px] font-semibold rounded-full bg-sky-50 text-sky-700 border border-sky-200">${chatCategoryLabel}</span>` : ''}
                             ${chat.unreadCount > 0 ? `<span class="inline-flex items-center justify-center px-2 py-0.5 mt-1 text-xs font-bold leading-none text-white bg-red-500 rounded-full">${chat.unreadCount}</span>` : ''}
                         </div>
                     </div>
@@ -12039,6 +12151,36 @@ const meta = categories[ds.slug] || {};
                 const inputArea = document.getElementById('messageInputArea');
                 if (currentChatStatus === 'pending' || currentChatStatus === 'waiting') {
                     inputArea.classList.add('hidden');
+
+                    const detectedCategory = getChatCategory(chat);
+                    if (!pendingCategorySelections[resolvedChatId] && detectedCategory) {
+                        pendingCategorySelections[resolvedChatId] = detectedCategory;
+                    }
+
+                    const selectedCategory = pendingCategorySelections[resolvedChatId] || '';
+                    const categoryButtons = [
+                        { key: 'ambulance', label: '🚑 Ambulance' },
+                        { key: 'fire', label: '🔥 Fire' },
+                        { key: 'tanod', label: '👮 Tanod' },
+                        { key: 'barangay', label: '🏘️ Barangay' }
+                    ];
+
+                    const categoryChooser = `
+                        <div class="mb-4 w-full max-w-xs text-left">
+                            <p class="text-xs font-bold text-slate-600 mb-2 uppercase tracking-wide">Category Routing</p>
+                            <div class="flex flex-wrap gap-2" data-chat-category-group="${resolvedChatId}">
+                                ${categoryButtons.map(item => {
+                                    const isActive = selectedCategory === item.key;
+                                    const cls = isActive
+                                        ? 'px-3 py-1.5 rounded-full text-xs font-semibold border bg-sky-600 text-white border-sky-600 transition-all'
+                                        : 'px-3 py-1.5 rounded-full text-xs font-semibold border bg-white text-slate-700 border-slate-300 hover:border-sky-400 hover:text-sky-700 transition-all';
+                                    return `<button type="button" class="${cls}" data-category="${item.key}" onclick="setPendingChatCategory('${resolvedChatId}', '${item.key}', this)">${item.label}</button>`;
+                                }).join('')}
+                            </div>
+                            <p class="text-[11px] text-slate-500 mt-2">Choose a category before accepting to route this chat to the correct responders.</p>
+                        </div>
+                    `;
+
                     // Show Accept Button in messages area
                     messagesArea.innerHTML = `
                         <div class="h-full flex flex-col items-center justify-center p-6 text-center">
@@ -12054,6 +12196,7 @@ const meta = categories[ds.slug] || {};
                                 <p class="text-slate-600">Type: ${chat.relatedReportType || 'Report'}</p>
                                 <p class="text-slate-600 text-xs mt-1">ID: ${chat.relatedReportId}</p>
                             </div>` : ''}
+                            ${categoryChooser}
                             <button onclick="acceptChat('${resolvedChatId}', this)" class="bg-sky-600 hover:bg-sky-700 text-white px-6 py-3 rounded-xl font-bold shadow-lg shadow-sky-500/20 transition-all hover:scale-105 flex items-center gap-2">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
@@ -12171,6 +12314,10 @@ const meta = categories[ds.slug] || {};
                 try {
                     const formData = new FormData();
                     formData.append('chat_id', chatId);
+                    const selectedCategory = pendingCategorySelections[chatId] || '';
+                    if (selectedCategory) {
+                        formData.append('chat_category', selectedCategory);
+                    }
                     
                     if(btn) {
                         // Store original content to restore on error
@@ -12218,6 +12365,7 @@ const meta = categories[ds.slug] || {};
                             id: chatId, 
                             userName: chatName, 
                             status: 'active',
+                            chatCategory: selectedCategory,
                             lastMessageTime: new Date()
                         };
                         
@@ -12543,9 +12691,9 @@ const meta = categories[ds.slug] || {};
                                 </svg>
                             </div>
                             <div class="mt-3 text-center sm:ml-4 sm:mt-0 sm:text-left w-full">
-                                <h3 class="text-lg font-bold leading-6 text-slate-900" id="modal-title">End Chat Session</h3>
+                                <h3 class="text-lg font-bold leading-6 text-slate-900" id="modal-title">End Live Agent</h3>
                                 <div class="mt-2">
-                                    <p class="text-sm text-slate-500">Are you sure you want to end this chat session? This action cannot be undone and the user will be notified.</p>
+                                    <p class="text-sm text-slate-500">Do you want to end Live Agent? This will close the active chat and notify the user.</p>
                                 </div>
                             </div>
                         </div>

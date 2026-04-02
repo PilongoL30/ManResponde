@@ -21,8 +21,87 @@ if (!isset($_SESSION['user_id'])) {
 $action = $_GET['action'] ?? $_POST['action'] ?? ''; // Support POST action too
 $currentUserId = $_SESSION['user_id'];
 $userRole = $_SESSION['user_role'] ?? 'staff';
-$assignedBarangay = $_SESSION['assigned_barangay'] ?? ''; // Get assigned barangay
-$assignedBarangay = $_SESSION['assignedBarangay'] ?? '';
+$assignedBarangay = $_SESSION['assignedBarangay'] ?? ($_SESSION['assigned_barangay'] ?? '');
+$staffCategories = $_SESSION['user_categories'] ?? [];
+
+if (!is_array($staffCategories)) {
+    $staffCategories = array_filter(array_map('trim', explode(',', (string)$staffCategories)));
+}
+
+function normalize_chat_category($value) {
+    $v = strtolower(trim((string)$value));
+    if ($v === '') return '';
+    if (strpos($v, 'ambulance') !== false) return 'ambulance';
+    if (strpos($v, 'fire') !== false) return 'fire';
+    if (strpos($v, 'tanod') !== false) return 'tanod';
+    if (strpos($v, 'barangay') !== false || strpos($v, 'brgy') !== false) return 'barangay';
+    return $v;
+}
+
+function extract_chat_category(array $chat): string {
+    $candidates = [
+        $chat['chatCategory'] ?? '',
+        $chat['category'] ?? '',
+        $chat['relatedReportType'] ?? '',
+        $chat['reportType'] ?? '',
+        $chat['type'] ?? '',
+    ];
+    foreach ($candidates as $candidate) {
+        $normalized = normalize_chat_category($candidate);
+        if ($normalized !== '') return $normalized;
+    }
+    return '';
+}
+
+function category_requires_barangay(string $category): bool {
+    return in_array($category, ['tanod', 'barangay'], true);
+}
+
+function is_known_chat_category(string $category): bool {
+    return in_array($category, ['ambulance', 'fire', 'tanod', 'barangay'], true);
+}
+
+function staff_matches_chat_category(string $userRole, array $staffCategories, string $chatCategory): bool {
+    if ($userRole === 'admin') return true;
+    if ($chatCategory === '') return true;
+    if (!is_known_chat_category($chatCategory)) return true;
+
+    $normalizedStaff = [];
+    foreach ($staffCategories as $cat) {
+        $n = normalize_chat_category($cat);
+        if ($n !== '') $normalizedStaff[] = $n;
+    }
+
+    if (in_array($chatCategory, ['tanod', 'barangay'], true)) {
+        return in_array('tanod', $normalizedStaff, true) || in_array('barangay', $normalizedStaff, true);
+    }
+
+    return in_array($chatCategory, $normalizedStaff, true);
+}
+
+function staff_matches_chat_barangay(array $chat, string $assignedBarangay, string $chatCategory): bool {
+    if (!category_requires_barangay($chatCategory)) {
+        return true;
+    }
+
+    $assigned = strtolower(trim($assignedBarangay));
+    if ($assigned === '') return false;
+
+    $haystack = strtolower(trim(implode(' ', array_filter([
+        (string)($chat['location'] ?? ''),
+        (string)($chat['relatedReportLocation'] ?? ''),
+        (string)($chat['barangay'] ?? ''),
+        (string)($chat['userBarangay'] ?? ''),
+        (string)($chat['requesterBarangay'] ?? ''),
+        (string)($chat['assignedBarangay'] ?? ''),
+        (string)($chat['currentBarangay'] ?? ''),
+        (string)($chat['address'] ?? ''),
+    ]))));
+
+    if ($haystack === '') return false;
+
+    return strpos($haystack, $assigned) !== false;
+}
 
 // Helper to get user details
 function get_user_details_cached($uid) {
@@ -40,6 +119,17 @@ if ($userRole === 'staff' && empty($assignedBarangay)) {
     $staffProfile = get_user_details_cached($currentUserId);
     $assignedBarangay = $staffProfile['assignedBarangay'] ?? '';
     $_SESSION['assignedBarangay'] = $assignedBarangay;
+}
+
+// Fallback: If staff categories are missing in session, fetch from profile
+if ($userRole === 'staff' && empty($staffCategories)) {
+    $staffProfile = get_user_details_cached($currentUserId);
+    $profileCategories = $staffProfile['categories'] ?? [];
+    if (!is_array($profileCategories)) {
+        $profileCategories = array_filter(array_map('trim', explode(',', (string)$profileCategories)));
+    }
+    $staffCategories = $profileCategories;
+    $_SESSION['user_categories'] = $staffCategories;
 }
 
 try {
@@ -84,40 +174,27 @@ try {
                 $userBarangay = $userLocation; // Assume location string contains barangay
             }
 
-            // Filtering Logic
-            if ($userRole === 'staff' && !empty($assignedBarangay)) {
-                $hasAccess = false;
-                
-                // 1. Check User Location
-                // Allow if location matches OR if location is unknown (empty) so staff can triage
-                if (empty($userLocation) && empty($userBarangay)) {
-                    $hasAccess = true;
-                } elseif (stripos($userLocation, $assignedBarangay) !== false || stripos($userBarangay, $assignedBarangay) !== false) {
-                    $hasAccess = true;
+            // Strict filtering logic for staff privacy and category routing
+            if ($userRole === 'staff') {
+                $status = strtolower(trim((string)($chat['status'] ?? 'pending')));
+                $acceptedBy = (string)($chat['acceptedBy'] ?? '');
+                $isPending = in_array($status, ['pending', 'waiting'], true);
+                $isOwnedByCurrentStaff = ($acceptedBy !== '' && $acceptedBy === $currentUserId);
+                $chatCategory = extract_chat_category($chat);
+
+                // Privacy: active/ended chats must only be visible to the staff who accepted them.
+                if (!$isPending && !$isOwnedByCurrentStaff) {
+                    continue;
                 }
 
-                // Allow access if location is unknown and status is pending/waiting (so someone can accept it)
-                if (!$hasAccess && empty($userLocation) && empty($userBarangay) && 
-                    (!isset($chat['status']) || $chat['status'] === 'pending' || $chat['status'] === 'waiting')) {
-                    $hasAccess = true;
-                }
-                
-                // 2. Check Related Report Location (if not yet matched)
-                // OPTIMIZATION: Only check if we have the data in the chat document. 
-                // Do NOT fetch the report document here.
-                if (!$hasAccess && !empty($chat['relatedReportLocation'])) {
-                     if (stripos($chat['relatedReportLocation'], $assignedBarangay) !== false) {
-                        $hasAccess = true;
+                // For unaccepted chats, enforce category + barangay visibility rules.
+                if (!$isOwnedByCurrentStaff) {
+                    if (!staff_matches_chat_category($userRole, $staffCategories, $chatCategory)) {
+                        continue;
                     }
-                }
-
-                // 3. Always allow chats already accepted by this staff member
-                if (!$hasAccess && isset($chat['acceptedBy']) && $chat['acceptedBy'] === $currentUserId) {
-                    $hasAccess = true;
-                }
-
-                if (!$hasAccess) {
-                    continue; // Skip this chat if it doesn't match the staff's barangay
+                    if (!staff_matches_chat_barangay($chat, $assignedBarangay, $chatCategory)) {
+                        continue;
+                    }
                 }
             }
 
@@ -135,38 +212,32 @@ try {
         $chatId = $_GET['chat_id'] ?? '';
         if (!$chatId) throw new Exception('Missing chat ID');
 
-        if ($userRole === 'staff' && !empty($assignedBarangay)) {
-             $hasAccess = false;
-             
-             // Optimization: Fetch chat document ONCE to check access
-             $chatDoc = firestore_get_doc_by_id('support_chats', $chatId);
-             
-             if ($chatDoc) {
-                 // 1. Check if accepted by this user (Fastest check)
-                 if (isset($chatDoc['acceptedBy']) && $chatDoc['acceptedBy'] === $currentUserId) {
-                     $hasAccess = true;
-                 }
-                 
-                 // 2. Check User Location in Chat Doc
-                 if (!$hasAccess) {
-                     $userLocation = $chatDoc['location'] ?? '';
-                     if (empty($userLocation) || stripos($userLocation, $assignedBarangay) !== false) {
-                         $hasAccess = true;
-                     }
-                 }
+        $chatDoc = firestore_get_doc_by_id('support_chats', $chatId);
+        if (!$chatDoc) {
+            echo json_encode(['error' => 'Chat not found']);
+            exit;
+        }
 
-                 // 3. Check Related Report Location (Only if needed)
-                 if (!$hasAccess && !empty($chatDoc['relatedReportLocation'])) {
-                     if (stripos($chatDoc['relatedReportLocation'], $assignedBarangay) !== false) {
-                         $hasAccess = true;
-                     }
-                 }
-             }
+        if ($userRole === 'staff') {
+            $status = strtolower(trim((string)($chatDoc['status'] ?? 'pending')));
+            $acceptedBy = (string)($chatDoc['acceptedBy'] ?? '');
+            $isPending = in_array($status, ['pending', 'waiting'], true);
+            $isOwnedByCurrentStaff = ($acceptedBy !== '' && $acceptedBy === $currentUserId);
+            $chatCategory = extract_chat_category($chatDoc);
 
-             if (!$hasAccess) {
-                 echo json_encode(['error' => 'Access Denied: Outside jurisdiction']);
-                 exit;
-             }
+            if (!$isOwnedByCurrentStaff) {
+                // Do not allow opening another staff member's active/ended chat.
+                if (!$isPending) {
+                    echo json_encode(['error' => 'Access Denied: This chat is handled by another staff member']);
+                    exit;
+                }
+
+                if (!staff_matches_chat_category($userRole, $staffCategories, $chatCategory) ||
+                    !staff_matches_chat_barangay($chatDoc, $assignedBarangay, $chatCategory)) {
+                    echo json_encode(['error' => 'Access Denied: Outside assigned category/jurisdiction']);
+                    exit;
+                }
+            }
         }
 
         // Fetch messages subcollection
@@ -211,6 +282,15 @@ try {
             throw new Exception('Missing parameters');
         }
 
+        // Staff can only send messages to chats they accepted.
+        if ($userRole === 'staff') {
+            $chatDoc = firestore_get_doc_by_id('support_chats', $chatId);
+            $acceptedBy = (string)($chatDoc['acceptedBy'] ?? '');
+            if ($acceptedBy === '' || $acceptedBy !== $currentUserId) {
+                throw new Exception('Access denied: You can only message chats you accepted.');
+            }
+        }
+
         // 1. Add message to subcollection
         $msgData = [
             'sender' => 'admin', // Or 'staff', maybe use actual name or ID
@@ -245,6 +325,7 @@ try {
 
     } elseif ($action === 'accept_chat') {
         $chatId = $_POST['chat_id'] ?? '';
+        $selectedCategory = normalize_chat_category($_POST['chat_category'] ?? '');
         if (!$chatId) {
             throw new Exception('Chat ID required');
         }
@@ -254,6 +335,25 @@ try {
 
         // 1. Fetch current chat document to preserve existing data
         $currentChat = firestore_get_doc_by_id('support_chats', $chatId);
+        if (!$currentChat) {
+            throw new Exception('Chat not found');
+        }
+
+        // Prevent accepting a chat already accepted by another staff member.
+        $alreadyAcceptedBy = (string)($currentChat['acceptedBy'] ?? '');
+        $currentStatus = strtolower(trim((string)($currentChat['status'] ?? 'pending')));
+        if ($alreadyAcceptedBy !== '' && $alreadyAcceptedBy !== $currentUserId && in_array($currentStatus, ['active', 'ended'], true)) {
+            throw new Exception('This chat is already assigned to another staff member.');
+        }
+
+        if ($userRole === 'staff') {
+            $chatCategory = $selectedCategory !== '' ? $selectedCategory : extract_chat_category($currentChat);
+            if (!staff_matches_chat_category($userRole, $staffCategories, $chatCategory) ||
+                !staff_matches_chat_barangay($currentChat, $assignedBarangay, $chatCategory)) {
+                throw new Exception('Access denied: Chat is outside your assigned category or barangay.');
+            }
+        }
+
         $existingUserName = $currentChat['userName'] ?? '';
         $existingLocation = $currentChat['location'] ?? '';
 
@@ -298,6 +398,7 @@ try {
         }
 
         $finalLocation = !empty($userLocation) ? $userLocation : $existingLocation;
+        $finalCategory = $selectedCategory !== '' ? $selectedCategory : extract_chat_category($currentChat);
 
         // Update chat status to active AND backfill user info
         $updateData = [
@@ -308,6 +409,13 @@ try {
             'userName' => $finalUserName,
             'location' => $finalLocation
         ];
+
+        if ($finalCategory !== '') {
+            $updateData['chatCategory'] = $finalCategory;
+            if (empty($currentChat['relatedReportType'])) {
+                $updateData['relatedReportType'] = ucfirst($finalCategory);
+            }
+        }
         
         $updateSuccess = false;
 
@@ -360,6 +468,14 @@ try {
         $chatId = $_POST['chat_id'] ?? '';
         if (!$chatId) {
             throw new Exception('Chat ID required');
+        }
+
+        if ($userRole === 'staff') {
+            $chatDoc = firestore_get_doc_by_id('support_chats', $chatId);
+            $acceptedBy = (string)($chatDoc['acceptedBy'] ?? '');
+            if ($acceptedBy === '' || $acceptedBy !== $currentUserId) {
+                throw new Exception('Access denied: You can only end chats you accepted.');
+            }
         }
 
         error_log("Ending chat $chatId by $currentUserId");

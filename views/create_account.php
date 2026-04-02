@@ -61,15 +61,15 @@
     </div>
 
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div class="glass-card p-4"><p class="text-xs text-slate-500">Total Staff</p><p id="totalStaffCount" class="text-2xl font-bold text-slate-800">0</p></div>
-        <div class="glass-card p-4"><p class="text-xs text-slate-500">Active Staff</p><p id="activeStaffCount" class="text-2xl font-bold text-emerald-600">0</p></div>
-        <div class="glass-card p-4"><p class="text-xs text-slate-500">Reports Assigned</p><p id="reportsAssignedCount" class="text-2xl font-bold text-cyan-600">0</p></div>
+        <div class="glass-card p-4"><p class="text-xs text-slate-500">Total Accounts</p><p id="totalStaffCount" class="text-2xl font-bold text-slate-800">0</p></div>
+        <div class="glass-card p-4"><p class="text-xs text-slate-500">Active Accounts</p><p id="activeStaffCount" class="text-2xl font-bold text-emerald-600">0</p></div>
+        <div class="glass-card p-4"><p class="text-xs text-slate-500">Category Assignments</p><p id="reportsAssignedCount" class="text-2xl font-bold text-cyan-600">0</p></div>
     </div>
 
     <div class="glass-card p-4 md:p-6">
-        <h4 class="text-lg font-semibold text-slate-800 mb-3">Staff List</h4>
-        <div id="staffLoading" class="text-sm text-slate-500">Loading staff data...</div>
-        <div id="staffEmpty" class="hidden text-sm text-slate-500">No staff records found.</div>
+        <h4 class="text-lg font-semibold text-slate-800 mb-3">Staff &amp; Responder List</h4>
+        <div id="staffLoading" class="text-sm text-slate-500">Loading account data...</div>
+        <div id="staffEmpty" class="hidden text-sm text-slate-500">No staff or responder records found.</div>
         <div id="staffList" class="space-y-3"></div>
     </div>
 </section>

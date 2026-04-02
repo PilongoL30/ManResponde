@@ -37,6 +37,7 @@
                 <option value="all">All Status</option>
                 <option value="Pending">Pending</option>
                 <option value="Approved">Approved</option>
+                <option value="Responding">Responding</option>
                 <option value="Responded">Responded</option>
                 <option value="Declined">Declined</option>
             </select>
