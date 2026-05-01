@@ -97,7 +97,7 @@
             projectId: "ibantayv2"
         };
     </script>
-    <script src="assets/js/dashboard-core.js?v=<?php echo filemtime(__DIR__ . '/../assets/js/dashboard-core.js'); ?>"></script>
+    <script src="assets/js/dashboard-core.js?v=<?php echo filemtime(__DIR__ . '/../assets/js/dashboard-core.js'); ?>" defer></script>
     
     <script>
     // Ensure theme preference is applied ASAP
@@ -1704,26 +1704,15 @@ const meta = categories[ds.slug] || {};
                 // Show loading state only on initial load
                 if (isInitial && statsContainer) {
                     statsContainer.innerHTML = `
-                        <div class="col-span-full text-center py-6 text-slate-500">
-                            <div class="inline-flex items-center gap-2">
-                                ${svg_icon('spinner', 'w-4 h-4 animate-spin')}
-                                <span class="text-sm">Loading statistics...</span>
-                            </div>
+                        <div class="col-span-full grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 animate-pulse">
+                            <div class="h-40 rounded-2xl bg-slate-100"></div>
+                            <div class="h-40 rounded-2xl bg-slate-100"></div>
+                            <div class="h-40 rounded-2xl bg-slate-100"></div>
                         </div>
                     `;
                 }
                 
                 // Prepare requests
-                const requests = [];
-                
-                if (statsContainer) {
-                    const statsFormData = new FormData();
-                    statsFormData.append('api_action', 'load_admin_stats');
-                    requests.push(fetch(window.location.href, { method: 'POST', body: statsFormData }));
-                } else {
-                    requests.push(Promise.resolve(null));
-                }
-                
                 const recentFormData = new FormData();
                 recentFormData.append('api_action', 'recent_feed');
                 recentFormData.append('page', '1');
@@ -1731,13 +1720,21 @@ const meta = categories[ds.slug] || {};
                 recentFormData.append('search', '');
                 recentFormData.append('category', 'all');
                 recentFormData.append('status', 'all');
-                requests.push(fetch(window.location.href, { method: 'POST', body: recentFormData }));
-                
-                // Execute requests
-                const [statsResponse, recentResponse] = await Promise.all(requests);
-                
-                // Process stats
+                const statsRequest = statsContainer
+                    ? fetch(window.location.href, {
+                        method: 'POST',
+                        body: (() => {
+                            const statsFormData = new FormData();
+                            statsFormData.append('api_action', 'load_admin_stats');
+                            return statsFormData;
+                        })()
+                    })
+                    : Promise.resolve(null);
+                const recentRequest = fetch(window.location.href, { method: 'POST', body: recentFormData });
+
+                // Process stats as soon as possible
                 let statsResult = { success: false };
+                const statsResponse = await statsRequest;
                 if (statsResponse) {
                     statsResult = await statsResponse.json();
                 }
@@ -1941,12 +1938,17 @@ const meta = categories[ds.slug] || {};
                     }
                 }
                 
-                // Process recent activity
-                const recentResult = await recentResponse.json();
-                if (recentResult.success && recentContainer) {
-                    if (typeof loadRecentPage === 'function') {
-                        displayRecentItems(recentResult.data);
+                // Process recent activity after statistics are visible
+                try {
+                    const recentResponse = await recentRequest;
+                    const recentResult = await recentResponse.json();
+                    if (recentResult.success && recentContainer) {
+                        if (typeof loadRecentPage === 'function') {
+                            displayRecentItems(recentResult.data);
+                        }
                     }
+                } catch (recentError) {
+                    console.error('Error loading recent activity:', recentError);
                 }
                 
             } catch (error) {

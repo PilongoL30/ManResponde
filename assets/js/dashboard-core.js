@@ -25,6 +25,9 @@ if (Notification && Notification.permission === 'default') {
 }
 
 const categories = (window.dashboardConfig && window.dashboardConfig.categories) || window.categories;
+const activeDashboardView = (window.dashboardConfig && window.dashboardConfig.view) || new URLSearchParams(window.location.search).get('view') || 'dashboard';
+const isDashboardView = activeDashboardView === 'dashboard';
+const isCreateAccountView = activeDashboardView === 'create-account' || activeDashboardView === 'create-staff';
 
 // Main Dashboard Module - wrapper removed, using direct execution
 // Helper function for SVG icons in JavaScript
@@ -333,7 +336,7 @@ function svg_icon(name, className = 'w-6 h-6') {
                 if (form.id === 'createStaffForm' || form.id === 'createResponderForm') {
                     form.reset();
                     // Refresh admin statistics if on dashboard view after creating user
-                    if (window.location.search.includes('view=dashboard') || !window.location.search.includes('view=')) {
+                    if (isDashboardView) {
                         refreshAdminStats();
                     }
                 }
@@ -786,7 +789,7 @@ function svg_icon(name, className = 'w-6 h-6') {
         }
         
         // Refresh admin statistics if on dashboard view
-        if (window.location.search.includes('view=dashboard') || !window.location.search.includes('view=')) {
+        if (isDashboardView) {
             refreshAdminStats();
         }
         
@@ -915,7 +918,7 @@ function svg_icon(name, className = 'w-6 h-6') {
                 }
                 
                 // Refresh admin statistics if on dashboard view
-                if (window.location.search.includes('view=dashboard') || !window.location.search.includes('view=')) {
+                if (isDashboardView) {
                     refreshAdminStats();
                 }
             } else {
@@ -964,8 +967,58 @@ function svg_icon(name, className = 'w-6 h-6') {
         // Handle Tanod and Police Barangay/Outpost Selection
         const tanodCheckbox = createAccountForm.querySelector('input[name="categories[]"][value="tanod"]');
         const policeCheckbox = createAccountForm.querySelector('input[name="categories[]"][value="police"]');
+        const categoryCheckboxes = Array.from(createAccountForm.querySelectorAll('input[name="categories[]"]'));
+        const responderCheckbox = createAccountForm.querySelector('input[name="accountTypes[]"][value="responder"]');
         const barangaySection = document.getElementById('barangaySelection');
         const barangaySelect = document.getElementById('assignedBarangay');
+        const vehicleSection = document.getElementById('vehicleSelection');
+        const plateNumberInput = document.getElementById('plateNumber');
+        const vehicleTypeSelect = document.getElementById('vehicleType');
+        const vehicleTypeOther = document.getElementById('vehicleTypeOther');
+
+        const vehicleOptionsByCategory = {
+            tanod: [
+                { value: 'L300', label: 'L300' },
+                { value: 'Garong', label: 'Garong' },
+                { value: 'Tricycle', label: 'Tricycle' },
+                { value: 'Motorcycle', label: 'Motorcycle' }
+            ],
+            barangay: [
+                { value: 'L300', label: 'L300' },
+                { value: 'Garong', label: 'Garong' },
+                { value: 'Tricycle', label: 'Tricycle' },
+                { value: 'Motorcycle', label: 'Motorcycle' }
+            ],
+            police: [
+                { value: 'Patrol Car', label: 'Patrol Car' },
+                { value: 'Patrol SUV', label: 'Patrol SUV' },
+                { value: 'Motorcycle', label: 'Motorcycle' },
+                { value: 'Van', label: 'Van' }
+            ],
+            fire: [
+                { value: 'Fire Truck', label: 'Fire Truck' },
+                { value: 'Water Tender', label: 'Water Tender' },
+                { value: 'Rescue Truck', label: 'Rescue Truck' }
+            ],
+            flood: [
+                { value: 'Rescue Boat', label: 'Rescue Boat' },
+                { value: 'L300', label: 'L300' },
+                { value: 'Rescue Truck', label: 'Rescue Truck' },
+                { value: 'Utility Vehicle', label: 'Utility Vehicle' }
+            ],
+            ambulance: [
+                { value: 'Van', label: 'Van' },
+                { value: 'L300', label: 'L300' },
+                { value: 'Ambulance', label: 'Ambulance' }
+            ]
+        };
+
+        const genericVehicleOptions = [
+            { value: 'L300', label: 'L300' },
+            { value: 'Van', label: 'Van' },
+            { value: 'SUV', label: 'SUV' },
+            { value: 'Motorcycle', label: 'Motorcycle' }
+        ];
 
         function toggleBarangaySelection() {
             const isTanod = tanodCheckbox && tanodCheckbox.checked;
@@ -981,6 +1034,119 @@ function svg_icon(name, className = 'w-6 h-6') {
             }
         }
 
+        function getSelectedCategories() {
+            return categoryCheckboxes
+                .filter((checkbox) => checkbox.checked)
+                .map((checkbox) => checkbox.value);
+        }
+
+        function buildVehicleTypeOptions() {
+            if (!vehicleTypeSelect) {
+                return;
+            }
+
+            const selectedCategories = getSelectedCategories();
+            const normalizedCategories = selectedCategories.length > 0 ? selectedCategories : ['generic'];
+            const seenValues = new Set();
+            const groups = [];
+
+            normalizedCategories.forEach((category) => {
+                const options = category === 'generic'
+                    ? genericVehicleOptions
+                    : (vehicleOptionsByCategory[category] || []);
+
+                if (!options.length) {
+                    return;
+                }
+
+                const filteredOptions = options.filter((option) => {
+                    if (seenValues.has(option.value)) {
+                        return false;
+                    }
+                    seenValues.add(option.value);
+                    return true;
+                });
+
+                if (filteredOptions.length) {
+                    groups.push({
+                        label: category === 'generic'
+                            ? 'Common vehicles'
+                            : category.charAt(0).toUpperCase() + category.slice(1),
+                        options: filteredOptions
+                    });
+                }
+            });
+
+            vehicleTypeSelect.innerHTML = '<option value="">Select vehicle type</option>';
+
+            groups.forEach((group) => {
+                const optGroup = document.createElement('optgroup');
+                optGroup.label = group.label;
+
+                group.options.forEach((option) => {
+                    const opt = document.createElement('option');
+                    opt.value = option.value;
+                    opt.textContent = option.label;
+                    optGroup.appendChild(opt);
+                });
+
+                vehicleTypeSelect.appendChild(optGroup);
+            });
+
+            const othersOption = document.createElement('option');
+            othersOption.value = 'Others';
+            othersOption.textContent = 'Others (type custom vehicle)';
+            vehicleTypeSelect.appendChild(othersOption);
+        }
+
+        function toggleVehicleSelection() {
+            const isResponder = responderCheckbox && responderCheckbox.checked;
+
+            if (vehicleSection) {
+                vehicleSection.classList.toggle('hidden', !isResponder);
+            }
+
+            if (plateNumberInput) {
+                plateNumberInput.required = isResponder;
+                if (!isResponder) {
+                    plateNumberInput.value = '';
+                }
+            }
+
+            if (vehicleTypeSelect) {
+                vehicleTypeSelect.required = isResponder;
+                if (!isResponder) {
+                    vehicleTypeSelect.value = '';
+                }
+            }
+
+            if (vehicleTypeOther) {
+                vehicleTypeOther.required = false;
+                vehicleTypeOther.classList.add('hidden');
+                if (!isResponder) {
+                    vehicleTypeOther.value = '';
+                }
+            }
+
+            if (isResponder) {
+                buildVehicleTypeOptions();
+            }
+        }
+
+        function toggleOtherVehicleInput() {
+            if (!vehicleTypeSelect || !vehicleTypeOther) {
+                return;
+            }
+
+            const showOther = vehicleTypeSelect.value === 'Others';
+            vehicleTypeOther.classList.toggle('hidden', !showOther);
+            vehicleTypeOther.required = showOther && !!(responderCheckbox && responderCheckbox.checked);
+
+            if (!showOther) {
+                vehicleTypeOther.value = '';
+            }
+        }
+
         if (barangaySection && barangaySelect) {
             if (tanodCheckbox) {
                 tanodCheckbox.addEventListener('change', toggleBarangaySelection);
@@ -989,6 +1155,28 @@ function svg_icon(name, className = 'w-6 h-6') {
                 policeCheckbox.addEventListener('change', toggleBarangaySelection);
             }
         }
+
+        if (vehicleSection) {
+            if (responderCheckbox) {
+                responderCheckbox.addEventListener('change', toggleVehicleSelection);
+            }
+            categoryCheckboxes.forEach((checkbox) => {
+                checkbox.addEventListener('change', () => {
+                    if (responderCheckbox && responderCheckbox.checked) {
+                        buildVehicleTypeOptions();
+                        toggleOtherVehicleInput();
+                    }
+                });
+            });
+
+            if (vehicleTypeSelect) {
+                vehicleTypeSelect.addEventListener('change', toggleOtherVehicleInput);
+            }
+        }
+
+        toggleBarangaySelection();
+        toggleVehicleSelection();
+        toggleOtherVehicleInput();
 
         createAccountForm.addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -1016,7 +1204,7 @@ function svg_icon(name, className = 'w-6 h-6') {
     }
 
     // Staff Statistics and Management
-    if (window.location.search.includes('view=create-account') || window.location.search.includes('view=create-staff')) {
+    if (isCreateAccountView) {
         loadStaffData();
 
         // Auto-refresh staff data every 30 seconds
@@ -1474,22 +1662,24 @@ function svg_icon(name, className = 'w-6 h-6') {
         `;
 
         const statusEl = document.getElementById('m_status');
-        const st = (ds.status || 'Pending').toLowerCase();
-        statusEl.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${ds.status || 'Pending'}`;
+        const stRaw = String(ds.status || 'Pending').trim().toLowerCase();
+        const st = stRaw === 'faile' ? 'failed' : stRaw;
+        const statusLabel = st === 'failed' ? 'Failed' : (ds.status || 'Pending');
+        statusEl.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${statusLabel}`;
         statusEl.className = 'status-badge ml-2';
         if (st === 'approved') statusEl.classList.add('status-badge-success');
-        else if (st === 'declined') statusEl.classList.add('status-badge-declined');
+        else if (st === 'declined' || st === 'failed') statusEl.classList.add('status-badge-declined');
         else statusEl.classList.add('status-badge-pending');
 
         // Show Approved/Declined By info
         const approvedByContainer = document.getElementById('m_approved_by_container');
         if (approvedByContainer) {
-             if ((st === 'approved' || st === 'declined') && ds.updatedby) {
+             if ((st === 'approved' || st === 'declined' || st === 'failed') && ds.updatedby) {
                 approvedByContainer.innerHTML = `
                     <div class="inline-block text-left bg-white/50 backdrop-blur-sm rounded-xl p-3 border border-gray-200/50 shadow-sm">
                         <div class="text-sm text-gray-600 flex items-center gap-2 justify-center">
                             ${svg_icon('user-check', 'w-4 h-4 text-gray-400')}
-                            <span>${st === 'approved' ? 'Approved' : 'Declined'} by <span class="font-bold text-gray-800">${ds.updatedby}</span></span>
+                            <span>${st === 'approved' ? 'Approved' : (st === 'failed' ? 'Failed' : 'Declined')} by <span class="font-bold text-gray-800">${ds.updatedby}</span></span>
                         </div>
                         <div class="text-xs text-gray-500 mt-1 flex items-center gap-2 justify-center">
                             ${svg_icon('info', 'w-3 h-3 text-gray-400')}
@@ -1950,7 +2140,8 @@ function svg_icon(name, className = 'w-6 h-6') {
                 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
                 
                 const html = data.length > 0 ? data.map((row, index) => {
-                    const st = String(row.status || 'Pending').toLowerCase();
+                    const stRaw = String(row.status || 'Pending').trim().toLowerCase();
+                    const st = stRaw === 'faile' ? 'failed' : stRaw;
                     const getStatusConfig = (status) => {
                         switch(status) {
                             case 'approved':
@@ -1968,6 +2159,14 @@ function svg_icon(name, className = 'w-6 h-6') {
                                     dotColor: 'bg-red-500',
                                     borderColor: 'border-red-200',
                                     label: 'Declined'
+                                };
+                            case 'failed':
+                                return {
+                                    bgColor: 'from-red-500 to-rose-600',
+                                    textColor: 'text-red-700',
+                                    dotColor: 'bg-red-500',
+                                    borderColor: 'border-red-200',
+                                    label: 'Failed'
                                 };
                             case 'responded':
                                 return {
@@ -2035,9 +2234,9 @@ function svg_icon(name, className = 'w-6 h-6') {
                                         ${statusConfig.label}
                                     </span>
                                     
-                                    ${(st === 'approved' || st === 'declined') && row.updatedBy ? `
+                                    ${(st === 'approved' || st === 'declined' || st === 'failed') && row.updatedBy ? `
                                     <div class="text-xs text-gray-500 text-right">
-                                        <div>${st === 'approved' ? 'Approved' : 'Declined'} by <span class="font-medium text-gray-700">${esc(row.updatedBy)}</span></div>
+                                        <div>${st === 'approved' ? 'Approved' : (st === 'failed' ? 'Failed' : 'Declined')} by <span class="font-medium text-gray-700">${esc(row.updatedBy)}</span></div>
                                         <div>${window.formatFirebaseTimestamp ? window.formatFirebaseTimestamp(row.updatedAt) : row.updatedAt}</div>
                                     </div>
                                     ` : `

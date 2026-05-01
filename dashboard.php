@@ -1913,6 +1913,9 @@ if (isset($_POST['api_action'])) {
         $accountTypes = $_POST['accountTypes'] ?? [];
         $categories = $_POST['categories'] ?? [];
         $assignedBarangay = $_POST['assignedBarangay'] ?? null;
+        $plateNumber = trim($_POST['plateNumber'] ?? '');
+        $vehicleType = trim($_POST['vehicleType'] ?? '');
+        $vehicleTypeOther = trim($_POST['vehicleTypeOther'] ?? '');
         
         // Construct full name in "Last, First Middle" format
         $fullName = $lastName;
@@ -1929,6 +1932,10 @@ if (isset($_POST['api_action'])) {
             $response['message'] = 'Account creation failed. Please select at least one account type (Staff or Responder).';
         } elseif ((in_array('tanod', $categories) || in_array('police', $categories)) && empty($assignedBarangay)) {
             $response['message'] = 'Account creation failed. Assigned Barangay/Outpost is required for Tanod and Police categories.';
+        } elseif (in_array('responder', $accountTypes) && (empty($plateNumber) || empty($vehicleType))) {
+            $response['message'] = 'Account creation failed. Plate number and vehicle type are required for responder accounts.';
+        } elseif (in_array('responder', $accountTypes) && $vehicleType === 'Others' && empty($vehicleTypeOther)) {
+            $response['message'] = 'Account creation failed. Please type the custom vehicle type when Others is selected.';
         } else {
             try {
                 // Initialize Firebase Auth
@@ -1949,6 +1956,8 @@ if (isset($_POST['api_action'])) {
                 $primaryRole = in_array('staff', $accountTypes) ? 'staff' : 'responder';
                 
                 // Create user document in Firestore with multi-role support
+                $resolvedVehicleType = ($vehicleType === 'Others') ? $vehicleTypeOther : $vehicleType;
+
                 $userData = [
                     'uid' => $uid,
                     'fullName' => $fullName,
@@ -1962,6 +1971,10 @@ if (isset($_POST['api_action'])) {
                     'status' => 'approved',
                     'categories' => $categories,
                     'assignedBarangay' => $assignedBarangay,
+                    'plateNumber' => in_array('responder', $accountTypes) ? $plateNumber : null,
+                    'vehicleType' => in_array('responder', $accountTypes) ? $resolvedVehicleType : null,
+                    'vehicleTypeChoice' => in_array('responder', $accountTypes) ? $vehicleType : null,
+                    'vehicleTypeOther' => in_array('responder', $accountTypes) && $vehicleType === 'Others' ? $vehicleTypeOther : null,
                     'createdAt' => date('Y-m-d H:i:s'),
                     'createdBy' => $userId,
                     'lastLogin' => null
@@ -2670,7 +2683,7 @@ if (isset($_POST['api_action'])) {
         try {
             // Check cache first with aggressive caching for admin dashboard
             $cacheKey = 'admin_stats_' . $userRole;
-            $adminStats = cache_get($cacheKey, 60); // 60-second cache for better performance
+            $adminStats = cache_get($cacheKey, 20); // Short cache for fast UX with near-realtime feel
             
             // Check if we need to force refresh (cache busting)
             $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
@@ -2692,8 +2705,10 @@ if (isset($_POST['api_action'])) {
                     throw new Exception("No collections found");
                 }
                 
-                // Get optimized counts for all collections (using fallback to working method)
-                $countResults = get_admin_stats_counts_fallback($collections);
+                // Get optimized counts for all collections (prefer fast path when available)
+                $countResults = function_exists('get_admin_stats_counts_fast')
+                    ? get_admin_stats_counts_fast($collections)
+                    : get_admin_stats_counts_fallback($collections);
                 
                 // Map results back to category slugs
                 foreach ($categories as $slug => $meta) {
@@ -2707,8 +2722,8 @@ if (isset($_POST['api_action'])) {
                     ];
                 }
                 
-                // Cache the results for 60 seconds
-                cache_set($cacheKey, $adminStats, 60);
+                // Cache the results briefly for fast page loads and navigation
+                cache_set($cacheKey, $adminStats, 20);
             }
             
             echo json_encode([
@@ -3783,10 +3798,11 @@ function render_report_table(array $list, string $collection, array $categories)
             <th class="p-4 text-right font-semibold text-slate-500 uppercase tracking-wider">Actions</th>
             </tr></thead><tbody class="divide-y divide-slate-200/50">';
     foreach ($list as $i => $it) {
-        $st = strtolower((string)($it['status'] ?? ''));
-        $displayStatus = $it['status'] ?: 'Pending';
+        $stRaw = strtolower((string)($it['status'] ?? ''));
+        $st = ($stRaw === 'faile') ? 'failed' : $stRaw;
+        $displayStatus = ($st === 'failed') ? 'Failed' : ($it['status'] ?: 'Pending');
         $isApproved = ($st === 'approved');
-        $isDeclined = ($st === 'declined');
+        $isDeclined = ($st === 'declined' || $st === 'failed');
         $isResponded = ($st === 'responded');
         $isFinal = $isApproved || $isDeclined || $isResponded;
         $tDisplay = fmt_ts($it['timestamp']);
@@ -7379,11 +7395,13 @@ const meta = categories[ds.slug] || {};
             `;
 
             const statusEl = document.getElementById('m_status');
-            const st = (ds.status || 'Pending').toLowerCase();
-            statusEl.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${ds.status || 'Pending'}`;
+            const stRaw = String(ds.status || 'Pending').trim().toLowerCase();
+            const st = stRaw === 'faile' ? 'failed' : stRaw;
+            const statusLabel = st === 'failed' ? 'Failed' : (ds.status || 'Pending');
+            statusEl.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${statusLabel}`;
             statusEl.className = 'status-badge ml-2';
             if (st === 'approved') statusEl.classList.add('status-badge-success');
-            else if (st === 'declined') statusEl.classList.add('status-badge-declined');
+            else if (st === 'declined' || st === 'failed') statusEl.classList.add('status-badge-declined');
             else statusEl.classList.add('status-badge-pending');
 
             const imgEl = document.getElementById('m_image');
@@ -7830,7 +7848,8 @@ const meta = categories[ds.slug] || {};
                     }
                     
                     const html = data.length > 0 ? data.map((row, index) => {
-                        const st = String(row.status || 'Pending').toLowerCase();
+                        const stRaw = String(row.status || 'Pending').trim().toLowerCase();
+                        const st = stRaw === 'faile' ? 'failed' : stRaw;
                         const getStatusConfig = (status) => {
                             switch(status) {
                                 case 'approved':
@@ -7848,6 +7867,14 @@ const meta = categories[ds.slug] || {};
                                         dotColor: 'bg-red-500',
                                         borderColor: 'border-red-200',
                                         label: 'Declined'
+                                    };
+                                case 'failed':
+                                    return {
+                                        bgColor: 'from-red-500 to-rose-600',
+                                        textColor: 'text-red-700',
+                                        dotColor: 'bg-red-500',
+                                        borderColor: 'border-red-200',
+                                        label: 'Failed'
                                     };
                                 case 'responding':
                                     return {
@@ -7900,7 +7927,7 @@ const meta = categories[ds.slug] || {};
                                     <span>Approved by <strong>${esc(approverName)}</strong>${approveTime ? ' • ' + esc(approveTime) : ''}</span>
                                 </div>`;
                             }
-                        } else if (st === 'declined') {
+                        } else if (st === 'declined' || st === 'failed') {
                             const declinerName = row.declinedByName || row.updatedBy || '';
                             const declineTime = row.declinedAt || row.updatedAt || '';
                             if (declinerName) {
@@ -7908,7 +7935,7 @@ const meta = categories[ds.slug] || {};
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                                     </svg>
-                                    <span>Declined by <strong>${esc(declinerName)}</strong>${declineTime ? ' • ' + esc(declineTime) : ''}</span>
+                                    <span>${st === 'failed' ? 'Failed' : 'Declined'} by <strong>${esc(declinerName)}</strong>${declineTime ? ' • ' + esc(declineTime) : ''}</span>
                                 </div>`;
                             }
                         } else if (st === 'responded') {
@@ -8344,25 +8371,31 @@ const meta = categories[ds.slug] || {};
         }
 
         // Function to refresh admin statistics
-        window.refreshAdminStats = async function() {
+        window.refreshAdminStats = async function(options = {}) {
+            const config = (typeof options === 'boolean') ? { forceRefresh: options } : (options || {});
+            const forceRefresh = config.forceRefresh === true;
+            const showLoading = config.showLoading !== false;
             const container = document.getElementById('adminStatsContainer');
             if (!container) return;
             
-            // Show brief loading state
             const originalContent = container.innerHTML;
-            container.innerHTML = `
-                <div class="col-span-full text-center py-6 text-slate-500">
-                    <div class="inline-flex items-center gap-2">
-                        ${svg_icon('spinner', 'w-4 h-4 animate-spin')}
-                        Refreshing statistics...
+            if (showLoading) {
+                container.innerHTML = `
+                    <div class="col-span-full text-center py-6 text-slate-500">
+                        <div class="inline-flex items-center gap-2">
+                            ${svg_icon('spinner', 'w-4 h-4 animate-spin')}
+                            Refreshing statistics...
+                        </div>
                     </div>
-                </div>
-            `;
+                `;
+            }
             
             try {
                 const formData = createFormDataWithCsrf();
                 formData.append('api_action', 'load_admin_stats');
-                formData.append('force_refresh', 'true'); // Force fresh data
+                if (forceRefresh) {
+                    formData.append('force_refresh', 'true');
+                }
                 
                 const response = await fetch(window.location.href, {
                     method: 'POST',
@@ -8486,21 +8519,20 @@ const meta = categories[ds.slug] || {};
                 } else {
                     console.error('Failed to refresh admin stats:', result.message);
                     showToast('Failed to refresh statistics: ' + result.message, 'error');
-                    // Restore original content on error
-                    container.innerHTML = originalContent;
+                    if (showLoading) {
+                        container.innerHTML = originalContent;
+                    }
                 }
             } catch (error) {
                 console.error('Error refreshing admin stats:', error);
                 showToast('Error refreshing statistics: ' + error.message, 'error');
-                // Restore original content on error
-                container.innerHTML = originalContent;
+                if (showLoading) {
+                    container.innerHTML = originalContent;
+                }
             }
         };
 
-        // Initial load of admin statistics and Overview KPIs
-        setTimeout(() => {
-            refreshAdminStats();
-        }, 1000);
+        // Stats panel removed from dashboard home; no auto-init required.
 
         // Quick Action: Clear All Cache
         window.clearAllCache = async function() {
@@ -8520,7 +8552,7 @@ const meta = categories[ds.slug] || {};
                 if (result.success) {
                     showToast('Cache cleared successfully', 'success');
                     // Refresh stats after clearing cache
-                    setTimeout(() => refreshAdminStats(), 500);
+                    setTimeout(() => refreshAdminStats({ forceRefresh: true, showLoading: true }), 500);
                 } else {
                     showToast('Failed to clear cache: ' + result.message, 'error');
                 }
@@ -8602,11 +8634,10 @@ const meta = categories[ds.slug] || {};
                 
                 if (statsContainer) {
                     statsContainer.innerHTML = `
-                        <div class="col-span-full text-center py-6 text-slate-500">
-                            <div class="inline-flex items-center gap-2">
-                                ${svg_icon('spinner', 'w-4 h-4 animate-spin')}
-                                <span class="text-sm">Loading statistics...</span>
-                            </div>
+                        <div class="col-span-full grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 animate-pulse">
+                            <div class="h-40 rounded-2xl bg-slate-100"></div>
+                            <div class="h-40 rounded-2xl bg-slate-100"></div>
+                            <div class="h-40 rounded-2xl bg-slate-100"></div>
                         </div>
                     `;
                 }
@@ -8623,19 +8654,18 @@ const meta = categories[ds.slug] || {};
                 recentFormData.append('category', 'all');
                 recentFormData.append('status', 'all');
                 
-                // Execute both requests simultaneously
-                const [statsResponse, recentResponse] = await Promise.all([
-                    fetch(window.location.href, {
+                // Execute both requests simultaneously, but render statistics first
+                const statsRequest = fetch(window.location.href, {
                     method: 'POST',
-                        body: statsFormData
-                    }),
-                    fetch(window.location.href, {
-                        method: 'POST',
-                        body: recentFormData
-                    })
-                ]);
-                
-                // Process stats response
+                    body: statsFormData
+                });
+                const recentRequest = fetch(window.location.href, {
+                    method: 'POST',
+                    body: recentFormData
+                });
+
+                // Process stats response as soon as it arrives
+                const statsResponse = await statsRequest;
                 const statsResult = await statsResponse.json();
                 if (statsResult.success) {
                     const container = document.getElementById('adminStatsContainer');
@@ -8756,17 +8786,20 @@ const meta = categories[ds.slug] || {};
                     }
                 }
                 
-                // Process recent activity response in parallel
-                const recentResult = await recentResponse.json();
-                if (recentResult.success && recentContainer) {
-                    // Update recent activity list immediately
-                    if (typeof loadRecentPage === 'function') {
-                        // Manually trigger the recent activity update with the cached data
-                        displayRecentItems(recentResult.data);
-                        console.log('Recent activity loaded successfully:', recentResult.executionTime);
+                // Process recent activity after the stats are already visible
+                try {
+                    const recentResponse = await recentRequest;
+                    const recentResult = await recentResponse.json();
+                    if (recentResult.success && recentContainer) {
+                        if (typeof loadRecentPage === 'function') {
+                            displayRecentItems(recentResult.data);
+                            console.log('Recent activity loaded successfully:', recentResult.executionTime);
+                        }
+                    } else if (recentResult && !recentResult.success) {
+                        console.error('Failed to load recent activity:', recentResult.message);
                     }
-                } else if (recentResult && !recentResult.success) {
-                    console.error('Failed to load recent activity:', recentResult.message);
+                } catch (recentError) {
+                    console.error('Error loading recent activity:', recentError);
                 }
                 
                 // Prefetch data for next load (background refresh)
@@ -8837,15 +8870,16 @@ const meta = categories[ds.slug] || {};
             if (!li) return;
 
             const st = (newStatus || 'Pending').toLowerCase();
-            li.dataset.status = st;
+            const normalizedStatus = st === 'faile' ? 'failed' : st;
+            li.dataset.status = normalizedStatus;
 
             const badge = li.querySelector('.status-badge');
             if (badge) {
                 badge.className = 'mt-2 inline-flex status-badge';
-                if (st === 'approved') badge.classList.add('status-badge-success');
-                else if (st === 'declined') badge.classList.add('status-badge-declined');
+                if (normalizedStatus === 'approved') badge.classList.add('status-badge-success');
+                else if (normalizedStatus === 'declined' || normalizedStatus === 'failed') badge.classList.add('status-badge-declined');
                 else badge.classList.add('status-badge-pending');
-                badge.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${newStatus}`;
+                badge.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${normalizedStatus === 'failed' ? 'Failed' : newStatus}`;
             }
         }
 
@@ -10525,10 +10559,11 @@ const meta = categories[ds.slug] || {};
 
             let tableRows = '';
             reports.forEach((it, i) => {
-                const st = (it.status || 'Pending').toLowerCase();
-                const displayStatus = it.status || 'Pending';
+                const stRaw = String(it.status || 'Pending').trim().toLowerCase();
+                const st = stRaw === 'faile' ? 'failed' : stRaw;
+                const displayStatus = st === 'failed' ? 'Failed' : (it.status || 'Pending');
                 const isApproved = (st === 'approved');
-                const isDeclined = (st === 'declined');
+                const isDeclined = (st === 'declined' || st === 'failed');
                 const isResponded = (st === 'responded');
                 const isFinal = isApproved || isDeclined || isResponded;
                 const tDisplay = it.tsDisplay || formatFirebaseTimestamp(it.timestamp);
@@ -10757,7 +10792,10 @@ const meta = categories[ds.slug] || {};
         loadNotificationCount();
         
         // Refresh notification count every 30 seconds
-        setInterval(loadNotificationCount, 30000);
+        setInterval(() => {
+            if (document.hidden) return;
+            loadNotificationCount();
+        }, 30000);
         
         // Real-time notification updates
         if (window.FIREBASE_CLIENT_CONFIG && window.FIREBASE_CLIENT_CONFIG.projectId) {
@@ -11828,6 +11866,7 @@ const meta = categories[ds.slug] || {};
         function startRealTimeTabCountUpdates() {
             // Update tab counts every 10 seconds
             setInterval(async () => {
+                if (document.hidden) return;
                 try {
                     // Get fresh data from server
                     const formData = new FormData();
@@ -12660,7 +12699,10 @@ const meta = categories[ds.slug] || {};
         (function() {
             const startPolling = () => {
                 updateLiveSupportBadge();
-                setInterval(updateLiveSupportBadge, 5000); // Poll every 5 seconds
+                setInterval(() => {
+                    if (document.hidden) return;
+                    updateLiveSupportBadge();
+                }, 5000); // Poll every 5 seconds
             };
 
             if (document.readyState === 'loading') {
@@ -12788,7 +12830,10 @@ const meta = categories[ds.slug] || {};
         (function() {
             const startPolling = () => {
                 updateVerifyUsersBadge();
-                setInterval(updateVerifyUsersBadge, 10000); // Poll every 10 seconds
+                setInterval(() => {
+                    if (document.hidden) return;
+                    updateVerifyUsersBadge();
+                }, 10000); // Poll every 10 seconds
             };
 
             if (document.readyState === 'loading') {
@@ -12800,7 +12845,7 @@ const meta = categories[ds.slug] || {};
     </script>
     
     <!-- Dashboard Core JS for realtime polling -->
-    <script src="assets/js/dashboard-core.js?v=<?php echo time(); ?>"></script>
+    <script src="assets/js/dashboard-core.js?v=<?php echo filemtime(__DIR__ . '/assets/js/dashboard-core.js'); ?>" defer></script>
     <?php if (($_GET['view'] ?? 'dashboard') === 'map'): ?>
     <script src="assets/js/map-dashboard.js?v=<?php echo filemtime(__DIR__ . '/assets/js/map-dashboard.js'); ?>"></script>
     <?php endif; ?>

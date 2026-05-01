@@ -54,6 +54,21 @@
                 </select>
             </div>
 
+            <div id="vehicleSelection" class="hidden grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                    <label for="plateNumber" class="text-sm font-semibold text-slate-700">Plate Number</label>
+                    <input id="plateNumber" name="plateNumber" type="text" placeholder="e.g. ABC-1234" class="mt-2 w-full border border-slate-300 rounded-lg px-3 py-2 text-sm">
+                </div>
+                <div>
+                    <label for="vehicleType" class="text-sm font-semibold text-slate-700">Vehicle Type</label>
+                    <select id="vehicleType" name="vehicleType" class="mt-2 w-full border border-slate-300 rounded-lg px-3 py-2 text-sm">
+                        <option value="">Select vehicle type</option>
+                    </select>
+                    <input id="vehicleTypeOther" name="vehicleTypeOther" type="text" placeholder="Type other vehicle type" class="mt-2 hidden w-full border border-slate-300 rounded-lg px-3 py-2 text-sm">
+                    <p class="mt-2 text-xs text-slate-500">Choose a vehicle type based on category. Select <span class="font-semibold">Others</span> to type a custom vehicle type.</p>
+                </div>
+            </div>
+
             <div class="pt-2">
                 <button type="submit" class="px-4 py-2 rounded-lg bg-sky-600 text-white font-semibold hover:bg-sky-700">Create Account</button>
             </div>

@@ -13,10 +13,6 @@
                 <option value="year">This Year</option>
                 <option value="all">All Reports</option>
             </select>
-            <button onclick="exportAnalytics('pdf')" class="btn btn-secondary text-sm">
-                <?php echo svg_icon('download', 'w-4 h-4'); ?>
-                Export Report
-            </button>
         </div>
     </div>
 

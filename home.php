@@ -156,7 +156,7 @@
         .phone-screen img {
             width: 100%;
             height: 100%;
-            object-fit: cover;
+            object-position: center bottom;
             border-radius: 32px; 
         }
 
@@ -281,6 +281,91 @@
             filter: none;
             mix-blend-mode: normal;
         }
+
+        .preview-carousel-3d {
+            position: relative;
+            height: 700px;
+            overflow: hidden;
+            perspective: 1300px;
+        }
+
+        .preview-track-3d {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            transform-style: preserve-3d;
+        }
+
+        .preview-slide {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: min(280px, 82vw);
+            transform-style: preserve-3d;
+            opacity: 0;
+            pointer-events: none;
+            transition: transform 650ms ease, opacity 650ms ease, filter 650ms ease;
+        }
+
+        .preview-slide-card {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 1rem;
+            padding: 0.9rem;
+            box-shadow: 0 12px 24px rgba(15, 23, 42, 0.10);
+        }
+
+        .preview-slide-image {
+            width: 100%;
+            aspect-ratio: 9 / 17.5;
+            object-fit: cover;
+            border-radius: 0.75rem;
+            border: 1px solid #cbd5e1;
+            background: #0f172a;
+        }
+
+        .preview-slide.is-active {
+            transform: translate(-50%, -50%) translateZ(120px) rotateY(0deg) scale(1);
+            opacity: 1;
+            z-index: 30;
+            filter: none;
+            pointer-events: auto;
+        }
+
+        .preview-slide.is-prev {
+            transform: translate(calc(-50% - 200px), -50%) translateZ(0) rotateY(30deg) scale(0.9);
+            opacity: 0.55;
+            z-index: 20;
+            filter: blur(0.8px);
+        }
+
+        .preview-slide.is-next {
+            transform: translate(calc(-50% + 200px), -50%) translateZ(0) rotateY(-30deg) scale(0.9);
+            opacity: 0.55;
+            z-index: 20;
+            filter: blur(0.8px);
+        }
+
+        .preview-slide.is-hidden {
+            transform: translate(-50%, -50%) translateZ(-160px) scale(0.82);
+            opacity: 0;
+            z-index: 10;
+            filter: blur(2px);
+        }
+
+        @media (max-width: 640px) {
+            .preview-carousel-3d {
+                height: 620px;
+            }
+
+            .preview-slide.is-prev {
+                transform: translate(calc(-50% - 120px), -50%) rotateY(25deg) scale(0.86);
+            }
+
+            .preview-slide.is-next {
+                transform: translate(calc(-50% + 120px), -50%) rotateY(-25deg) scale(0.86);
+            }
+        }
     </style>
 </head>
 <body class="font-sans text-slate-800 antialiased bg-slate-50">
@@ -300,6 +385,7 @@
                     <a href="#home" class="text-sm font-medium text-slate-600 hover:text-brand-600 transition-colors">Home</a>
                     <a href="#features" class="text-sm font-medium text-slate-600 hover:text-brand-600 transition-colors">Features</a>
                     <a href="#download" class="text-sm font-medium text-slate-600 hover:text-brand-600 transition-colors">Download</a>
+                    <a href="#faq" class="text-sm font-medium text-slate-600 hover:text-brand-600 transition-colors">FAQ</a>
                     <a href="#about" class="text-sm font-medium text-slate-600 hover:text-brand-600 transition-colors">About</a>
                 </div>
 
@@ -324,6 +410,7 @@
                     <a href="#home" class="px-2 py-2 rounded-lg text-sm font-medium text-slate-600 hover:text-brand-600 hover:bg-slate-100 transition-colors mobile-nav-link">Home</a>
                     <a href="#features" class="px-2 py-2 rounded-lg text-sm font-medium text-slate-600 hover:text-brand-600 hover:bg-slate-100 transition-colors mobile-nav-link">Features</a>
                     <a href="#download" class="px-2 py-2 rounded-lg text-sm font-medium text-slate-600 hover:text-brand-600 hover:bg-slate-100 transition-colors mobile-nav-link">Download</a>
+                    <a href="#faq" class="px-2 py-2 rounded-lg text-sm font-medium text-slate-600 hover:text-brand-600 hover:bg-slate-100 transition-colors mobile-nav-link">FAQ</a>
                     <a href="#about" class="px-2 py-2 rounded-lg text-sm font-medium text-slate-600 hover:text-brand-600 hover:bg-slate-100 transition-colors mobile-nav-link">About</a>
                 </div>
             </div>
@@ -388,6 +475,15 @@
                     <p class="text-lg lg:text-xl text-slate-600 mb-10 leading-relaxed animate-fade-up [animation-delay:400ms]">
                         San Carlos City's advanced emergency coordination platform connecting citizens, responders, and command centers in real-time.
                     </p>
+
+                    <p class="text-base lg:text-lg text-slate-700 font-medium mb-6 animate-fade-up [animation-delay:500ms]">
+                        Report emergencies in seconds, track response in real time.
+                    </p>
+
+                    <div class="mb-8 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-50 border border-red-100 text-red-700 text-sm font-semibold animate-fade-up [animation-delay:550ms]">
+                        <span class="w-2 h-2 rounded-full bg-red-500"></span>
+                        For immediate life-threatening emergencies, call 911 now.
+                    </div>
                     
                     <div class="flex flex-col sm:flex-row items-center lg:justify-start justify-center gap-4 animate-fade-up [animation-delay:600ms]">
                         <a href="#download" class="w-full sm:w-auto px-8 py-4 rounded-full bg-brand-600 text-white font-semibold text-lg hover:bg-brand-700 hover:shadow-xl hover:shadow-brand-500/25 transition-all duration-300">
@@ -438,7 +534,7 @@
                                         <svg class="w-5 h-3 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M15.67 4H14V2h-4v2H8.33C7.6 4 7 4.6 7 5.33v15.33C7 21.4 7.6 22 8.33 22h7.33c.74 0 1.34-.6 1.34-1.33V5.33C17 4.6 16.4 4 15.67 4z"/></svg>
                                     </div>
                                 </div>
-                                <img src="image.png" alt="App Interface" class="h-full w-full object-cover rounded-[32px]">
+                                <img src="Screenshot_2026-04-02-17-54-29-452_com.example.ibantay.jpg" alt="App Interface" class="h-full w-full rounded-[32px]" style="transform: translateY(15px);">
                             </div>
 
                             <!-- Back of Phone -->
@@ -552,6 +648,20 @@
                     <div class="text-3xl font-extrabold text-slate-900 tracking-tight">GPS</div>
                     <div class="text-sm text-slate-500 font-semibold uppercase tracking-wider">Tracking</div>
                 </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="py-10 bg-white border-b border-slate-100">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center mb-6">
+                <p class="text-sm font-semibold uppercase tracking-wider text-slate-500">Used by San Carlos responders</p>
+            </div>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-center text-sm font-semibold text-slate-700">City DRRMO</div>
+                <div class="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-center text-sm font-semibold text-slate-700">BFP Unit</div>
+                <div class="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-center text-sm font-semibold text-slate-700">PNP Station</div>
+                <div class="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-center text-sm font-semibold text-slate-700">City Health Office</div>
             </div>
         </div>
     </section>
@@ -687,6 +797,50 @@
         </div>
     </section>
 
+    <section class="py-20 bg-white border-y border-slate-100">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center mb-12">
+                <span class="text-brand-600 font-semibold text-sm uppercase tracking-wider mb-2 block">App Preview</span>
+                <h2 class="text-3xl font-bold text-slate-900">See Man-Responde in action</h2>
+                <p class="text-slate-600 mt-3 max-w-2xl mx-auto">Quick look at reporting, hotline access, verified updates, and responder tracking.</p>
+            </div>
+            <div id="previewCarousel" class="preview-carousel-3d">
+                <div id="previewTrack" class="preview-track-3d">
+                    <div class="preview-slide">
+                        <div class="preview-slide-card">
+                            <img src="Screenshot_2026-04-02-17-54-29-452_com.example.ibantay.jpg" alt="Emergency Report Screen" class="preview-slide-image">
+                            <p class="mt-3 text-sm font-semibold text-slate-800 text-center">Report</p>
+                        </div>
+                    </div>
+                    <div class="preview-slide">
+                        <div class="preview-slide-card">
+                            <img src="hotline.jpg" alt="Hotline Screen" class="preview-slide-image">
+                            <p class="mt-3 text-sm font-semibold text-slate-800 text-center">Hotline</p>
+                        </div>
+                    </div>
+                    <div class="preview-slide">
+                        <div class="preview-slide-card">
+                            <img src="news.jpg" alt="News and Alerts Screen" class="preview-slide-image">
+                            <p class="mt-3 text-sm font-semibold text-slate-800 text-center">News & Alerts</p>
+                        </div>
+                    </div>
+                    <div class="preview-slide">
+                        <div class="preview-slide-card">
+                            <img src="livetracking.jpg" alt="Live Tracking Screen" class="preview-slide-image">
+                            <p class="mt-3 text-sm font-semibold text-slate-800 text-center">Live Tracking</p>
+                        </div>
+                    </div>
+                </div>
+                <button id="previewPrevBtn" type="button" class="absolute left-2 top-1/2 -translate-y-1/2 z-10 h-10 w-10 rounded-full bg-white/90 border border-slate-200 text-slate-700 shadow hover:bg-white transition-colors" aria-label="Previous preview">
+                    <svg class="w-5 h-5 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+                </button>
+                <button id="previewNextBtn" type="button" class="absolute right-2 top-1/2 -translate-y-1/2 z-10 h-10 w-10 rounded-full bg-white/90 border border-slate-200 text-slate-700 shadow hover:bg-white transition-colors" aria-label="Next preview">
+                    <svg class="w-5 h-5 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+                </button>
+            </div>
+        </div>
+    </section>
+
     <!-- App CTA -->
     <section id="download" class="py-24 bg-slate-900 relative overflow-hidden">
         <!-- Background Effects -->
@@ -737,6 +891,46 @@
             </div>
         </div>
     </section>
+
+    <section id="faq" class="py-24 bg-slate-50 border-t border-slate-100">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="grid lg:grid-cols-2 gap-10">
+                <div>
+                    <span class="text-brand-600 font-semibold text-sm uppercase tracking-wider mb-2 block">FAQ</span>
+                    <h2 class="text-3xl font-bold text-slate-900 mb-4">Frequently asked questions</h2>
+                    <p class="text-slate-600">Quick answers about who can use Man-Responde and how your data is protected.</p>
+                </div>
+                <div class="space-y-4">
+                    <div class="bg-white border border-slate-200 rounded-2xl p-5">
+                        <h3 class="font-bold text-slate-900 mb-2">Is this free to use?</h3>
+                        <p class="text-sm text-slate-600">Yes. The app is free for residents who need to submit emergency reports and receive official alerts.</p>
+                    </div>
+                    <div class="bg-white border border-slate-200 rounded-2xl p-5">
+                        <h3 class="font-bold text-slate-900 mb-2">Who can use Man-Responde?</h3>
+                        <p class="text-sm text-slate-600">Residents, visitors, and local responders in San Carlos City can use it for faster emergency coordination.</p>
+                    </div>
+                    <div class="bg-white border border-slate-200 rounded-2xl p-5">
+                        <h3 class="font-bold text-slate-900 mb-2">How is my data protected?</h3>
+                        <p class="text-sm text-slate-600">Reports are handled by authorized personnel only, with access controls and secure session handling in place.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mt-10 bg-white border border-slate-200 rounded-2xl p-6">
+                <h3 class="text-lg font-bold text-slate-900 mb-3">Security & Privacy Summary</h3>
+                <ul class="space-y-2 text-sm text-slate-600">
+                    <li class="flex items-start gap-2"><span class="mt-1.5 h-2 w-2 rounded-full bg-brand-500"></span><span>Data is used only for emergency response coordination and service improvement.</span></li>
+                    <li class="flex items-start gap-2"><span class="mt-1.5 h-2 w-2 rounded-full bg-brand-500"></span><span>Only authorized command center personnel can access incident records.</span></li>
+                    <li class="flex items-start gap-2"><span class="mt-1.5 h-2 w-2 rounded-full bg-brand-500"></span><span>Critical emergencies should still be escalated directly through hotline 911.</span></li>
+                </ul>
+            </div>
+        </div>
+    </section>
+
+    <a href="#download" class="fixed bottom-5 right-5 z-[90] inline-flex items-center gap-2 rounded-full bg-brand-600 px-5 py-3 text-white font-semibold shadow-xl shadow-brand-600/30 hover:bg-brand-700 transition-all duration-300" aria-label="Go to download section">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 16V4m0 12l-4-4m4 4l4-4M4 20h16"/></svg>
+        <span>Get the App</span>
+    </a>
 
     <!-- Footer -->
     <footer class="bg-white border-t border-slate-200">
@@ -791,6 +985,96 @@
             </div>
         </div>
     </footer>
+
+    <script>
+        const previewCarousel = document.getElementById('previewCarousel');
+        const previewTrack = document.getElementById('previewTrack');
+        const previewPrevBtn = document.getElementById('previewPrevBtn');
+        const previewNextBtn = document.getElementById('previewNextBtn');
+
+        if (previewCarousel && previewTrack && previewTrack.children.length) {
+            const previewSlides = Array.from(previewTrack.children);
+            let currentPreviewIndex = 0;
+            let previewIntervalId = null;
+
+            const wrapIndex = (index) => {
+                const total = previewSlides.length;
+                return ((index % total) + total) % total;
+            };
+
+            const updatePreviewPosition = () => {
+                const prevIndex = wrapIndex(currentPreviewIndex - 1);
+                const nextIndex = wrapIndex(currentPreviewIndex + 1);
+
+                previewSlides.forEach((slide, index) => {
+                    slide.classList.remove('is-active', 'is-prev', 'is-next', 'is-hidden');
+
+                    if (index === currentPreviewIndex) {
+                        slide.classList.add('is-active');
+                        return;
+                    }
+
+                    if (index === prevIndex) {
+                        slide.classList.add('is-prev');
+                        return;
+                    }
+
+                    if (index === nextIndex) {
+                        slide.classList.add('is-next');
+                        return;
+                    }
+
+                    slide.classList.add('is-hidden');
+                });
+            };
+
+            const nextPreviewSlide = () => {
+                currentPreviewIndex = wrapIndex(currentPreviewIndex + 1);
+                updatePreviewPosition();
+            };
+
+            const prevPreviewSlide = () => {
+                currentPreviewIndex = wrapIndex(currentPreviewIndex - 1);
+                updatePreviewPosition();
+            };
+
+            const stopPreviewAutoSlide = () => {
+                if (previewIntervalId) {
+                    clearInterval(previewIntervalId);
+                    previewIntervalId = null;
+                }
+            };
+
+            const startPreviewAutoSlide = () => {
+                stopPreviewAutoSlide();
+                previewIntervalId = setInterval(nextPreviewSlide, 3200);
+            };
+
+            if (previewPrevBtn) {
+                previewPrevBtn.addEventListener('click', () => {
+                    prevPreviewSlide();
+                    startPreviewAutoSlide();
+                });
+            }
+
+            if (previewNextBtn) {
+                previewNextBtn.addEventListener('click', () => {
+                    nextPreviewSlide();
+                    startPreviewAutoSlide();
+                });
+            }
+
+            previewCarousel.addEventListener('mouseenter', stopPreviewAutoSlide);
+            previewCarousel.addEventListener('mouseleave', startPreviewAutoSlide);
+            previewCarousel.addEventListener('touchstart', stopPreviewAutoSlide, { passive: true });
+            previewCarousel.addEventListener('touchend', startPreviewAutoSlide, { passive: true });
+
+            window.addEventListener('resize', updatePreviewPosition);
+
+            updatePreviewPosition();
+            startPreviewAutoSlide();
+        }
+    </script>
 
     <div id="policyModal" class="fixed inset-0 z-[100] hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="policyModalTitle">
         <div id="policyModalBackdrop" class="absolute inset-0 bg-slate-900/70 backdrop-blur-sm"></div>
