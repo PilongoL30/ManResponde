@@ -10,3 +10,5 @@ firebase-php-auth/config/*-firebase-adminsdk-*.json
 # OS/editor noise
 .DS_Store
 Thumbs.db
+.idea/
+scratch/

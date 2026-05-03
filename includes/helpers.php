@@ -12,315 +12,431 @@ if (!defined('DEFAULT_PAGE_SIZE')) {
 /**
  * List latest reports from a collection with caching
  */
-function list_latest_reports(string $collection, int $limit = 20, bool $useCache = true): array {
-    // Enforce maximum limit
-    $limit = min($limit, DEFAULT_PAGE_SIZE);
-    
-    // Try cache first
-    if ($useCache) {
-        $cacheKey = "reports_{$collection}_{$limit}";
-        $cached = cache_get($cacheKey, 30); // 30-second cache
-        if ($cached !== null) {
-            return $cached;
+if (!function_exists('list_latest_reports')) {
+    function list_latest_reports(string $collection, int $limit = 20, bool $useCache = true): array {
+        // Enforce maximum limit
+        $limit = min($limit, DEFAULT_PAGE_SIZE);
+        
+        // Try cache first
+        if ($useCache) {
+            $cacheKey = "reports_{$collection}_{$limit}";
+            $cached = cache_get($cacheKey, 30); // 30-second cache
+            if ($cached !== null) {
+                return $cached;
+            }
         }
-    }
-    
-    $items = [];
-    if (function_exists('firestore_query_latest')) {
-        try {
-            $docs = firestore_query_latest($collection, $limit);
-            foreach ($docs as $d) {
+        
+        $items = [];
+        if (function_exists('firestore_query_latest')) {
+            try {
+                $docs = firestore_query_latest($collection, $limit);
+                foreach ($docs as $d) {
+                    $item = [
+                        'id'         => $d['_id'] ?? '',
+                        'fullName'   => $d['fullName'] ?? $d['reporterName'] ?? $d['name'] ?? '',
+                        'contact'    => $d['contact'] ?? $d['reporterContact'] ?? $d['phone'] ?? '',
+                        'location'   => $d['location'] ?? $d['address'] ?? '',
+                        'purpose'    => $d['purpose'] ?? $d['description'] ?? '',
+                        'status'     => $d['status'] ?? '',
+                        'priority'   => $d['priority'] ?? '',
+                        'imageUrl'   => $d['imageUrl'] ?? '',
+                        'timestamp'  => $d['timestamp'] ?? $d['createdAt'] ?? null,
+                        'reporterId' => $d['reporterId'] ?? $d['uid'] ?? '',
+                        '_created'   => $d['_created'] ?? null,
+                    ];
+                    $items[] = $item;
+                }
+            } catch (Throwable $e) {
+                if (DEBUG_MODE) {
+                    error_log("Error in firestore_query_latest for {$collection}: " . $e->getMessage());
+                }
+            }
+        }
+        // Fallback to REST API if the specific function doesn't exist
+        if (count($items) < $limit) {
+            // Reduced from 200 to limit * 2 for better performance
+            $fetchLimit = min($limit * 2, 50);
+            $raw = rest_list_documents($collection, $fetchLimit);
+            foreach ($raw as $doc) {
+                if (!isset($doc['name'])) continue;
+                $parts = explode('/', $doc['name']);
+                $id = end($parts);
+                $fields = isset($doc['fields']) && function_exists('firestore_decode_fields')
+                    ? firestore_decode_fields($doc['fields'])
+                    : [];
                 $item = [
-                    'id'         => $d['_id'] ?? '',
-                    'fullName'   => $d['fullName'] ?? $d['reporterName'] ?? $d['name'] ?? '',
-                    'contact'    => $d['contact'] ?? $d['reporterContact'] ?? $d['phone'] ?? '',
-                    'location'   => $d['location'] ?? $d['address'] ?? '',
-                    'purpose'    => $d['purpose'] ?? $d['description'] ?? '',
-                    'status'     => $d['status'] ?? '',
-                    'priority'   => $d['priority'] ?? '',
-                    'imageUrl'   => $d['imageUrl'] ?? '',
-                    'timestamp'  => $d['timestamp'] ?? $d['createdAt'] ?? null,
-                    'reporterId' => $d['reporterId'] ?? $d['uid'] ?? '',
-                    '_created'   => $d['_created'] ?? null,
+                    'id'         => $id,
+                    'fullName'   => $fields['fullName'] ?? '',
+                    'contact'    => $fields['contact'] ?? '',
+                    'location'   => $fields['location'] ?? '',
+                    'purpose'    => $fields['purpose'] ?? $fields['description'] ?? '',
+                    'status'     => $fields['status'] ?? '',
+                    'priority'   => $fields['priority'] ?? '',
+                    'imageUrl'   => $fields['imageUrl'] ?? '',
+                    'timestamp'  => $fields['timestamp'] ?? ($doc['createTime'] ?? null),
+                    'reporterId' => $fields['reporterId'] ?? '',
+                    '_created'   => $doc['createTime'] ?? null,
                 ];
                 $items[] = $item;
             }
-        } catch (Throwable $e) {
-            if (DEBUG_MODE) {
-                error_log("Error in firestore_query_latest for {$collection}: " . $e->getMessage());
+            usort($items, function($a, $b) {
+                $ta = $a['timestamp'] ?? $a['_created'] ?? '';
+                $tb = $b['timestamp'] ?? $b['_created'] ?? '';
+                return strcmp((string)$tb, (string)$ta);
+            });
+            $seen = [];
+            $dedup = [];
+            foreach ($items as $it) {
+                if (isset($seen[$it['id']])) continue;
+                $seen[$it['id']] = true;
+                $dedup[] = $it;
+                if (count($dedup) >= $limit) break;
             }
+            $items = $dedup;
         }
-    }
-    // Fallback to REST API if the specific function doesn't exist
-    if (count($items) < $limit) {
-        // Reduced from 200 to limit * 2 for better performance
-        $fetchLimit = min($limit * 2, 50);
-        $raw = rest_list_documents($collection, $fetchLimit);
-        foreach ($raw as $doc) {
-            if (!isset($doc['name'])) continue;
-            $parts = explode('/', $doc['name']);
-            $id = end($parts);
-            $fields = isset($doc['fields']) && function_exists('firestore_decode_fields')
-                ? firestore_decode_fields($doc['fields'])
-                : [];
-            $item = [
-                'id'         => $id,
-                'fullName'   => $fields['fullName'] ?? '',
-                'contact'    => $fields['contact'] ?? '',
-                'location'   => $fields['location'] ?? '',
-                'purpose'    => $fields['purpose'] ?? $fields['description'] ?? '',
-                'status'     => $fields['status'] ?? '',
-                'priority'   => $fields['priority'] ?? '',
-                'imageUrl'   => $fields['imageUrl'] ?? '',
-                'timestamp'  => $fields['timestamp'] ?? ($doc['createTime'] ?? null),
-                'reporterId' => $fields['reporterId'] ?? '',
-                '_created'   => $doc['createTime'] ?? null,
-            ];
-            $items[] = $item;
+        
+        // Cache the results before returning
+        if ($useCache && !empty($items)) {
+            $cacheKey = "reports_{$collection}_{$limit}";
+            cache_set($cacheKey, $items, 30); // 30-second cache
         }
-        usort($items, function($a, $b) {
-            $ta = $a['timestamp'] ?? $a['_created'] ?? '';
-            $tb = $b['timestamp'] ?? $b['_created'] ?? '';
-            return strcmp((string)$tb, (string)$ta);
-        });
-        $seen = [];
-        $dedup = [];
-        foreach ($items as $it) {
-            if (isset($seen[$it['id']])) continue;
-            $seen[$it['id']] = true;
-            $dedup[] = $it;
-            if (count($dedup) >= $limit) break;
-        }
-        $items = $dedup;
+        
+        return $items;
     }
-    
-    // Cache the results before returning
-    if ($useCache && !empty($items)) {
-        $cacheKey = "reports_{$collection}_{$limit}";
-        cache_set($cacheKey, $items, 30); // 30-second cache
-    }
-    
-    return $items;
 }
 
 /**
  * Fetches documents from a Firestore collection using a basic REST query
  */
-function rest_list_documents(string $collection, int $pageSize = 200): array {
-    if (!function_exists('firestore_rest_request') || !function_exists('firestore_base_url')) return [];
-    $url = firestore_base_url().'/'.rawurlencode($collection).'?pageSize='.$pageSize;
-    try {
-        $res = firestore_rest_request('GET', $url);
-        $docs = $res['documents'] ?? [];
-        return is_array($docs) ? $docs : [];
-    } catch (Throwable $e) { return []; }
+if (!function_exists('rest_list_documents')) {
+    function rest_list_documents(string $collection, int $pageSize = 200): array {
+        if (!function_exists('firestore_rest_request') || !function_exists('firestore_base_url')) return [];
+        $url = firestore_base_url().'/'.rawurlencode($collection).'?pageSize='.$pageSize;
+        try {
+            $res = firestore_rest_request('GET', $url);
+            $docs = $res['documents'] ?? [];
+            return is_array($docs) ? $docs : [];
+        } catch (Throwable $e) { return []; }
+    }
 }
 
 /**
  * Build recent feed (simple version for admin dashboard)
  */
-function build_recent_feed(array $categories, int $limit = 10): array {
-    $recent = [];
-    
-    foreach ($categories as $slug => $meta) {
-        $reports = list_latest_reports($meta['collection'], $limit, true);
-        foreach ($reports as $report) {
-            $recent[] = array_merge($report, ['categorySlug' => $slug]);
+if (!function_exists('build_recent_feed')) {
+    function build_recent_feed(array $categories, int $limit = 10): array {
+        $recent = [];
+        
+        foreach ($categories as $slug => $meta) {
+            $reports = list_latest_reports($meta['collection'], $limit, true);
+            foreach ($reports as $report) {
+                $recent[] = array_merge($report, ['categorySlug' => $slug]);
+            }
         }
+        
+        // Sort by timestamp descending
+        usort($recent, function($a, $b) {
+            $timeA = $a['timestamp'] ?? '';
+            $timeB = $b['timestamp'] ?? '';
+            
+            // Handle different timestamp formats
+            if (is_array($timeA) && isset($timeA['_seconds'])) {
+                $secondsA = $timeA['_seconds'];
+            } elseif (is_string($timeA)) {
+                $secondsA = strtotime($timeA);
+            } else {
+                $secondsA = 0;
+            }
+            
+            if (is_array($timeB) && isset($timeB['_seconds'])) {
+                $secondsB = $timeB['_seconds'];
+            } elseif (is_string($timeB)) {
+                $secondsB = strtotime($timeB);
+            } else {
+                $secondsB = 0;
+            }
+            
+            return $secondsB - $secondsA;
+        });
+        
+        return array_slice($recent, 0, $limit);
     }
-    
-    // Sort by timestamp descending
-    usort($recent, function($a, $b) {
-        $timeA = $a['timestamp'] ?? '';
-        $timeB = $b['timestamp'] ?? '';
-        
-        // Handle different timestamp formats
-        if (is_array($timeA) && isset($timeA['_seconds'])) {
-            $secondsA = $timeA['_seconds'];
-        } elseif (is_string($timeA)) {
-            $secondsA = strtotime($timeA);
-        } else {
-            $secondsA = 0;
-        }
-        
-        if (is_array($timeB) && isset($timeB['_seconds'])) {
-            $secondsB = $timeB['_seconds'];
-        } elseif (is_string($timeB)) {
-            $secondsB = strtotime($timeB);
-        } else {
-            $secondsB = 0;
-        }
-        
-        return $secondsB - $secondsA;
-    });
-    
-    return array_slice($recent, 0, $limit);
 }
 
 /**
  * Build recent feed optimized with filtering
  */
-function build_recent_feed_optimized(array $categories, string $categoryFilter, string $statusFilter, string $search, int $perCategoryLimit = 10): array {
-    $recent = [];
-    
-    // Determine which categories to fetch
-    $categoriesToFetch = [];
-    if ($categoryFilter === 'all') {
-        $categoriesToFetch = $categories;
-    } else {
-        $categoriesToFetch = isset($categories[$categoryFilter]) ? [$categoryFilter => $categories[$categoryFilter]] : [];
-    }
-    
-    if (empty($categoriesToFetch)) {
-        return [];
-    }
-    
-    foreach ($categoriesToFetch as $slug => $meta) {
-        try {
-            $items = get_recent_reports_optimized($meta['collection'], $perCategoryLimit, $statusFilter, $search);
-            
-            foreach ($items as $it) {
-                $ts = $it['timestamp'] ?? ($it['_created'] ?? '');
-                $recent[] = [
-                    'slug'         => $slug,
-                    'label'        => $meta['label'],
-                    'icon'         => $meta['icon'],
-                    'iconSvg'      => svg_icon($meta['icon'], 'w-5 h-5'),
-                    'color'        => $meta['color'],
-                    'id'           => $it['id'] ?? '',
-                    'fullName'     => $it['fullName'] ?? $it['reporterName'] ?? '',
-                    'contact'      => $it['contact'] ?? $it['reporterContact'] ?? '',
-                    'mobileNumber' => $it['mobileNumber'] ?? $it['contact'] ?? $it['reporterContact'] ?? '',
-                    'location'     => $it['location'] ?? '',
-                    'purpose'      => $it['purpose'] ?? $it['description'] ?? '',
-                    'reporterId'   => $it['reporterId'] ?? '',
-                    'imageUrl'     => $it['imageUrl'] ?? '',
-                    'status'       => $it['status'] ?? 'Pending',
-                    'priority'     => $it['priority'] ?? '',
-                    'lat'          => $it['latitude'] ?? ($it['coordinates']['latitude'] ?? null),
-                    'lng'          => $it['longitude'] ?? ($it['coordinates']['longitude'] ?? null),
-                    'timestamp'    => $ts,
-                    'tsDisplay'    => fmt_ts($ts),
-                    'collection'   => $meta['collection'],
-                ];
-            }
-        } catch (Exception $e) {
-            error_log("Error fetching from collection {$meta['collection']}: " . $e->getMessage());
+if (!function_exists('build_recent_feed_optimized')) {
+    function build_recent_feed_optimized(array $categories, string $categoryFilter, string $statusFilter, string $search, int $perCategoryLimit = 10): array {
+        $recent = [];
+        
+        // Determine which categories to fetch
+        $categoriesToFetch = [];
+        if ($categoryFilter === 'all') {
+            $categoriesToFetch = $categories;
+        } else {
+            $categoriesToFetch = isset($categories[$categoryFilter]) ? [$categoryFilter => $categories[$categoryFilter]] : [];
         }
+        
+        if (empty($categoriesToFetch)) {
+            return [];
+        }
+        
+        foreach ($categoriesToFetch as $slug => $meta) {
+            try {
+                $items = get_recent_reports_optimized($meta['collection'], $perCategoryLimit, $statusFilter, $search);
+                
+                foreach ($items as $it) {
+                    $ts = $it['timestamp'] ?? ($it['_created'] ?? '');
+                    $recent[] = [
+                        'slug'         => $slug,
+                        'label'        => $meta['label'],
+                        'icon'         => $meta['icon'],
+                        'iconSvg'      => svg_icon($meta['icon'], 'w-5 h-5'),
+                        'color'        => $meta['color'],
+                        'id'           => $it['id'] ?? '',
+                        'fullName'     => $it['fullName'] ?? $it['reporterName'] ?? '',
+                        'contact'      => $it['contact'] ?? $it['reporterContact'] ?? '',
+                        'mobileNumber' => $it['mobileNumber'] ?? $it['contact'] ?? $it['reporterContact'] ?? '',
+                        'location'     => $it['location'] ?? '',
+                        'purpose'      => $it['purpose'] ?? $it['description'] ?? '',
+                        'reporterId'   => $it['reporterId'] ?? '',
+                        'imageUrl'     => $it['imageUrl'] ?? '',
+                        'status'       => $it['status'] ?? 'Pending',
+                        'priority'     => $it['priority'] ?? '',
+                        'lat'          => $it['latitude'] ?? ($it['coordinates']['latitude'] ?? null),
+                        'lng'          => $it['longitude'] ?? ($it['coordinates']['longitude'] ?? null),
+                        'timestamp'    => $ts,
+                        'tsDisplay'    => fmt_ts($ts),
+                        'collection'   => $meta['collection'],
+                    ];
+                }
+            } catch (Exception $e) {
+                error_log("Error fetching from collection {$meta['collection']}: " . $e->getMessage());
+            }
+        }
+        
+        // Sort by priority first, then timestamp
+        usort($recent, function($a, $b) {
+            $aUrgent = ($a['priority'] ?? '') === 'HIGH';
+            $bUrgent = ($b['priority'] ?? '') === 'HIGH';
+            
+            if ($aUrgent && !$bUrgent) return -1;
+            if (!$aUrgent && $bUrgent) return 1;
+            
+            return strcmp((string)($b['timestamp'] ?? ''), (string)($a['timestamp'] ?? ''));
+        });
+        
+        return $recent;
     }
-    
-    // Sort by priority first, then timestamp
-    usort($recent, function($a, $b) {
-        $aUrgent = ($a['priority'] ?? '') === 'HIGH';
-        $bUrgent = ($b['priority'] ?? '') === 'HIGH';
-        
-        if ($aUrgent && !$bUrgent) return -1;
-        if (!$aUrgent && $bUrgent) return 1;
-        
-        return strcmp((string)($b['timestamp'] ?? ''), (string)($a['timestamp'] ?? ''));
-    });
-    
-    return $recent;
 }
 
 /**
  * Optimized function to get recent reports with filtering
  */
-function get_recent_reports_optimized(string $collection, int $limit, string $statusFilter, string $search): array {
-    try {
-        $url = firestore_base_url() . ':runQuery';
-        $body = [
-            'structuredQuery' => [
-                'from' => [['collectionId' => $collection]],
-                'limit' => $limit * 2
-            ]
-        ];
-        
-        if ($statusFilter !== 'all') {
-            $body['structuredQuery']['where'] = [
-                'fieldFilter' => [
-                    'field' => ['fieldPath' => 'status'],
-                    'op' => 'EQUAL',
-                    'value' => firestore_encode_value(ucfirst($statusFilter))
+if (!function_exists('get_recent_reports_optimized')) {
+    function get_recent_reports_optimized(string $collection, int $limit, string $statusFilter, string $search): array {
+        try {
+            $url = firestore_base_url() . ':runQuery';
+            $body = [
+                'structuredQuery' => [
+                    'from' => [['collectionId' => $collection]],
+                    'limit' => $limit * 2
                 ]
             ];
-        }
-        
-        $response = firestore_rest_request('POST', $url, $body);
-        $items = [];
-        
-        if (is_array($response)) {
-            foreach ($response as $row) {
-                if (!isset($row['document'])) continue;
-                $doc = $row['document'];
-                $itemData = firestore_decode_fields($doc['fields'] ?? []);
-                $itemData['id'] = basename($doc['name'] ?? '');
-                $itemData['_created'] = $doc['createTime'] ?? null;
-                
-                // Apply search filter
-                if ($search) {
-                    $searchableText = strtolower(
-                        ($itemData['fullName'] ?? $itemData['reporterName'] ?? '') . ' ' .
-                        ($itemData['location'] ?? '') . ' ' .
-                        ($itemData['purpose'] ?? $itemData['description'] ?? '') . ' ' .
-                        ($itemData['contact'] ?? $itemData['reporterContact'] ?? '')
-                    );
-                    if (strpos($searchableText, strtolower($search)) === false) {
-                        continue;
+            
+            if ($statusFilter !== 'all') {
+                $body['structuredQuery']['where'] = [
+                    'fieldFilter' => [
+                        'field' => ['fieldPath' => 'status'],
+                        'op' => 'EQUAL',
+                        'value' => firestore_encode_value(ucfirst($statusFilter))
+                    ]
+                ];
+            }
+            
+            $response = firestore_rest_request('POST', $url, $body);
+            $items = [];
+            
+            if (is_array($response)) {
+                foreach ($response as $row) {
+                    if (!isset($row['document'])) continue;
+                    $doc = $row['document'];
+                    $itemData = firestore_decode_fields($doc['fields'] ?? []);
+                    $itemData['id'] = basename($doc['name'] ?? '');
+                    $itemData['_created'] = $doc['createTime'] ?? null;
+                    
+                    // Apply search filter
+                    if ($search) {
+                        $searchableText = strtolower(
+                            ($itemData['fullName'] ?? $itemData['reporterName'] ?? '') . ' ' .
+                            ($itemData['location'] ?? '') . ' ' .
+                            ($itemData['purpose'] ?? $itemData['description'] ?? '') . ' ' .
+                            ($itemData['contact'] ?? $itemData['reporterContact'] ?? '')
+                        );
+                        if (strpos($searchableText, strtolower($search)) === false) {
+                            continue;
+                        }
+                    }
+                    
+                    $items[] = $itemData;
+                    
+                    if (count($items) >= $limit) {
+                        break;
                     }
                 }
-                
-                $items[] = $itemData;
-                
-                if (count($items) >= $limit) {
-                    break;
-                }
             }
+            
+            return $items;
+        } catch (Exception $e) {
+            error_log("Error in get_recent_reports_optimized: " . $e->getMessage());
+            return [];
         }
-        
-        return $items;
-    } catch (Exception $e) {
-        error_log("Error in get_recent_reports_optimized: " . $e->getMessage());
-        return [];
     }
 }
 
 /**
  * Format timestamp for display
  */
-function fmt_ts($ts): string {
-    if ($ts instanceof \Google\Cloud\Core\Timestamp) {
-        try {
-            $timestamp = $ts->get();
-            if ($timestamp instanceof DateTime) {
-                return $timestamp->setTimezone(new DateTimeZone('Asia/Manila'))->format('M j, Y g:i A');
-            }
-            return '';
-        } catch (Throwable $e) { return ''; }
+if (!function_exists('fmt_ts')) {
+    function fmt_ts($ts): string {
+        if ($ts instanceof \Google\Cloud\Core\Timestamp) {
+            try {
+                $timestamp = $ts->get();
+                if ($timestamp instanceof DateTime) {
+                    return $timestamp->setTimezone(new DateTimeZone('Asia/Manila'))->format('M j, Y g:i A');
+                }
+                return '';
+            } catch (Throwable $e) { return ''; }
+        }
+        if (is_string($ts)) {
+            try {
+                $dateTime = new DateTimeImmutable($ts);
+                return $dateTime->setTimezone(new DateTimeZone('Asia/Manila'))->format('M j, Y g:i A');
+            } catch (Throwable $e) { return htmlspecialchars($ts); }
+        }
+        return '';
     }
-    if (is_string($ts)) {
-        try {
-            $dateTime = new DateTimeImmutable($ts);
-            return $dateTime->setTimezone(new DateTimeZone('Asia/Manila'))->format('M j, Y g:i A');
-        } catch (Throwable $e) { return htmlspecialchars($ts); }
-    }
-    return '';
 }
 
 /**
  * Generate SVG icons
  */
-function svg_icon(string $name, string $class = 'w-6 h-6') {
-    $icons = [
-        'shield-halved' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.286zm0 13.036h.008v.017h-.008v-.017z" />',
-        'fire-flame-curved' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15.362 5.214A8.252 8.252 0 0112 21 8.25 8.25 0 016.038 7.048 8.287 8.287 0 009 9.6a8.983 8.983 0 013.362-6.867 8.268 8.268 0 013 2.481z" /><path stroke-linecap="round" stroke-linejoin="round" d="M12 18a3.75 3.75 0 00.495-7.467 5.99 5.99 0 00-1.925 3.546 5.974 5.974 0 01-2.133-1.001A3.75 3.75 0 0012 18z" />',
-        'kit-medical' => '<path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />',
-        'car-burst' => '<path stroke-linecap="round" stroke-linejoin="round" d="M8.25 18.75a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h6m-9 0H3.375a1.125 1.125 0 01-1.125-1.125V14.25m17.25 4.5a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h1.125c.621 0 1.125-.504 1.125-1.125V14.25m-17.25 4.5v-1.875a3.375 3.375 0 003.375-3.375h1.5a1.125 1.125 0 011.125 1.125v-1.5a3.375 3.375 0 00-3.375-3.375H9.75V7.5h1.5a3.375 3.375 0 013.375 3.375v1.5a1.125 1.125 0 001.125 1.125h1.5a3.375 3.375 0 003.375-3.375V7.5a1.125 1.125 0 00-1.125-1.125H5.625" />',
-        'house-tsunami' => '<path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M8.25 21h7.5" />',
-        'handcuffs' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" />',
-        'spinner' => '<path d="M21 12a9 9 0 11-6.219-8.56" />',
-    ];
-    
-    $path = $icons[$name] ?? $icons['spinner'];
-    return '<svg class="'.$class.'" fill="none" stroke="currentColor" viewBox="0 0 24 24">'.$path.'</svg>';
+if (!function_exists('svg_icon')) {
+    function svg_icon(string $name, string $class = 'w-6 h-6') {
+        $icons = [
+            'dashboard' => '<path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />',
+            'truck' => '<path stroke-linecap="round" stroke-linejoin="round" d="M8.25 18.75a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h6m-9 0H3.375a1.125 1.125 0 01-1.125-1.125V14.25m17.25 4.5a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h1.125c.621 0 1.125-.504 1.125-1.125V14.25m-17.25 4.5v-1.875a3.375 3.375 0 003.375-3.375h1.5a1.125 1.125 0 011.125 1.125v-1.5a3.375 3.375 0 00-3.375-3.375H9.75V7.5h1.5a3.375 3.375 0 013.375 3.375v1.5a1.125 1.125 0 001.125 1.125h1.5a3.375 3.375 0 003.375-3.375V7.5a1.125 1.125 0 00-1.125-1.125H5.625" />',
+            'shield-check' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.286zm0 13.036h.008v.017h-.008v-.017z" />',
+            'fire' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15.362 5.214A8.252 8.252 0 0112 21 8.25 8.25 0 016.038 7.048 8.287 8.287 0 009 9.6a8.983 8.983 0 013.362-6.867 8.268 8.268 0 013 2.481z" /><path stroke-linecap="round" stroke-linejoin="round" d="M12 18a3.75 3.75 0 00.495-7.467 5.99 5.99 0 00-1.925 3.546 5.974 5.974 0 01-2.133-1.001A3.75 3.75 0 0012 18z" />',
+            'home' => '<path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M8.25 21h7.5" />',
+            'question-mark-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />',
+            'user-plus' => '<path stroke-linecap="round" stroke-linejoin="round" d="M19 7.5v3m0 0v3m0-3h3m-3 0h-3m-2.25-4.5a3 3 0 11-6 0 3 3 0 016 0zM4 18.75v-1.5a6.75 6.75 0 017.5-6.75h.5a6.75 6.75 0 016.75 6.75v1.5a6.75 6.75 0 01-6.75 6.75H9.75V21h7.5" />',
+            'user-shield' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z" />',
+            'user-check' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" /><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75" />',
+            'logout' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9" />',
+            'download' => '<path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M7.5 10.5L12 15m0 0l4.5-4.5M12 15V3" />',
+            'chart-pie' => '<path stroke-linecap="round" stroke-linejoin="round" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" /><path stroke-linecap="round" stroke-linejoin="round" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />',
+            'map' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />',
+            'chat' => '<path stroke-linecap="round" stroke-linejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>',
+            'x-mark' => '<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />',
+            'eye' => '<path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />',
+            'check-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />',
+            'x-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9.75 9.75l4.5 4.5m0-4.5l-4.5 4.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />',
+            'identification' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15 9h3.75M15 12h3.75M15 15h3.75M4.5 19.5h15a2.25 2.25 0 002.25-2.25V6.75A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25v10.5A2.25 2.25 0 004.5 19.5zm6-10.125a1.875 1.875 0 11-3.75 0 1.875 1.875 0 013.75 0zm1.294 6.336a6.721 6.721 0 01-3.17.789 6.721 6.721 0 01-3.168-.789 3.376 3.376 0 016.338 0z" />',
+            'user-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M17.982 18.725A7.488 7.488 0 0012 15.75a7.488 7.488 0 00-5.982 2.975m11.963 0a9 9 0 10-11.963 0m11.963 0A8.966 8.966 0 0112 21a8.966 8.966 0 01-5.982-2.275M15 9.75a3 3 0 11-6 0 3 3 0 016 0z" />',
+            'clock' => '<path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />',
+            'info' => '<path stroke-linecap="round" stroke-linejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z" />',
+            'check' => '<path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" />',
+            'spinner' => '<path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />',
+            'phone' => '<path stroke-linecap="round" stroke-linejoin="round" d="M2.25 6.75c0 8.284 6.716 15 15 15h2.25a2.25 2.25 0 002.25-2.25v-1.372c0-.516-.351-.966-.852-1.091l-4.423-1.106c-.44-.11-.902.055-1.173.417l-.97 1.293c-2.824-1.47-5.112-3.758-6.582-6.582l1.293-.97c.362-.271.527-.734.417-1.173L6.963 3.102a1.125 1.125 0 00-1.091-.852H4.5A2.25 2.25 0 002.25 4.5v2.25z" />',
+            'user' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" />',
+        ];
+        
+        $path = $icons[$name] ?? $icons['spinner'];
+        return '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="'.$class.'">'.$path.'</svg>';
+    }
+}
+
+if (!function_exists('get_user_profile')) {
+    function get_user_profile(string $uid): array {
+        if (session_status() !== PHP_SESSION_NONE) {
+            $k = '__user_profile_' . $uid;
+            $kt = $k . '_time';
+            if (isset($_SESSION[$k], $_SESSION[$kt]) && (time() - (int)$_SESSION[$kt]) < 300) {
+                return is_array($_SESSION[$k]) ? $_SESSION[$k] : [];
+            }
+        }
+        $cacheKey = 'user_profile_' . $uid;
+        $cached = cache_get($cacheKey, 300);
+        if (is_array($cached)) {
+            if (session_status() !== PHP_SESSION_NONE) {
+                $_SESSION[$k] = $cached;
+                $_SESSION[$kt] = time();
+            }
+            return $cached;
+        }
+        if (function_exists('firestore_get_doc_by_id')) {
+            try {
+                $data = firestore_get_doc_by_id('users', $uid) ?? [];
+                if (is_array($data)) {
+                    cache_set($cacheKey, $data, 300);
+                    if (session_status() !== PHP_SESSION_NONE) {
+                        $_SESSION[$k] = $data;
+                        $_SESSION[$kt] = time();
+                    }
+                }
+                return $data;
+            } catch (Throwable $e) {}
+        }
+        global $firestore;
+        if ($firestore) {
+            try {
+                $snap = $firestore->collection('users')->document($uid)->snapshot();
+                $data = $snap->exists() ? ($snap->data() ?? []) : [];
+                if (is_array($data)) {
+                    cache_set($cacheKey, $data, 300);
+                    if (session_status() !== PHP_SESSION_NONE) {
+                        $_SESSION[$k] = $data;
+                        $_SESSION[$kt] = time();
+                    }
+                }
+                return $data;
+            } catch (Throwable $e) {}
+        }
+        return [];
+    }
+}
+
+if (!function_exists('get_user_name_by_id')) {
+    function get_user_name_by_id(string $uid): string {
+        if (empty($uid)) return '';
+        static $nameCache = [];
+        if (isset($nameCache[$uid])) {
+            return $nameCache[$uid];
+        }
+        $profile = get_user_profile($uid);
+        $name = $profile['fullName'] ?? $profile['name'] ?? $profile['displayName'] ?? '';
+        $nameCache[$uid] = $name;
+        return $name;
+    }
+}
+
+if (!function_exists('fmt_action_time')) {
+    function fmt_action_time($ts): string {
+        if (empty($ts)) return '';
+        try {
+            if (is_string($ts)) {
+                $dt = new DateTime($ts);
+            } elseif (is_array($ts) && isset($ts['_seconds'])) {
+                $dt = new DateTime('@' . $ts['_seconds']);
+            } elseif (is_array($ts) && isset($ts['seconds'])) {
+                $dt = new DateTime('@' . $ts['seconds']);
+            } else {
+                return '';
+            }
+            $dt->setTimezone(new DateTimeZone('Asia/Manila'));
+            return $dt->format('M j, Y, g:i A');
+        } catch (Throwable $e) { return htmlspecialchars((string)$ts); }
+    }
 }

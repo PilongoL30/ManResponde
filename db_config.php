@@ -423,7 +423,9 @@ function firestore_query_one_by_field(string $collection, string $field, $value)
             $data['_id'] = $name ? basename($name) : '';
             return $data;
         }
-    } catch (Throwable $e) {}
+    } catch (Throwable $e) {
+        error_log("Firestore query one error ($collection): " . $e->getMessage());
+    }
     return null;
 }
 
@@ -456,7 +458,9 @@ function firestore_query_latest(string $collection, int $limit = 10): array {
             $data['_created'] = $doc['createTime'] ?? null;
             $out[] = $data;
         }
-    } catch (Throwable $e) {}
+    } catch (Throwable $e) {
+        error_log("Firestore query latest error ($collection): " . $e->getMessage());
+    }
     return $out;
 }
 
@@ -488,7 +492,9 @@ function firestore_count(string $collection, ?string $statusEquals = null): int 
             $v = $row['result']['aggregateFields']['c']['integerValue'] ?? null;
             if ($v !== null) return (int)$v;
         }
-    } catch (Throwable $e) {}
+    } catch (Throwable $e) {
+        error_log("Firestore count error ($collection): " . $e->getMessage());
+    }
     return 0;
 }
 
@@ -530,114 +536,130 @@ function get_admin_stats_counts(array $collections): array {
  * Super fast admin statistics using Firestore aggregation queries.
  * Uses parallel requests and aggregation for maximum performance.
  */
-function get_admin_stats_counts_fast(array $collections): array {
+function get_admin_stats_counts_fast(array $collections, ?string $startTime = null, ?string $endTime = null): array {
     $results = [];
     $requests = [];
     
     // Prepare all requests for parallel execution
     foreach ($collections as $collection) {
+        $baseQuery = [
+            'from' => [['collectionId' => $collection]]
+        ];
+
+        // Add time filter if provided
+        $filters = [];
+        if ($startTime) {
+            $filters[] = [
+                'fieldFilter' => [
+                    'field' => ['fieldPath' => 'timestamp'],
+                    'op' => 'GREATER_THAN_OR_EQUAL',
+                    'value' => ['timestampValue' => $startTime]
+                ]
+            ];
+        }
+        if ($endTime) {
+            $filters[] = [
+                'fieldFilter' => [
+                    'field' => ['fieldPath' => 'timestamp'],
+                    'op' => 'LESS_THAN_OR_EQUAL',
+                    'value' => ['timestampValue' => $endTime]
+                ]
+            ];
+        }
+
+        if (count($filters) === 1) {
+            $baseQuery['where'] = $filters[0];
+        } elseif (count($filters) > 1) {
+            $baseQuery['where'] = [
+                'compositeFilter' => [
+                    'op' => 'AND',
+                    'filters' => $filters
+                ]
+            ];
+        }
+
+        // Helper to add status filter to base query
+        $withStatus = function($query, $status) {
+            $existingWhere = $query['where'] ?? null;
+            $statusFilter = [
+                'fieldFilter' => [
+                    'field' => ['fieldPath' => 'status'],
+                    'op' => 'EQUAL',
+                    'value' => ['stringValue' => $status]
+                ]
+            ];
+
+            if ($existingWhere) {
+                // If existingWhere is already a composite AND filter, just add to it
+                if (isset($existingWhere['compositeFilter']) && $existingWhere['compositeFilter']['op'] === 'AND') {
+                    $newFilters = $existingWhere['compositeFilter']['filters'];
+                    $newFilters[] = $statusFilter;
+                    return array_merge($query, [
+                        'where' => [
+                            'compositeFilter' => [
+                                'op' => 'AND',
+                                'filters' => $newFilters
+                            ]
+                        ]
+                    ]);
+                }
+                
+                return array_merge($query, [
+                    'where' => [
+                        'compositeFilter' => [
+                            'op' => 'AND',
+                            'filters' => [$existingWhere, $statusFilter]
+                        ]
+                    ]
+                ]);
+            } else {
+                return array_merge($query, ['where' => $statusFilter]);
+            }
+        };
+
         // Use aggregation API for much faster counting
         $requests[] = [
             'collection' => $collection,
             'total_url' => firestore_base_url() . ':runAggregationQuery',
             'total_body' => [
                 'structuredAggregationQuery' => [
-                    'structuredQuery' => [
-                        'from' => [['collectionId' => $collection]]
-                    ],
-                    'aggregations' => [
-                        'total_count' => ['count' => (object)[]]
-                    ]
+                    'structuredQuery' => $baseQuery,
+                    'aggregations' => [['alias' => 'total_count', 'count' => (object)[]]]
                 ]
             ],
             'approved_url' => firestore_base_url() . ':runAggregationQuery',
             'approved_body' => [
                 'structuredAggregationQuery' => [
-                    'structuredQuery' => [
-                        'from' => [['collectionId' => $collection]],
-                        'where' => [
-                            'fieldFilter' => [
-                                'field' => ['fieldPath' => 'status'],
-                                'op' => 'EQUAL',
-                                'value' => ['stringValue' => 'Approved']
-                            ]
-                        ]
-                    ],
-                    'aggregations' => [
-                        'approved_count' => ['count' => (object)[]]
-                    ]
+                    'structuredQuery' => $withStatus($baseQuery, 'Approved'),
+                    'aggregations' => [['alias' => 'approved_count', 'count' => (object)[]]]
                 ]
             ],
             'pending_url' => firestore_base_url() . ':runAggregationQuery',
             'pending_body' => [
                 'structuredAggregationQuery' => [
-                    'structuredQuery' => [
-                        'from' => [['collectionId' => $collection]],
-                        'where' => [
-                            'fieldFilter' => [
-                                'field' => ['fieldPath' => 'status'],
-                                'op' => 'EQUAL',
-                                'value' => ['stringValue' => 'Pending']
-                            ]
-                        ]
-                    ],
-                    'aggregations' => [
-                        'pending_count' => ['count' => (object)[]]
-                    ]
+                    'structuredQuery' => $withStatus($baseQuery, 'Pending'),
+                    'aggregations' => [['alias' => 'pending_count', 'count' => (object)[]]]
                 ]
             ],
             'declined_url' => firestore_base_url() . ':runAggregationQuery',
             'declined_body' => [
                 'structuredAggregationQuery' => [
-                    'structuredQuery' => [
-                        'from' => [['collectionId' => $collection]],
-                        'where' => [
-                            'fieldFilter' => [
-                                'field' => ['fieldPath' => 'status'],
-                                'op' => 'EQUAL',
-                                'value' => ['stringValue' => 'Declined']
-                            ]
-                        ]
-                    ],
-                    'aggregations' => [
-                        'declined_count' => ['count' => (object)[]]
-                    ]
+                    'structuredQuery' => $withStatus($baseQuery, 'Declined'),
+                    'aggregations' => [['alias' => 'declined_count', 'count' => (object)[]]]
                 ]
             ],
             'responding_url' => firestore_base_url() . ':runAggregationQuery',
             'responding_body' => [
                 'structuredAggregationQuery' => [
-                    'structuredQuery' => [
-                        'from' => [['collectionId' => $collection]],
-                        'where' => [
-                            'fieldFilter' => [
-                                'field' => ['fieldPath' => 'status'],
-                                'op' => 'EQUAL',
-                                'value' => ['stringValue' => 'Responding']
-                            ]
-                        ]
-                    ],
-                    'aggregations' => [
-                        'responding_count' => ['count' => (object)[]]
-                    ]
+                    'structuredQuery' => $withStatus($baseQuery, 'Responding'),
+                    'aggregations' => [['alias' => 'responding_count', 'count' => (object)[]]]
                 ]
             ],
             'responded_url' => firestore_base_url() . ':runAggregationQuery',
             'responded_body' => [
                 'structuredAggregationQuery' => [
-                    'structuredQuery' => [
-                        'from' => [['collectionId' => $collection]],
-                        'where' => [
-                            'fieldFilter' => [
-                                'field' => ['fieldPath' => 'status'],
-                                'op' => 'EQUAL',
-                                'value' => ['stringValue' => 'Responded']
-                            ]
-                        ]
-                    ],
-                    'aggregations' => [
-                        'responded_count' => ['count' => (object)[]]
-                    ]
+                    'structuredQuery' => $withStatus($baseQuery, 'Responded'),
+                    'aggregations' => [['alias' => 'responded_count', 'count' => (object)[]]]
                 ]
             ]
         ];
@@ -821,23 +843,53 @@ function get_admin_stats_counts_fast(array $collections): array {
  * Fallback fast count using optimized document fetching.
  * Only used if aggregation queries fail.
  */
-function get_admin_stats_counts_fallback(array $collections): array {
+function get_admin_stats_counts_fallback(array $collections, ?string $startTime = null, ?string $endTime = null): array {
     $results = [];
     
     foreach ($collections as $collection) {
         try {
             // Get only status field to minimize data transfer
             $url = firestore_base_url() . ':runQuery';
-            $body = [
-                'structuredQuery' => [
-                    'from' => [['collectionId' => $collection]],
-                    'select' => [
-                        'fields' => [['fieldPath' => 'status']]
-                    ],
-                    'limit' => 500, // Reduced limit for faster response
-                ]
+            $structuredQuery = [
+                'from' => [['collectionId' => $collection]],
+                'select' => [
+                    'fields' => [['fieldPath' => 'status']]
+                ],
+                'limit' => 1000, 
             ];
-            
+
+            $filters = [];
+            if ($startTime) {
+                $filters[] = [
+                    'fieldFilter' => [
+                        'field' => ['fieldPath' => 'timestamp'],
+                        'op' => 'GREATER_THAN_OR_EQUAL',
+                        'value' => ['timestampValue' => $startTime]
+                    ]
+                ];
+            }
+            if ($endTime) {
+                $filters[] = [
+                    'fieldFilter' => [
+                        'field' => ['fieldPath' => 'timestamp'],
+                        'op' => 'LESS_THAN_OR_EQUAL',
+                        'value' => ['timestampValue' => $endTime]
+                    ]
+                ];
+            }
+
+            if (count($filters) === 1) {
+                $structuredQuery['where'] = $filters[0];
+            } elseif (count($filters) > 1) {
+                $structuredQuery['where'] = [
+                    'compositeFilter' => [
+                        'op' => 'AND',
+                        'filters' => $filters
+                    ]
+                ];
+            }
+
+            $body = ['structuredQuery' => $structuredQuery];
             $response = firestore_rest_request('POST', $url, $body);
             $total = 0;
             $approved = 0;
@@ -993,15 +1045,15 @@ function update_notification_for_report_status_async(string $docId, string $newS
  * Optimized admin stats with smart fallback strategy.
  * Tries aggregation API first, falls back to optimized counting.
  */
-function get_admin_stats_counts_optimized(array $collections): array {
+function get_admin_stats_counts_optimized(array $collections, ?string $startTime = null, ?string $endTime = null): array {
     try {
         // Try the new aggregation-based approach first
-        $results = get_admin_stats_counts_fast($collections);
+        $results = get_admin_stats_counts_fast($collections, $startTime, $endTime);
         
-        // Validate results - if any collection has 0 for all counts, it might be an API issue
+        // Validate results - if any collection has data, it's likely working
         $hasValidData = false;
         foreach ($results as $collection => $counts) {
-            if ($counts['total'] > 0 || $counts['approved'] > 0 || $counts['pending'] > 0) {
+            if ($counts['total'] > 0) {
                 $hasValidData = true;
                 break;
             }
@@ -1011,11 +1063,13 @@ function get_admin_stats_counts_optimized(array $collections): array {
             return $results;
         }
     } catch (Exception $e) {
-        error_log("Aggregation API failed, falling back to optimized approach: " . $e->getMessage());
+        if (DEBUG_MODE) {
+            error_log("Aggregation API failed for range ({$startTime} - {$endTime}): " . $e->getMessage());
+        }
     }
     
-    // Fallback to the optimized document-based approach
-    return get_admin_stats_counts_fallback($collections);
+    // Fallback to the document-based approach if aggregation fails or returns nothing
+    return get_admin_stats_counts_fallback($collections, $startTime, $endTime);
 }
 
 /**

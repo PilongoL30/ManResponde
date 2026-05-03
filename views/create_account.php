@@ -44,11 +44,28 @@
                 <label for="assignedBarangay" class="text-sm font-semibold text-slate-700">Assigned Barangay / Outpost</label>
                 <select id="assignedBarangay" name="assignedBarangay" class="mt-2 w-full border border-slate-300 rounded-lg px-3 py-2 text-sm">
                     <option value="">Select assigned area</option>
-                    <option value="Poblacion">Poblacion</option>
-                    <option value="Pangpang">Pangpang</option>
-                    <option value="Naguilayan">Naguilayan</option>
-                    <option value="Bocboc East">Bocboc East</option>
-                    <option value="Bocboc West">Bocboc West</option>
+                    <option value="Abanon">Abanon</option>
+                    <option value="Agdao">Agdao</option>
+                    <option value="Anando">Anando</option>
+                    <option value="Ano">Ano</option>
+                    <option value="Antipangol">Antipangol</option>
+                    <option value="Aponit">Aponit</option>
+                    <option value="Bacnar">Bacnar</option>
+                    <option value="Balaya">Balaya</option>
+                    <option value="Balayong">Balayong</option>
+                    <option value="Baldog">Baldog</option>
+                    <option value="Balite Sur">Balite Sur</option>
+                    <option value="Balococ">Balococ</option>
+                    <option value="Bani">Bani</option>
+                    <option value="Bega">Bega</option>
+                    <option value="Bocboc">Bocboc</option>
+                    <option value="Bogaoan">Bogaoan</option>
+                    <option value="Bolingit">Bolingit</option>
+                    <option value="Bolosan">Bolosan</option>
+                    <option value="Bonifacio">Bonifacio</option>
+                    <option value="Buenglat">Buenglat</option>
+                    <option value="Bugallon-Posadas">Bugallon-Posadas</option>
+                    <option value="Burgos-Padlan">Burgos-Padlan</option>
                     <option value="Barangay Outpost">Barangay Outpost</option>
                     <option value="Police Station">Police Station</option>
                 </select>

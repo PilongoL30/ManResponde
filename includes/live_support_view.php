@@ -61,6 +61,23 @@
                                 </div>
                             </div>
 
+                            <!-- Accept Request Area -->
+                            <div id="acceptRequestArea" class="p-6 border-t border-slate-200 bg-slate-50 hidden flex flex-col items-center justify-center text-center animate-fade-in">
+                                <div class="w-16 h-16 bg-sky-100 text-sky-600 rounded-full flex items-center justify-center mb-4">
+                                    <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"/>
+                                    </svg>
+                                </div>
+                                <h4 class="text-lg font-bold text-slate-800 mb-1">New Chat Request</h4>
+                                <p class="text-sm text-slate-500 mb-6 max-w-xs">A resident is requesting live assistance. Accept the request to start chatting.</p>
+                                <button id="acceptChatBtn" class="px-8 py-3 bg-sky-600 hover:bg-sky-700 text-white rounded-xl font-bold shadow-lg shadow-sky-200 transition-all transform hover:scale-105 active:scale-95 flex items-center gap-2">
+                                    <span>Accept Request</span>
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                                    </svg>
+                                </button>
+                            </div>
+
                             <!-- Input Area -->
                             <div id="messageInputArea" class="p-4 border-t border-slate-200 bg-white hidden">
                                 <form id="messageForm" class="flex items-end gap-2">
@@ -78,6 +95,27 @@
                                         </svg>
                                     </button>
                                 </form>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- End Chat Confirmation Modal -->
+                    <div id="endChatModal" class="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/40 backdrop-blur-sm hidden animate-fade-in">
+                        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 transform transition-all animate-scale-up">
+                            <div class="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                                <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                                </svg>
+                            </div>
+                            <h3 class="text-xl font-bold text-slate-800 text-center mb-2">End Chat Session?</h3>
+                            <p class="text-slate-500 text-center mb-6">This will close the conversation. You can no longer send messages to the resident after ending.</p>
+                            <div class="flex gap-3">
+                                <button onclick="closeEndChatModal()" class="flex-1 px-4 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-semibold hover:bg-slate-50 transition-colors">
+                                    Cancel
+                                </button>
+                                <button onclick="executeEndChat()" class="flex-1 px-4 py-2.5 rounded-xl bg-red-600 text-white font-semibold hover:bg-red-700 shadow-lg shadow-red-200 transition-all transform hover:scale-105 active:scale-95">
+                                    End Chat
+                                </button>
                             </div>
                         </div>
                     </div>

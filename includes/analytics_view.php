@@ -5,13 +5,19 @@
             <h1 class="text-2xl font-bold text-slate-800">Analytics Dashboard</h1>
             <p class="text-slate-500">Real-time insights and statistical reports</p>
         </div>
-        <div class="flex items-center gap-3">
-            <select id="analyticsTimeRange" class="form-select text-sm border-slate-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500">
+        <div class="flex flex-col md:flex-row items-center gap-3">
+            <div id="customDateRange" class="hidden flex items-center gap-2 animate-fade-in">
+                <input type="date" id="analyticsStartDate" class="text-sm border-slate-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500" value="<?php echo date('Y-m-d', strtotime('-30 days')); ?>">
+                <span class="text-slate-400 text-xs font-medium uppercase">to</span>
+                <input type="date" id="analyticsEndDate" class="text-sm border-slate-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500" value="<?php echo date('Y-m-d'); ?>">
+            </div>
+            <select id="analyticsTimeRange" class="form-select text-sm border-slate-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500 min-w-[140px]">
                 <option value="today">Today</option>
                 <option value="week" selected>This Week</option>
                 <option value="month">This Month</option>
                 <option value="year">This Year</option>
                 <option value="all">All Reports</option>
+                <option value="custom">Custom Range</option>
             </select>
         </div>
     </div>
@@ -112,17 +118,6 @@
             <h3 class="text-lg font-bold text-slate-800 mb-4">Response Time Analysis</h3>
             <div class="relative h-64 w-full">
                 <canvas id="responseTimeChart"></canvas>
-            </div>
-        </div>
-
-        <!-- Heatmap Placeholder (Future) -->
-        <div class="glass-card p-6">
-            <h3 class="text-lg font-bold text-slate-800 mb-4">Incident Heatmap</h3>
-            <div class="relative h-64 w-full bg-slate-100 rounded-lg flex items-center justify-center text-slate-400">
-                <div class="text-center">
-                    <?php echo svg_icon('map', 'w-12 h-12 mx-auto mb-2 opacity-50'); ?>
-                    <p>Geographic distribution visualization coming soon</p>
-                </div>
             </div>
         </div>
     </div>

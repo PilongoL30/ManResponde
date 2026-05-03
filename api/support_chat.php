@@ -134,9 +134,9 @@ if ($userRole === 'staff' && empty($staffCategories)) {
 
 try {
     if ($action === 'get_chats') {
-        // Fetch active chats using listDocuments to avoid index/ordering issues
-        // Reduced pageSize to 20 for performance
-        $url = firestore_base_url() . '/' . rawurlencode('support_chats') . '?pageSize=20';
+        // Fetch chats using listDocuments to ensure we see all documents 
+        // (even those missing the 'status' field which runQuery would skip)
+        $url = firestore_base_url() . '/' . rawurlencode('support_chats') . '?pageSize=100';
         $res = firestore_rest_request('GET', $url);
         
         $chats = [];
@@ -148,61 +148,45 @@ try {
                 $chats[] = $data;
             }
         }
-        
-        // Sort manually by timestamp or _created
+
+        // Sort in PHP (most recent first)
         usort($chats, function($a, $b) {
-            $t1 = $a['timestamp'] ?? $a['_created'] ?? '';
-            $t2 = $b['timestamp'] ?? $b['_created'] ?? '';
-            // Handle DateTime objects if present (though decode usually gives strings/timestamps)
-            if (is_object($t1) && method_exists($t1, 'format')) $t1 = $t1->format('c');
-            if (is_object($t2) && method_exists($t2, 'format')) $t2 = $t2->format('c');
-            return strcmp($t2, $t1); // Descending
+            $t1 = $a['lastMessageTimestamp'] ?? $a['timestamp'] ?? $a['_created'] ?? '';
+            $t2 = $b['lastMessageTimestamp'] ?? $b['timestamp'] ?? $b['_created'] ?? '';
+            return strcmp($t2, $t1);
         });
 
         $filteredChats = [];
-
         foreach ($chats as $chat) {
-            $chatUserId = $chat['_id']; // The document ID is the userId
+            $status = strtolower(trim((string)($chat['status'] ?? 'pending')));
+            if ($status === '') $status = 'pending';
             
-            // Use data directly from the chat document
-            // We DO NOT fetch user profile here to avoid N+1 performance issues
-            $userName = $chat['userName'] ?? 'Unknown User';
-            $userLocation = $chat['location'] ?? '';
-            $userBarangay = ''; 
-            
-            if (empty($userBarangay) && !empty($userLocation)) {
-                $userBarangay = $userLocation; // Assume location string contains barangay
+            // For general list, exclude ended chats older than 24 hours to keep it clean
+            if ($status === 'ended') {
+                $ts = $chat['lastMessageTimestamp'] ?? $chat['timestamp'] ?? $chat['_created'] ?? '';
+                if ($ts && (time() - strtotime($ts)) > 86400) continue;
             }
 
-            // Strict filtering logic for staff privacy and category routing
+            // Minimal filtering for staff (access control)
             if ($userRole === 'staff') {
-                $status = strtolower(trim((string)($chat['status'] ?? 'pending')));
                 $acceptedBy = (string)($chat['acceptedBy'] ?? '');
                 $isPending = in_array($status, ['pending', 'waiting'], true);
                 $isOwnedByCurrentStaff = ($acceptedBy !== '' && $acceptedBy === $currentUserId);
                 $chatCategory = extract_chat_category($chat);
 
-                // Privacy: active/ended chats must only be visible to the staff who accepted them.
+                if (!$isPending && !$isOwnedByCurrentStaff) continue;
                 if (!$isPending && !$isOwnedByCurrentStaff) {
-                    continue;
-                }
-
-                // For unaccepted chats, enforce category + barangay visibility rules.
-                if (!$isOwnedByCurrentStaff) {
-                    if (!staff_matches_chat_category($userRole, $staffCategories, $chatCategory)) {
-                        continue;
-                    }
-                    if (!staff_matches_chat_barangay($chat, $assignedBarangay, $chatCategory)) {
-                        continue;
-                    }
+                    if (!staff_matches_chat_category($userRole, $staffCategories, $chatCategory)) continue;
+                    if (!staff_matches_chat_barangay($chat, $assignedBarangay, $chatCategory)) continue;
                 }
             }
 
-            $chat['userName'] = $userName;
-            $chat['location'] = $userLocation;
-            if (empty($chat['id'])) {
-                $chat['id'] = $chat['_id'] ?? $chat['userId'] ?? $chat['user_id'] ?? '';
-            }
+            $chat['id'] = $chat['_id'];
+            $chat['status'] = $status;
+            $chat['userName'] = $chat['userName'] ?? 'Anonymous';
+            $chat['lastMessage'] = $chat['lastMessage'] ?? 'No messages yet';
+            $chat['lastMessageTime'] = $chat['lastMessageTimestamp'] ?? $chat['_created'] ?? '';
+            
             $filteredChats[] = $chat;
         }
 
@@ -276,10 +260,10 @@ try {
 
     } elseif ($action === 'send_message') {
         $chatId = $_POST['chat_id'] ?? '';
-        $text = $_POST['text'] ?? '';
+        $text = $_POST['message'] ?? ($_POST['text'] ?? '');
         
-        if (!$chatId || !$text) {
-            throw new Exception('Missing parameters');
+        if (!$chatId || $text === '') {
+            throw new Exception('Missing parameters: chatId or message');
         }
 
         // Staff can only send messages to chats they accepted.
@@ -357,50 +341,30 @@ try {
         $existingUserName = $currentChat['userName'] ?? '';
         $existingLocation = $currentChat['location'] ?? '';
 
-        // 2. Fetch user details to ensure they are in the chat document
+        // 2. Fetch user details ONLY if missing or unknown
         $userName = '';
         $userLocation = '';
         
-        try {
-            // The chat ID is the user ID in this system
-            $userProfile = get_user_details_cached($chatId);
-            
-            if (is_array($userProfile) && !empty($userProfile)) {
-                // Try multiple fields for name
-                $userName = $userProfile['fullName'] ?? $userProfile['name'] ?? $userProfile['displayName'] ?? '';
-                
-                // Try constructing from parts
-                if (empty($userName)) {
-                    $firstName = $userProfile['firstName'] ?? $userProfile['firstname'] ?? '';
-                    $lastName = $userProfile['lastName'] ?? $userProfile['lastname'] ?? '';
-                    if (!empty($firstName) || !empty($lastName)) {
-                        $userName = trim("$firstName $lastName");
+        if (empty($existingUserName) || $existingUserName === 'Unknown User' || empty($existingLocation)) {
+            try {
+                $userProfile = get_user_details_cached($chatId);
+                if (is_array($userProfile) && !empty($userProfile)) {
+                    $userName = $userProfile['fullName'] ?? $userProfile['name'] ?? $userProfile['displayName'] ?? '';
+                    if (empty($userName)) {
+                        $firstName = $userProfile['firstName'] ?? $userProfile['firstname'] ?? '';
+                        $lastName = $userProfile['lastName'] ?? $userProfile['lastname'] ?? '';
+                        if (!empty($firstName) || !empty($lastName)) $userName = trim("$firstName $lastName");
                     }
+                    $userLocation = $userProfile['address'] ?? $userProfile['location'] ?? $userProfile['currentAddress'] ?? $userProfile['permanentAddress'] ?? '';
                 }
-
-                // Try multiple fields for location/address
-                $userLocation = $userProfile['address'] ?? $userProfile['location'] ?? $userProfile['currentAddress'] ?? $userProfile['permanentAddress'] ?? '';
-            }
-        } catch (Exception $e) {
-            error_log("Error fetching user profile for chat $chatId: " . $e->getMessage());
+            } catch (Exception $e) {}
         }
 
-        // Fallback logic:
-        // 1. Use fetched profile name if available
-        // 2. Use existing chat name if available and not "Unknown User"
-        // 3. Default to "Unknown User"
-        
-        $finalUserName = 'Unknown User';
-        if (!empty($userName) && $userName !== 'Unknown User') {
-            $finalUserName = $userName;
-        } elseif (!empty($existingUserName) && $existingUserName !== 'Unknown User') {
-            $finalUserName = $existingUserName;
-        }
-
+        $finalUserName = (!empty($userName) && $userName !== 'Unknown User') ? $userName : (!empty($existingUserName) ? $existingUserName : 'Unknown User');
         $finalLocation = !empty($userLocation) ? $userLocation : $existingLocation;
         $finalCategory = $selectedCategory !== '' ? $selectedCategory : extract_chat_category($currentChat);
 
-        // Update chat status to active AND backfill user info
+        // Update chat status to active
         $updateData = [
             'status' => 'active',
             'acceptedBy' => $currentUserId,
@@ -412,56 +376,28 @@ try {
 
         if ($finalCategory !== '') {
             $updateData['chatCategory'] = $finalCategory;
-            if (empty($currentChat['relatedReportType'])) {
-                $updateData['relatedReportType'] = ucfirst($finalCategory);
-            }
+            if (empty($currentChat['relatedReportType'])) $updateData['relatedReportType'] = ucfirst($finalCategory);
         }
         
         $updateSuccess = false;
-
-        // Use fast update if available to speed up response
         if (function_exists('firestore_set_document_fast')) {
-            try {
-                $updateSuccess = firestore_set_document_fast('support_chats', $chatId, $updateData);
-                error_log("Fast update result for $chatId: " . ($updateSuccess ? 'Success' : 'Failed'));
-            } catch (Exception $e) {
-                error_log("Fast update exception for $chatId: " . $e->getMessage());
-            }
+            $updateSuccess = firestore_set_document_fast('support_chats', $chatId, $updateData);
         } 
         
-        // Fallback to standard update if fast update failed or not available
         if (!$updateSuccess) {
-            error_log("Falling back to standard update for $chatId");
-            try {
-                firestore_set_document('support_chats', $chatId, $updateData);
-                $updateSuccess = true;
-            } catch (Exception $e) {
-                error_log("Standard update exception for $chatId: " . $e->getMessage());
-                throw $e; // Re-throw to be caught by main catch block
-            }
+            firestore_set_document('support_chats', $chatId, $updateData);
         }
         
-        // Send a system message indicating the chat has been accepted
-        // We do this AFTER the status update to ensure the chat is active
-        $msgData = [
-            'sender' => 'system',
-            'senderId' => 'system',
-            'senderName' => 'System',
-            'text' => 'Chat request accepted by ' . ($_SESSION['user_fullname'] ?? 'Staff'),
-            'timestamp' => new DateTime(),
-            'isAdmin' => true,
-            'isSystem' => true
-        ];
-        
+        // System message (done after status update)
         $msgUrl = firestore_base_url() . '/' . rawurlencode('support_chats') . '/' . rawurlencode($chatId) . '/' . rawurlencode('messages');
-        
-        // Use a shorter timeout for the system message to avoid blocking
         try {
+            $msgData = [
+                'sender' => 'system', 'senderId' => 'system', 'senderName' => 'System',
+                'text' => 'Chat request accepted by ' . ($_SESSION['user_fullname'] ?? 'Staff'),
+                'timestamp' => new DateTime(), 'isAdmin' => true, 'isSystem' => true
+            ];
             firestore_rest_request('POST', $msgUrl, ['fields' => firestore_encode_fields($msgData)]);
-        } catch (Exception $e) {
-            // Ignore message send failure, as long as status is updated
-            error_log("Failed to send system message for chat acceptance: " . $e->getMessage());
-        }
+        } catch (Exception $e) {}
         
         echo json_encode(['success' => true]);
     } elseif ($action === 'end_chat') {

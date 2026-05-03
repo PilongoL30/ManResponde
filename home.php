@@ -1170,5 +1170,6 @@
         }
     </script>
 
+    <script src="assets/js/instant-page.js" type="module"></script>
 </body>
 </html>

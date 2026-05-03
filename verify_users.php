@@ -12,6 +12,7 @@ ob_start(); // Start output buffering
 require_once __DIR__ . '/db_config.php';
 session_start();
 require_once __DIR__ . '/fcm_config.php';
+require_once __DIR__ . '/includes/helpers.php';
 
 // Check if user is logged in and is an admin
 if (!isset($_SESSION['user_id'])) {
@@ -25,16 +26,16 @@ $assignedBarangay = $_SESSION['assignedBarangay'] ?? '';
 
 // Fetch user profile to check categories
 $userProfile = firestore_get_doc_by_id('users', $_SESSION['user_id']);
-$categories = $userProfile['categories'] ?? [];
+$categories_list = $userProfile['categories'] ?? [];
 // Handle case where categories might be a string or array
-if (is_string($categories)) {
-    $categories = [$categories];
-} elseif (!is_array($categories)) {
-    $categories = [];
+if (is_string($categories_list)) {
+    $categories_list = [$categories_list];
+} elseif (!is_array($categories_list)) {
+    $categories_list = [];
 }
 // Convert all categories to lowercase for case-insensitive comparison
-$categories = array_map('strtolower', $categories);
-$isTanod = in_array('tanod', $categories);
+$categories_list = array_map('strtolower', $categories_list);
+$isTanod = in_array('tanod', $categories_list);
 
 // Allow admin or tanod to access
 if (!$isAdmin && !$isTanod) {
@@ -88,6 +89,86 @@ function sendApprovalNotification($userId) {
         return false;
     }
 }
+
+/**
+ * Optimized fetching of pending users using REST API for better performance
+ */
+function get_initial_pending_users($isAdmin, $isTanod, $assignedBarangay) {
+    try {
+        $url = firestore_base_url() . ':runQuery';
+        $body = [
+            'structuredQuery' => [
+                'from' => [['collectionId' => 'users']],
+                'where' => [
+                    'compositeFilter' => [
+                        'op' => 'OR',
+                        'filters' => [
+                            [
+                                'fieldFilter' => [
+                                    'field' => ['fieldPath' => 'accountStatus'],
+                                    'op' => 'EQUAL',
+                                    'value' => firestore_encode_value('pending')
+                                ]
+                            ],
+                            [
+                                'fieldFilter' => [
+                                    'field' => ['fieldPath' => 'status'],
+                                    'op' => 'EQUAL',
+                                    'value' => firestore_encode_value('pending')
+                                ]
+                            ]
+                        ]
+                    ]
+                ],
+                'orderBy' => [
+                    ['field' => ['fieldPath' => 'registrationDate'], 'direction' => 'DESCENDING']
+                ],
+                'limit' => 100
+            ]
+        ];
+        
+        $response = firestore_rest_request('POST', $url, $body);
+        $users = [];
+        
+        if (is_array($response)) {
+            foreach ($response as $row) {
+                if (!isset($row['document'])) continue;
+                $doc = $row['document'];
+                $userData = firestore_decode_fields($doc['fields'] ?? []);
+                $id = basename($doc['name'] ?? '');
+                
+                // Filter by barangay for Tanods
+                if ($isTanod && !$isAdmin) {
+                    $staffBarangay = strtolower(trim((string)$assignedBarangay));
+                    $userBarangay = strtolower(trim((string)($userData['currentBarangay'] ?? $userData['barangay'] ?? '')));
+                    if ($userBarangay !== $staffBarangay && strpos(strtolower($userData['address'] ?? ''), $staffBarangay) === false) {
+                        continue;
+                    }
+                }
+                
+                $users[] = [
+                    'id' => $id,
+                    'data' => $userData
+                ];
+            }
+        }
+        return $users;
+    } catch (Exception $e) {
+        error_log("Error pre-loading pending users: " . $e->getMessage());
+        return [];
+    }
+}
+
+$initialPendingUsers = get_initial_pending_users($isAdmin, $isTanod, $assignedBarangay);
+
+$categories = [
+    'ambulance' => ['label' => 'Ambulance', 'collection' => 'ambulance_reports', 'icon' => 'truck', 'color' => 'blue'],
+    'police'    => ['label' => 'Police',    'collection' => 'police_reports',    'icon' => 'user-shield', 'color' => 'slate'],
+    'tanod'     => ['label' => 'Tanod',     'collection' => 'tanod_reports',     'icon' => 'shield-check', 'color' => 'sky'],
+    'fire'      => ['label' => 'Fire',      'collection' => 'fire_reports',      'icon' => 'fire', 'color' => 'red'],
+    'flood'     => ['label' => 'Flood',     'collection' => 'flood_reports',     'icon' => 'home', 'color' => 'indigo'],
+    'other'     => ['label' => 'Other',     'collection' => 'other_reports',     'icon' => 'question-mark-circle', 'color' => 'gray'],
+];
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -96,8 +177,11 @@ function sendApprovalNotification($userId) {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>User Registration Verification</title>
   <link rel="icon" href="responde.png" type="image/png">
+  <?php echo csrf_meta(); ?>
   <!-- Tailwind CSS for styling -->
   <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="assets/css/custom.css?v=<?php echo filemtime(__DIR__ . '/assets/css/custom.css'); ?>">
+    <script src="assets/js/common-modals.js?v=<?php echo filemtime(__DIR__ . '/assets/js/common-modals.js'); ?>"></script>
   <style>
     /* Custom animations and styles */
     @keyframes fade-in-up {
@@ -252,6 +336,28 @@ function sendApprovalNotification($userId) {
       background: linear-gradient(to bottom, #10b981, #34d399);
       border-radius: 99px;
     }
+    
+    /* Export Modal Button Colors - Ensure they show correctly */
+    .btn-primary { 
+      background: linear-gradient(135deg, #2563eb, #3b82f6) !important; 
+      color: white !important; 
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2) !important;
+    }
+    .btn-view { 
+      background: linear-gradient(135deg, #fbbf24, #f59e0b) !important; 
+      color: white !important; 
+      box-shadow: 0 4px 12px rgba(245, 158, 11, 0.2) !important;
+    }
+    .btn-success {
+      background: linear-gradient(135deg, #10b981, #34d399) !important;
+      color: white !important;
+      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2) !important;
+    }
+    .btn-danger {
+      background: linear-gradient(135deg, #ef4444, #f87171) !important;
+      color: white !important;
+      box-shadow: 0 4px 12px rgba(239, 68, 68, 0.2) !important;
+    }
   </style>
 </head>
 <body class="antialiased bg-slate-50 font-sans text-slate-800">
@@ -264,49 +370,36 @@ function sendApprovalNotification($userId) {
       </div>
       <nav class="flex-1 px-2 py-4 space-y-1.5">
         <a href="dashboard.php?view=dashboard" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
-          </svg>
+          <?php echo svg_icon('dashboard', 'w-5 h-5'); ?>
           <span>Dashboard</span>
         </a>
 
-        <a href="dashboard.php?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
-          </svg>
+        <a href="analytics.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+          <?php echo svg_icon('chart-pie', 'w-5 h-5'); ?>
           <span>Analytics</span>
         </a>
 
-        <a href="dashboard.php?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
-          </svg>
+        <a href="interactive_map.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+          <?php echo svg_icon('map', 'w-5 h-5'); ?>
           <span>Interactive Map</span>
         </a>
 
-        <a href="dashboard.php?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z" />
-          </svg>
+        <a href="live_support.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+          <?php echo svg_icon('chat', 'w-5 h-5'); ?>
           <span>Live Support</span>
           <span id="liveSupportBadge" class="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
         </a>
 
         <?php if ($isAdmin): ?>
-        <a href="dashboard.php?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M19 7.5v3m0 0v3m0-3h3m-3 0h-3m-2.25-4.125a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zM4 19.235v-.11a6.375 6.375 0 0112.75 0v.109A12.318 12.318 0 0110.374 21c-2.331 0-4.512-.645-6.374-1.766z" />
-          </svg>
+        <a href="create_account.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+          <?php echo svg_icon('user-plus', 'w-5 h-5'); ?>
           <span>Create Account</span>
         </a>
         <?php endif; ?>
         
         <?php if ($isAdmin || $isTanod): ?>
         <a href="verify_users.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-sky-100 text-sky-700 font-semibold">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
+          <?php echo svg_icon('user-check', 'w-5 h-5'); ?>
           <span>Verify Users</span>
           <span id="verifyUsersBadge" class="ml-auto bg-amber-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
         </a>
@@ -314,9 +407,7 @@ function sendApprovalNotification($userId) {
         
         <?php if ($isAdmin): ?>
         <button onclick="showExportModal()" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600 w-full text-left">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
-          </svg>
+          <?php echo svg_icon('download', 'w-5 h-5'); ?>
           <span>Export Reports</span>
         </button>
         <?php endif; ?>
@@ -332,9 +423,7 @@ function sendApprovalNotification($userId) {
           </div>
         </div>
         <a href="logout.php" class="flex items-center justify-center gap-2 rounded-lg bg-slate-100 text-slate-700 hover:bg-slate-200 w-full px-4 py-2.5 text-sm font-semibold">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75" />
-          </svg>
+          <?php echo svg_icon('logout', 'w-5 h-5'); ?>
           <span>Logout</span>
         </a>
       </div>
@@ -364,49 +453,36 @@ function sendApprovalNotification($userId) {
           </div>
           <nav class="flex-1 px-4 py-4 space-y-1.5 overflow-y-auto">
             <a href="dashboard.php?view=dashboard" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
-              </svg>
+              <?php echo svg_icon('dashboard', 'w-5 h-5'); ?>
               <span>Dashboard</span>
             </a>
 
-            <a href="dashboard.php?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
-              </svg>
+            <a href="analytics.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+              <?php echo svg_icon('chart-pie', 'w-5 h-5'); ?>
               <span>Analytics</span>
             </a>
 
-            <a href="dashboard.php?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
-              </svg>
+            <a href="interactive_map.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+              <?php echo svg_icon('map', 'w-5 h-5'); ?>
               <span>Interactive Map</span>
             </a>
 
-            <a href="dashboard.php?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z" />
-              </svg>
+            <a href="live_support.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+              <?php echo svg_icon('chat', 'w-5 h-5'); ?>
               <span>Live Support</span>
               <span id="liveSupportBadgeMobile" class="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
             </a>
             
             <?php if ($isAdmin): ?>
-            <a href="dashboard.php?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M19 7.5v3m0 0v3m0-3h3m-3 0h-3m-2.25-4.125a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zM4 19.235v-.11a6.375 6.375 0 0112.75 0v.109A12.318 12.318 0 0110.374 21c-2.331 0-4.512-.645-6.374-1.766z" />
-              </svg>
+            <a href="create_account.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600">
+              <?php echo svg_icon('user-plus', 'w-5 h-5'); ?>
               <span>Create Account</span>
             </a>
             <?php endif; ?>
             
             <?php if ($isAdmin || $isTanod): ?>
             <a href="verify_users.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-sky-100 text-sky-700 font-semibold">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
+              <?php echo svg_icon('user-check', 'w-5 h-5'); ?>
               <span>Verify Users</span>
               <span id="verifyUsersBadgeMobile" class="ml-auto bg-amber-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
             </a>
@@ -414,18 +490,14 @@ function sendApprovalNotification($userId) {
             
             <?php if ($isAdmin): ?>
             <button onclick="showExportModal(); closeMobileSidebar();" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600 w-full text-left">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
-              </svg>
+              <?php echo svg_icon('download', 'w-5 h-5'); ?>
               <span>Export Reports</span>
             </button>
             <?php endif; ?>
             
             <div class="border-t border-slate-200 pt-4 mt-4">
               <a href="logout.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-600 hover:bg-slate-50">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75" />
-                </svg>
+                <?php echo svg_icon('logout', 'w-5 h-5'); ?>
                 <span>Logout</span>
               </a>
             </div>
@@ -647,18 +719,19 @@ service firebase.storage {
       });
     }
     
+    window.INITIAL_PENDING_USERS = <?php echo json_encode($initialPendingUsers); ?>;
+
     // Close mobile sidebar function
     function closeMobileSidebar() {
+      const mobileMenuOverlay = document.getElementById('mobileMenuOverlay');
       if (mobileMenuOverlay) {
         mobileMenuOverlay.classList.add('hidden');
       }
     }
-    
-    // Show export modal function (redirects to export page)
-    function showExportModal() {
-      window.location.href = 'export_reports.php';
-    }
   </script>
+
+  <?php if ($isAdmin) include __DIR__ . '/includes/modals_dashboard.php'; ?>
+  <script src="assets/js/common-modals.js?v=<?php echo filemtime(__DIR__ . '/assets/js/common-modals.js'); ?>"></script>
   
 
 
@@ -1540,23 +1613,31 @@ service firebase.storage {
       }
     });
 
-    // Load initial pending users (Fast Mode - Non-blocking)
+    // Load initial pending users (Instant Mode)
     async function loadPending() {
-      console.log('Starting to load pending users (Fast Mode)...');
-      const processedIds = new Set();
+      console.log('Loading initial pending users...');
+      
+      // 1. Process pre-loaded users immediately
+      if (window.INITIAL_PENDING_USERS && Array.isArray(window.INITIAL_PENDING_USERS)) {
+          console.log(`Found ${window.INITIAL_PENDING_USERS.length} pre-loaded users`);
+          window.INITIAL_PENDING_USERS.forEach(u => {
+              upsertCard(normalizeUser(u.id, u.data));
+          });
+          updateEmpty();
+          updatePendingCount();
+      }
+
+      const processedIds = new Set(Array.isArray(window.INITIAL_PENDING_USERS) ? window.INITIAL_PENDING_USERS.map(u => u.id) : []);
       
       // Function to process any snapshot immediately
       const processResult = (snap, sourceName) => {
-          console.log(`Source [${sourceName}] returned ${snap.size} docs`);
           if (snap.empty) return;
           
           let newFound = 0;
           snap.forEach(docSnap => {
               const id = docSnap.id;
-              // Avoid duplicates
               if (!processedIds.has(id)) {
                   const data = docSnap.data();
-                  // Client-side verification of status to be safe
                   const status = (data.accountStatus ?? data.status ?? data.Status ?? data.AccountStatus ?? 'pending').toLowerCase();
                   
                   if (status === 'pending') {
@@ -1573,42 +1654,25 @@ service firebase.storage {
           }
       };
 
-      // Define queries - Fire multiple strategies at once
-      const queries = [
-          // Strategy 1: Direct status query (Fastest if indexed)
-          { name: 'status=pending', q: query(collection(db, 'users'), where('status', '==', 'pending'), limit(50)) },
-          
-          // Strategy 2: Alternative field name
-          { name: 'accountStatus=pending', q: query(collection(db, 'users'), where('accountStatus', '==', 'pending'), limit(50)) },
-          
-          // Strategy 3: Newest users first (Uses auto-created index on registrationDate)
-          // This is crucial for finding recently registered users if the status index is missing
-          { name: 'newest_by_reg', q: query(collection(db, 'users'), orderBy('registrationDate', 'desc'), limit(100)) },
+      // 2. Fetch any extra users that might have been missed (Optimization: reduced queries)
+      const qPending = query(
+          collection(db, 'users'), 
+          where('status', '==', 'pending'), 
+          orderBy('registrationDate', 'desc'), 
+          limit(50)
+      );
 
-          // Strategy 4: Newest users by createdAt (Alternative timestamp field)
-          { name: 'newest_by_created', q: query(collection(db, 'users'), orderBy('createdAt', 'desc'), limit(100)) },
-          
-          // Strategy 5: Fallback - Get a larger chunk of users (by ID) and filter client-side
-          { name: 'latest_users_fallback', q: query(collection(db, 'users'), limit(500)) }
-      ];
-
-      // Execute all independently - don't wait for one to block the others
-      queries.forEach(({ name, q }) => {
-          getDocs(q)
-            .then(snap => processResult(snap, name))
-            .catch(err => {
-                console.warn(`Query [${name}] failed (likely missing index):`, err);
-            });
-      });
+      getDocs(qPending)
+        .then(snap => processResult(snap, 'extra_pending'))
+        .catch(err => {
+            console.warn(`Initial fetch failed (likely missing index):`, err);
+            // Fallback: search-like query
+            getDocs(query(collection(db, 'users'), limit(100)))
+                .then(snap => processResult(snap, 'fallback_limit'));
+        });
       
-      // Safety timeout: If nothing loads in 10 seconds, remove the spinner so user isn't stuck
-      setTimeout(() => {
-          const loadingEl = document.getElementById('vuLoading');
-          if (loadingEl) {
-             console.log('Safety timeout reached. Checking if any users found...');
-             updateEmpty(); // This will show "All Caught Up" if no cards found yet
-          }
-      }, 10000);
+      // Safety: always ensure spinner is gone
+      setTimeout(updateEmpty, 2000);
     }
 
     // Setup real-time listener for all users (filter client-side)
@@ -1657,5 +1721,6 @@ service firebase.storage {
     loadPending();
 
   </script>
+    <?php if ($isAdmin) include __DIR__ . '/includes/modals_dashboard.php'; ?>
 </body>
 </html>

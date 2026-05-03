@@ -19,21 +19,57 @@ $categories = [
 ];
 
 /**
- * Get all reports from a collection
+ * Get all reports from a collection with optional date filtering
  */
-function get_all_reports(string $collection): array {
+function get_all_reports(string $collection, ?string $startDate = null, ?string $endDate = null): array {
     try {
         $url = firestore_base_url() . ':runQuery';
-        $body = [
-            'structuredQuery' => [
-                'from' => [['collectionId' => $collection]],
-                'orderBy' => [[
+        
+        $filters = [];
+        
+        if ($startDate) {
+            $filters[] = [
+                'fieldFilter' => [
                     'field' => ['fieldPath' => 'timestamp'],
-                    'direction' => 'DESCENDING',
-                ]],
-                'limit' => 1000, // Get up to 1000 reports
-            ]
+                    'op' => 'GREATER_THAN_OR_EQUAL',
+                    'value' => ['timestampValue' => $startDate . 'T00:00:00Z']
+                ]
+            ];
+        }
+        
+        if ($endDate) {
+            $filters[] = [
+                'fieldFilter' => [
+                    'field' => ['fieldPath' => 'timestamp'],
+                    'op' => 'LESS_THAN_OR_EQUAL',
+                    'value' => ['timestampValue' => $endDate . 'T23:59:59Z']
+                ]
+            ];
+        }
+
+        $structuredQuery = [
+            'from' => [['collectionId' => $collection]],
+            'orderBy' => [[
+                'field' => ['fieldPath' => 'timestamp'],
+                'direction' => 'DESCENDING',
+            ]],
+            'limit' => 2000,
         ];
+
+        if (!empty($filters)) {
+            if (count($filters) === 1) {
+                $structuredQuery['where'] = $filters[0];
+            } else {
+                $structuredQuery['where'] = [
+                    'compositeFilter' => [
+                        'op' => 'AND',
+                        'filters' => $filters
+                    ]
+                ];
+            }
+        }
+
+        $body = ['structuredQuery' => $structuredQuery];
         
         $response = firestore_rest_request('POST', $url, $body);
         $reports = [];
@@ -269,8 +305,25 @@ function export_to_pdf(array $allReports, array $categories): void {
 }
 
 // Handle the export request
-$format = $_GET['format'] ?? 'excel';
-$category = $_GET['category'] ?? 'all';
+$format    = $_GET['format'] ?? 'excel';
+$category  = $_GET['category'] ?? 'all';
+$range     = $_GET['range'] ?? 'all';
+$startDate = $_GET['startDate'] ?? null;
+$endDate   = $_GET['endDate'] ?? null;
+
+// Calculate dates based on range if not custom
+if ($range !== 'custom' && $range !== 'all') {
+    $endDate = date('Y-m-d');
+    if ($range === 'today') {
+        $startDate = date('Y-m-d');
+    } elseif ($range === 'week') {
+        $startDate = date('Y-m-d', strtotime('-7 days'));
+    } elseif ($range === 'month') {
+        $startDate = date('Y-m-d', strtotime('-30 days'));
+    } elseif ($range === 'year') {
+        $startDate = date('Y-m-d', strtotime('-365 days'));
+    }
+}
 
 // Validate format
 if (!in_array($format, ['excel', 'pdf'])) {
@@ -284,7 +337,7 @@ $allReports = [];
 if ($category === 'all') {
     // Get all categories
     foreach ($categories as $slug => $meta) {
-        $reports = get_all_reports($meta['collection']);
+        $reports = get_all_reports($meta['collection'], $startDate, $endDate);
         if (!empty($reports)) {
             $allReports[$slug] = $reports;
         }
@@ -292,7 +345,7 @@ if ($category === 'all') {
 } else {
     // Get specific category
     if (isset($categories[$category])) {
-        $reports = get_all_reports($categories[$category]['collection']);
+        $reports = get_all_reports($categories[$category]['collection'], $startDate, $endDate);
         if (!empty($reports)) {
             $allReports[$category] = $reports;
         }

@@ -1,1 +1,1 @@
-<?php include __DIR__ . '/../includes/map_view.php';
+<?php include __DIR__ . '/../includes/interactive_map_view.php';

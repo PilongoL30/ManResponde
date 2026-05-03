@@ -1,5709 +1,10 @@
-<?php
-ob_start(); // Start output buffering immediately to catch any stray output
-
-// Prevent browser caching of dashboard page to ensure latest JS/HTML
-header('Cache-Control: no-cache, no-store, must-revalidate');
-header('Pragma: no-cache');
-header('Expires: 0');
-
-$__reqStart = microtime(true);
-
-require_once __DIR__.'/db_config.php';
-
-// Session is already started in db_config.php via config.php
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
-
-// Defer notification/FCM systems; load only for actions that need them.
-
-// CSRF Protection for POST requests
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    // Skip CSRF for specific actions that come from external sources
-    $skipCsrf = ['firebase_webhook', 'external_api'];
-    $action = $_POST['api_action'] ?? $_GET['action'] ?? '';
-    
-    if (!in_array($action, $skipCsrf)) {
-        if (!csrf_verify_token()) {
-            http_response_code(403);
-            
-            // Log CSRF failure for debugging
-            if (DEBUG_MODE) {
-                error_log("CSRF validation failed for action: {$action}, token provided: " . (isset($_POST[CSRF_TOKEN_NAME]) ? 'yes' : 'no'));
-            }
-            
-            if (!empty($_POST['api_action']) || isset($_SERVER['HTTP_X_REQUESTED_WITH'])) {
-                // AJAX request
-                header('Content-Type: application/json');
-                echo json_encode([
-                    'success' => false,
-                    'error' => 'CSRF token validation failed. Please refresh the page and try again.',
-                    'action' => $action
-                ]);
-                exit;
-            } else {
-                // Regular form submission
-                die('CSRF token validation failed. Please go back and try again.');
-            }
-        }
-    }
-}
-
-if (defined('DEBUG_MODE') && DEBUG_MODE) {
-    $v = $_GET['view'] ?? 'dashboard';
-    $a = $_POST['api_action'] ?? ($_GET['action'] ?? '');
-    error_log('[perf] dashboard.php start view=' . $v . ' action=' . $a . ' sid=' . session_id());
-}
-
-// Using Kreait Firebase SDK exceptions
-use Kreait\Firebase\Exception\Auth\UserNotFound;
-use Kreait\Firebase\Exception\Auth\EmailExists;
-
-// --- HELPER FUNCTIONS ---
-/**
- * Lists the latest reports from a specific Firestore collection.
- *
- * @param string $collection The name of the Firestore collection.
- * @param int $limit The maximum number of documents to retrieve.
- * @param bool $useCache Whether to use caching (default: true).
- * @return array An array of report documents.
- */
-function list_latest_reports(string $collection, int $limit = 20, bool $useCache = true): array {
-    // Enforce maximum limit
-    $limit = min($limit, DEFAULT_PAGE_SIZE);
-    
-    // Try cache first
-    if ($useCache) {
-        $cacheKey = "reports_{$collection}_{$limit}";
-        $cached = cache_get($cacheKey, 30); // 30-second cache
-        if ($cached !== null) {
-            return $cached;
-        }
-    }
-    
-    $items = [];
-    if (function_exists('firestore_query_latest')) {
-        try {
-            $docs = firestore_query_latest($collection, $limit);
-            foreach ($docs as $d) {
-                $item = [
-                    'id'         => $d['_id'] ?? '',
-                    'fullName'   => $d['fullName'] ?? $d['reporterName'] ?? $d['name'] ?? '',
-                    'contact'    => $d['contact'] ?? $d['reporterContact'] ?? $d['phone'] ?? '',
-                    'location'   => $d['location'] ?? $d['address'] ?? '',
-                    'purpose'    => $d['purpose'] ?? $d['description'] ?? '',
-                    'status'     => $d['status'] ?? '',
-                    'priority'   => $d['priority'] ?? '',
-                    'imageUrl'   => $d['imageUrl'] ?? '',
-                    'timestamp'  => $d['timestamp'] ?? $d['createdAt'] ?? null,
-                    'reporterId' => $d['reporterId'] ?? $d['uid'] ?? '',
-                    '_created'   => $d['_created'] ?? null,
-                ];
-                $items[] = $item;
-            }
-        } catch (Throwable $e) {
-            if (DEBUG_MODE) {
-                error_log("Error in firestore_query_latest for {$collection}: " . $e->getMessage());
-            }
-        }
-    }
-    // Fallback to REST API if the specific function doesn't exist
-    if (count($items) < $limit) {
-        // Reduced from 200 to limit * 2 for better performance
-        $fetchLimit = min($limit * 2, 50);
-        $raw = rest_list_documents($collection, $fetchLimit);
-        foreach ($raw as $doc) {
-            if (!isset($doc['name'])) continue;
-            $parts = explode('/', $doc['name']);
-            $id = end($parts);
-            $fields = isset($doc['fields']) && function_exists('firestore_decode_fields')
-                ? firestore_decode_fields($doc['fields'])
-                : [];
-            $item = [
-                'id'         => $id,
-                'fullName'   => $fields['fullName'] ?? '',
-                'contact'    => $fields['contact'] ?? '',
-                'location'   => $fields['location'] ?? '',
-                'purpose'    => $fields['purpose'] ?? $fields['description'] ?? '',
-                'status'     => $fields['status'] ?? '',
-                'priority'   => $fields['priority'] ?? '',
-                'imageUrl'   => $fields['imageUrl'] ?? '',
-                'timestamp'  => $fields['timestamp'] ?? ($doc['createTime'] ?? null),
-                'reporterId' => $fields['reporterId'] ?? '',
-                '_created'   => $doc['createTime'] ?? null,
-            ];
-            $items[] = $item;
-        }
-        usort($items, function($a, $b) {
-            $ta = $a['timestamp'] ?? $a['_created'] ?? '';
-            $tb = $b['timestamp'] ?? $b['_created'] ?? '';
-            return strcmp((string)$tb, (string)$ta);
-        });
-        $seen = [];
-        $dedup = [];
-        foreach ($items as $it) {
-            if (isset($seen[$it['id']])) continue;
-            $seen[$it['id']] = true;
-            $dedup[] = $it;
-            if (count($dedup) >= $limit) break;
-        }
-        $items = $dedup;
-    }
-    
-    // Cache the results before returning
-    if ($useCache && !empty($items)) {
-        $cacheKey = "reports_{$collection}_{$limit}";
-        cache_set($cacheKey, $items, 30); // 30-second cache
-    }
-    
-    return $items;
-}
-
-/**
- * Fetches documents from a Firestore collection using a basic REST query.
- *
- * @param string $collection The collection ID.
- * @param int $pageSize The number of documents to return.
- * @return array
- */
-function rest_list_documents(string $collection, int $pageSize = 200): array {
-    if (!function_exists('firestore_rest_request') || !function_exists('firestore_base_url')) return [];
-    $url = firestore_base_url().'/'.rawurlencode($collection).'?pageSize='.$pageSize;
-    try {
-        $res = firestore_rest_request('GET', $url);
-        $docs = $res['documents'] ?? [];
-        return is_array($docs) ? $docs : [];
-    } catch (Throwable $e) { return []; }
-}
-
-/**
- * Fetches a user's profile document by their UID.
- *
- * @param string $uid The user ID.
- * @return array The user's profile data.
- */
-function get_user_profile(string $uid): array {
-    // Session-level cache (fastest)
-    if (session_status() !== PHP_SESSION_NONE) {
-        $k = '__user_profile_' . $uid;
-        $kt = $k . '_time';
-        if (isset($_SESSION[$k], $_SESSION[$kt]) && (time() - (int)$_SESSION[$kt]) < 300) {
-            return is_array($_SESSION[$k]) ? $_SESSION[$k] : [];
-        }
-    }
-
-    // File cache (fast across requests)
-    $cacheKey = 'user_profile_' . $uid;
-    $cached = cache_get($cacheKey, 300);
-    if (is_array($cached)) {
-        if (session_status() !== PHP_SESSION_NONE) {
-            $_SESSION[$k] = $cached;
-            $_SESSION[$kt] = time();
-        }
-        return $cached;
-    }
-
-    if (function_exists('firestore_get_doc_by_id')) {
-        try {
-            $data = firestore_get_doc_by_id('users', $uid) ?? [];
-            if (is_array($data)) {
-                cache_set($cacheKey, $data, 300);
-                if (session_status() !== PHP_SESSION_NONE) {
-                    $_SESSION[$k] = $data;
-                    $_SESSION[$kt] = time();
-                }
-            }
-            return $data;
-        } catch (Throwable $e) {}
-    }
-    global $firestore;
-    if ($firestore) {
-        try {
-            $snap = $firestore->collection('users')->document($uid)->snapshot();
-            $data = $snap->exists() ? ($snap->data() ?? []) : [];
-            if (is_array($data)) {
-                cache_set($cacheKey, $data, 300);
-                if (session_status() !== PHP_SESSION_NONE) {
-                    $_SESSION[$k] = $data;
-                    $_SESSION[$kt] = time();
-                }
-            }
-            return $data;
-        } catch (Throwable $e) {}
-    }
-    return [];
-}
-
-/**
- * Get user's full name by UID. Uses caching to avoid repeated lookups.
- */
-function get_user_name_by_id(string $uid): string {
-    if (empty($uid)) return '';
-    
-    // Check static cache first (within same request)
-    static $nameCache = [];
-    if (isset($nameCache[$uid])) {
-        return $nameCache[$uid];
-    }
-    
-    // Try to get from user profile
-    $profile = get_user_profile($uid);
-    $name = $profile['fullName'] ?? $profile['name'] ?? $profile['displayName'] ?? '';
-    
-    // Cache the result
-    $nameCache[$uid] = $name;
-    
-    return $name;
-}
-
-/**
- * Format ISO timestamp to human-readable format.
- * Example: "Dec 14, 2025, 10:30 PM"
- */
-function fmt_action_time($ts): string {
-    if (empty($ts)) return '';
-    
-    try {
-        // Handle ISO 8601 format
-        if (is_string($ts)) {
-            $dt = new DateTime($ts);
-        } elseif (is_array($ts) && isset($ts['_seconds'])) {
-            $dt = new DateTime('@' . $ts['_seconds']);
-        } elseif (is_array($ts) && isset($ts['seconds'])) {
-            $dt = new DateTime('@' . $ts['seconds']);
-        } else {
-            return '';
-        }
-        
-        // Set timezone to Asia/Manila (Philippines)
-        $dt->setTimezone(new DateTimeZone('Asia/Manila'));
-        
-        // Format: "Dec 14, 2025, 10:30 PM"
-        return $dt->format('M j, Y, g:i A');
-    } catch (Throwable $e) {
-        return '';
-    }
-}
-
-// --- SESSION & ROLE MANAGEMENT ---
-if (!isset($_SESSION['user_id'])) {
-                header('Location: login');
-    exit();
-}
-
-$userId   = $_SESSION['user_id'];
-$userRole = $_SESSION['user_role'] ?? 'staff';
-$userName = $_SESSION['user_fullname'] ?? 'User';
-$isAdmin  = ($userRole === 'admin');
-
-// Fetch user profile/categories (prefer session to keep navigation fast)
-$userCategories = $_SESSION['user_categories'] ?? [];
-if (!is_array($userCategories)) $userCategories = [];
-
-// Only fetch profile if we don't have categories in session
-$userProfile = ['categories' => $userCategories, 'assignedBarangay' => ($_SESSION['assignedBarangay'] ?? '')];
-if (empty($userCategories)) {
-    $userProfile = get_user_profile($userId);
-    $userCategories = $userProfile['categories'] ?? [];
-    if (is_array($userCategories)) {
-        $_SESSION['user_categories'] = $userCategories;
-    }
-}
-// Check if user has 'tanod' category (case-insensitive check)
-$isTanod = false;
-if (!empty($userCategories)) {
-    foreach ($userCategories as $cat) {
-        if (strtolower($cat) === 'tanod') {
-            $isTanod = true;
-            break;
-        }
-    }
-}
-
-// Determine current view
-$view = $_GET['view'] ?? 'dashboard';
-
-// Define allowed views based on role
-$allowedViews = ['dashboard', 'live-support', 'map', 'analytics'];
-if ($isAdmin) {
-    $allowedViews[] = 'create-account';
-    $allowedViews[] = 'verify-users';
-} elseif ($isTanod) {
-    $allowedViews[] = 'verify-users';
-}
-
-// Validate view
-if (!in_array($view, $allowedViews)) {
-    $view = 'dashboard';
-}
-
-// --- CATEGORY CONFIGURATION ---
-$categories = [
-    'ambulance' => ['label' => 'Ambulance', 'collection' => 'ambulance_reports', 'icon' => 'truck', 'color' => 'blue'],
-    'police'    => ['label' => 'Police',    'collection' => 'police_reports',    'icon' => 'user-shield', 'color' => 'slate'],
-    'tanod'     => ['label' => 'Tanod',     'collection' => 'tanod_reports',     'icon' => 'shield-check', 'color' => 'sky'],
-    'fire'      => ['label' => 'Fire',      'collection' => 'fire_reports',      'icon' => 'fire', 'color' => 'red'],
-    'flood'     => ['label' => 'Flood',     'collection' => 'flood_reports',     'icon' => 'home', 'color' => 'indigo'],
-    'other'     => ['label' => 'Other',     'collection' => 'other_reports',     'icon' => 'question-mark-circle', 'color' => 'gray'],
-];
-
-// --- LAZY FIRESTORE INITIALIZATION (optimized for performance) ---
-$firestore = null;
-// Don't initialize Firebase on every page load - only when needed via AJAX
-// This significantly improves page load times
-
-
-
-// Build the recent activity feed (server-side utility)
-function build_recent_feed(array $categories): array {
-    $recentFeed = [];
-    foreach ($categories as $slug => $meta) {
-        $items = list_latest_reports($meta['collection'], 5);
-        foreach ($items as $it) {
-            $recentFeed[] = [
-                'slug'       => $slug,
-                'label'      => $meta['label'],
-                'icon'       => $meta['icon'],
-                'color'      => $meta['color'],
-                'id'         => $it['id'] ?? '',
-                'fullName'   => $it['fullName'] ?? $it['reporterName'] ?? '',
-                'contact'    => $it['contact'] ?? $it['reporterContact'] ?? '',
-                'location'   => $it['location'] ?? '',
-                'purpose'    => $it['purpose'] ?? $it['description'] ?? '',
-                'reporterId' => $it['reporterId'] ?? '',
-                'imageUrl'   => $it['imageUrl'] ?? '',
-                'status'     => $it['status'] ?? 'Pending',
-                'priority'   => $it['priority'] ?? '',
-                'timestamp'  => $it['timestamp'] ?? ($it['_created'] ?? ''),
-            ];
-        }
-    }
-    // Sort by priority first (urgent reports first), then by timestamp (newest first)
-    usort($recentFeed, function($a, $b) {
-        $aUrgent = ($a['priority'] ?? '') === 'HIGH';
-        $bUrgent = ($b['priority'] ?? '') === 'HIGH';
-        
-        if ($aUrgent && !$bUrgent) return -1;
-        if (!$aUrgent && $bUrgent) return 1;
-        
-        // If both have same priority, sort by timestamp (newest first)
-        return strcmp((string)($b['timestamp'] ?? ''), (string)($a['timestamp'] ?? ''));
-    });
-    return array_slice($recentFeed, 0, 10);
-}
-
-// Build the full recent activity feed (for pagination)
-function build_recent_feed_all(array $categories, int $perCategoryLimit = 200): array {
-    $recent = [];
-    foreach ($categories as $slug => $meta) {
-        $items = list_latest_reports($meta['collection'], $perCategoryLimit);
-        foreach ($items as $it) {
-            $ts = $it['timestamp'] ?? ($it['_created'] ?? '');
-            $recent[] = [
-                'slug'       => $slug,
-                'label'      => $meta['label'],
-                'icon'       => $meta['icon'],
-                'iconSvg'    => svg_icon($meta['icon'], 'w-5 h-5'),
-                'color'      => $meta['color'],
-                'id'         => $it['id'] ?? '',
-                'fullName'   => $it['fullName'] ?? $it['reporterName'] ?? '',
-                'contact'    => $it['contact'] ?? $it['reporterContact'] ?? '',
-                'location'   => $it['location'] ?? '',
-                'purpose'    => $it['purpose'] ?? $it['description'] ?? '',
-                'reporterId' => $it['reporterId'] ?? '',
-                'imageUrl'   => $it['imageUrl'] ?? '',
-                'status'     => $it['status'] ?? 'Pending',
-                'priority'   => $it['priority'] ?? '',
-                'timestamp'  => $ts,
-                'tsDisplay'  => fmt_ts($ts),
-                'collection' => $meta['collection'],
-            ];
-        }
-    }
-    // Sort by priority first (urgent reports first), then by timestamp (newest first)
-    usort($recent, function($a, $b) {
-        $aUrgent = ($a['priority'] ?? '') === 'HIGH';
-        $bUrgent = ($b['priority'] ?? '') === 'HIGH';
-        
-        if ($aUrgent && !$bUrgent) return -1;
-        if (!$aUrgent && $bUrgent) return 1;
-        
-        // If both have same priority, sort by timestamp (newest first)
-        return strcmp((string)($b['timestamp'] ?? ''), (string)($a['timestamp'] ?? ''));
-    });
-    return $recent;
-}
-
-// Optimized recent feed builder with smart filtering
-function build_recent_feed_optimized(array $categories, string $categoryFilter, string $statusFilter, string $search, int $perCategoryLimit = 10): array {
-    $recent = [];
-    
-    // Determine which categories to fetch based on filter
-    $categoriesToFetch = [];
-    if ($categoryFilter === 'all') {
-        $categoriesToFetch = $categories;
-    } else {
-        $categoriesToFetch = isset($categories[$categoryFilter]) ? [$categoryFilter => $categories[$categoryFilter]] : [];
-    }
-    
-    // If no categories match, return empty
-    if (empty($categoriesToFetch)) {
-        return [];
-    }
-    
-    foreach ($categoriesToFetch as $slug => $meta) {
-        try {
-            // Use REST API directly for better performance
-            $items = get_recent_reports_optimized($meta['collection'], $perCategoryLimit, $statusFilter, $search);
-            
-            foreach ($items as $it) {
-                $ts = $it['timestamp'] ?? ($it['createdAt'] ?? ($it['_created'] ?? ''));
-                $recent[] = [
-                    'slug'         => $slug,
-                    'label'        => $meta['label'],
-                    'icon'         => $meta['icon'],
-                    'iconSvg'      => svg_icon($meta['icon'], 'w-5 h-5'),
-                    'color'        => $meta['color'],
-                    'id'           => $it['id'] ?? '',
-                    'fullName'     => $it['fullName'] ?? $it['reporterName'] ?? '',
-                    'contact'      => $it['contact'] ?? $it['reporterContact'] ?? '',
-                    'mobileNumber' => $it['mobileNumber'] ?? $it['contact'] ?? $it['reporterContact'] ?? '',
-                    'location'     => $it['location'] ?? '',
-                    'purpose'      => $it['purpose'] ?? $it['description'] ?? '',
-                    'reporterId'   => $it['reporterId'] ?? '',
-                    'imageUrl'     => $it['imageUrl'] ?? '',
-                    'status'       => $it['status'] ?? 'Pending',
-                    'priority'     => $it['priority'] ?? '',
-                    // Provide both legacy (lat/lng) and UI-expected (latitude/longitude) fields
-                    'lat'          => $it['latitude'] ?? ($it['coordinates']['latitude'] ?? null),
-                    'lng'          => $it['longitude'] ?? ($it['coordinates']['longitude'] ?? null),
-                    'latitude'     => $it['latitude'] ?? ($it['coordinates']['latitude'] ?? null),
-                    'longitude'    => $it['longitude'] ?? ($it['coordinates']['longitude'] ?? null),
-                    'timestamp'    => $ts,
-                    'tsDisplay'    => fmt_ts($ts),
-                    'collection'   => $meta['collection'],
-                ];
-            }
-        } catch (Exception $e) {
-            // Log error but continue with other categories
-            error_log("Error fetching from collection {$meta['collection']}: " . $e->getMessage());
-        }
-    }
-    
-    // Sort by priority first (urgent reports first), then by timestamp (newest first)
-    usort($recent, function($a, $b) {
-        $aUrgent = ($a['priority'] ?? '') === 'HIGH';
-        $bUrgent = ($b['priority'] ?? '') === 'HIGH';
-        
-        if ($aUrgent && !$bUrgent) return -1;
-        if (!$aUrgent && $bUrgent) return 1;
-        
-        // If both have same priority, sort by time (newest first)
-        $ta = $a['timestamp'] ?? ($a['createdAt'] ?? '');
-        $tb = $b['timestamp'] ?? ($b['createdAt'] ?? '');
-
-        $toEpoch = function($t): int {
-            if (is_array($t)) {
-                if (isset($t['_seconds']) && is_numeric($t['_seconds'])) return (int)$t['_seconds'];
-                if (isset($t['seconds']) && is_numeric($t['seconds'])) return (int)$t['seconds'];
-                return 0;
-            }
-            if (is_int($t)) return $t;
-            if (is_float($t)) return (int)$t;
-            if (is_string($t)) {
-                $s = strtotime($t);
-                return $s === false ? 0 : (int)$s;
-            }
-            return 0;
-        };
-
-        return $toEpoch($tb) <=> $toEpoch($ta);
-    });
-    
-    return $recent;
-}
-
-// Ultra-fast recent feed builder using parallel requests
-function build_recent_feed_ultra_fast(array $categories, string $categoryFilter, string $statusFilter, string $search, int $perCategoryLimit = 15): array {
-    $categoriesToFetch = [];
-    if ($categoryFilter === 'all') {
-        $categoriesToFetch = $categories;
-    } else {
-        $categoriesToFetch = isset($categories[$categoryFilter]) ? [$categoryFilter => $categories[$categoryFilter]] : [];
-    }
-    
-    if (empty($categoriesToFetch)) {
-        return [];
-    }
-    
-    // Use parallel curl for all category requests
-    $multiHandle = curl_multi_init();
-    $curlHandles = [];
-    $requestMap = [];
-    
-    foreach ($categoriesToFetch as $slug => $meta) {
-        $url = firestore_base_url() . ':runQuery';
-        $body = [
-            'structuredQuery' => [
-                'from' => [['collectionId' => $meta['collection']]],
-                'orderBy' => [[
-                    'field' => ['fieldPath' => 'timestamp'],
-                    'direction' => 'DESCENDING',
-                ]],
-                'limit' => $perCategoryLimit,
-            ]
-        ];
-        
-        // Add status filter if specified
-        if ($statusFilter !== 'all') {
-            $body['structuredQuery']['where'] = [
-                'fieldFilter' => [
-                    'field' => ['fieldPath' => 'status'],
-                    'op' => 'EQUAL',
-                    'value' => ['stringValue' => ucfirst($statusFilter)]
-                ]
-            ];
-        }
-        
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => json_encode($body),
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
-                'Authorization: Bearer ' . get_firebase_access_token()
-            ],
-            CURLOPT_TIMEOUT => 3 // Very short timeout for speed
-        ]);
-        
-        curl_multi_add_handle($multiHandle, $ch);
-        $curlHandles[] = $ch;
-        $requestMap[] = ['slug' => $slug, 'meta' => $meta];
-    }
-    
-    // Execute all requests in parallel
-    $running = null;
-    do {
-        curl_multi_exec($multiHandle, $running);
-        curl_multi_select($multiHandle);
-    } while ($running > 0);
-    
-    // Process all results
-    $recent = [];
-    foreach ($curlHandles as $idx => $ch) {
-        $response = curl_multi_getcontent($ch);
-        $slug = $requestMap[$idx]['slug'];
-        $meta = $requestMap[$idx]['meta'];
-        
-        try {
-            $data = json_decode($response, true);
-            if (is_array($data)) {
-                foreach ($data as $row) {
-                    if (!isset($row['document'])) continue;
-                    
-                    $doc = $row['document'];
-                    $docData = firestore_decode_fields($doc['fields'] ?? []);
-                    $name = $doc['name'] ?? '';
-                    $docId = $name ? basename($name) : '';
-                    
-                    // Apply search filter if specified
-                    if (!empty($search)) {
-                        $searchText = strtolower($search);
-                        $fullName = strtolower($docData['fullName'] ?? $docData['reporterName'] ?? '');
-                        $location = strtolower($docData['location'] ?? '');
-                        $purpose = strtolower($docData['purpose'] ?? $docData['description'] ?? '');
-                        
-                        if (strpos($fullName, $searchText) === false && 
-                            strpos($location, $searchText) === false && 
-                            strpos($purpose, $searchText) === false) {
-                            continue;
-                        }
-                    }
-                    
-                    $ts = $docData['timestamp'] ?? ($docData['_created'] ?? '');
-                    $recent[] = [
-                        'slug' => $slug,
-                        'label' => $meta['label'],
-                        'icon' => $meta['icon'],
-                        'iconSvg' => svg_icon($meta['icon'], 'w-5 h-5'),
-                        'color' => $meta['color'],
-                        'id' => $docId,
-                        'fullName' => $docData['fullName'] ?? $docData['reporterName'] ?? '',
-                        'contact' => $docData['contact'] ?? $docData['reporterContact'] ?? '',
-                        'mobileNumber' => $docData['mobileNumber'] ?? $docData['contact'] ?? $docData['reporterContact'] ?? '',
-                        'location' => $docData['location'] ?? '',
-                        'purpose' => $docData['purpose'] ?? $docData['description'] ?? '',
-                        'reporterId' => $docData['reporterId'] ?? '',
-                        'imageUrl' => $docData['imageUrl'] ?? '',
-                        'status' => $docData['status'] ?? 'Pending',
-                        'priority' => $docData['priority'] ?? '',
-                        'timestamp' => $ts,
-                        'tsDisplay' => fmt_ts($ts),
-                        'updatedBy' => $docData['updatedBy'] ?? '',
-                        'updatedAt' => $docData['updatedAt'] ?? '',
-                        'collection' => $meta['collection'],
-                    ];
-                }
-            }
-        } catch (Exception $e) {
-            error_log("Error processing recent feed for {$slug}: " . $e->getMessage());
-        }
-        
-        curl_multi_remove_handle($multiHandle, $ch);
-        curl_close($ch);
-    }
-    
-    curl_multi_close($multiHandle);
-    
-    // Sort by priority and timestamp
-    usort($recent, function($a, $b) {
-        $aUrgent = ($a['priority'] ?? '') === 'HIGH';
-        $bUrgent = ($b['priority'] ?? '') === 'HIGH';
-        
-        if ($aUrgent && !$bUrgent) return -1;
-        if (!$aUrgent && $bUrgent) return 1;
-        
-        return strcmp((string)($b['timestamp'] ?? ''), (string)($a['timestamp'] ?? ''));
-    });
-    
-    return $recent;
-}
-
-// Ultra-fast recent feed builder using parallel LIST documents (createTime-based).
-// This avoids timestamp index issues and is much faster under load.
-function build_recent_feed_ultra_fast_listdocs(array $categories, string $categoryFilter, string $statusFilter, string $search, int $perCategoryLimit = 15): array {
-    $categoriesToFetch = [];
-    if ($categoryFilter === 'all') {
-        $categoriesToFetch = $categories;
-    } else {
-        $categoriesToFetch = isset($categories[$categoryFilter]) ? [$categoryFilter => $categories[$categoryFilter]] : [];
-    }
-    if (empty($categoriesToFetch)) return [];
-
-    $searchNeedle = trim(strtolower((string)$search));
-    $statusNeedle = strtolower(trim((string)$statusFilter));
-
-    // Keep list small; this endpoint is called frequently.
-    $pageSize = (int)min(max($perCategoryLimit * 5, 40), 80);
-
-    $token = firestore_rest_token();
-    $base = firestore_base_url();
-
-    $toEpoch = function($t): int {
-        if (is_array($t)) {
-            if (isset($t['_seconds']) && is_numeric($t['_seconds'])) return (int)$t['_seconds'];
-            if (isset($t['seconds']) && is_numeric($t['seconds'])) return (int)$t['seconds'];
-            return 0;
-        }
-        if (is_int($t)) return $t;
-        if (is_float($t)) return (int)$t;
-        if (is_string($t) && $t !== '') {
-            $s = strtotime($t);
-            return $s === false ? 0 : (int)$s;
-        }
-        return 0;
-    };
-
-    $mh = curl_multi_init();
-    $handles = [];
-    $map = [];
-
-    foreach ($categoriesToFetch as $slug => $meta) {
-        $collection = $meta['collection'];
-        $url = $base . '/' . rawurlencode($collection) . '?pageSize=' . $pageSize;
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER => [
-                'Authorization: Bearer ' . $token,
-                'Accept: application/json',
-            ],
-            CURLOPT_TIMEOUT => 10,
-            CURLOPT_CONNECTTIMEOUT => 4,
-            CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
-            CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
-        ]);
-        curl_multi_add_handle($mh, $ch);
-        $handles[] = $ch;
-        $map[(int)$ch] = ['slug' => $slug, 'meta' => $meta, 'collection' => $collection];
-    }
-
-    $running = null;
-    do {
-        curl_multi_exec($mh, $running);
-        curl_multi_select($mh, 0.2);
-    } while ($running > 0);
-
-    $recent = [];
-    foreach ($handles as $ch) {
-        $info = $map[(int)$ch] ?? null;
-        $raw = curl_multi_getcontent($ch);
-        $http = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_multi_remove_handle($mh, $ch);
-        curl_close($ch);
-        if (!$info || $http < 200 || $http >= 300) {
-            continue;
-        }
-
-        $json = json_decode($raw ?: 'null', true);
-        $docs = is_array($json) ? ($json['documents'] ?? []) : [];
-        if (!is_array($docs)) continue;
-
-        foreach ($docs as $doc) {
-            if (!isset($doc['name'])) continue;
-            $docId = basename($doc['name']);
-            $fields = isset($doc['fields']) ? firestore_decode_fields($doc['fields']) : [];
-            if (!is_array($fields)) $fields = [];
-
-            // Local status filter (case-insensitive)
-            if ($statusNeedle !== 'all') {
-                $st = strtolower(trim((string)($fields['status'] ?? '')));
-                if ($st !== $statusNeedle) continue;
-            }
-
-            // Local search filter
-            if ($searchNeedle !== '') {
-                $searchableText = strtolower(
-                    ($fields['fullName'] ?? $fields['reporterName'] ?? '') . ' ' .
-                    ($fields['location'] ?? '') . ' ' .
-                    ($fields['purpose'] ?? $fields['description'] ?? '') . ' ' .
-                    ($fields['contact'] ?? $fields['reporterContact'] ?? '')
-                );
-                if (strpos($searchableText, $searchNeedle) === false) continue;
-            }
-
-            $ts = $fields['timestamp'] ?? ($fields['createdAt'] ?? ($doc['createTime'] ?? null));
-            
-            // Resolve approver/decliner/responder names from user IDs
-            $approvedById = $fields['approvedBy'] ?? $fields['updatedBy'] ?? '';
-            $declinedById = $fields['declinedBy'] ?? '';
-            $respondedById = $fields['respondedBy'] ?? '';
-            
-            // Get names - prefer stored name, fallback to lookup by ID
-            $approvedByName = $fields['approvedByName'] ?? '';
-            if (empty($approvedByName) && !empty($approvedById)) {
-                $approvedByName = get_user_name_by_id($approvedById);
-            }
-            
-            $declinedByName = $fields['declinedByName'] ?? '';
-            if (empty($declinedByName) && !empty($declinedById)) {
-                $declinedByName = get_user_name_by_id($declinedById);
-            }
-            
-            $respondedByName = $fields['respondedByName'] ?? '';
-            if (empty($respondedByName) && !empty($respondedById)) {
-                $respondedByName = get_user_name_by_id($respondedById);
-            }
-            
-            // For approved status, also check updatedBy as fallback
-            $status = strtolower($fields['status'] ?? '');
-            if ($status === 'approved' && empty($approvedByName)) {
-                $updatedById = $fields['updatedBy'] ?? '';
-                if (!empty($updatedById)) {
-                    $approvedByName = get_user_name_by_id($updatedById);
-                }
-            }
-            if ($status === 'declined' && empty($declinedByName)) {
-                $updatedById = $fields['updatedBy'] ?? '';
-                if (!empty($updatedById)) {
-                    $declinedByName = get_user_name_by_id($updatedById);
-                }
-            }
-            
-            $recent[] = [
-                'slug'         => $info['slug'],
-                'label'        => $info['meta']['label'],
-                'icon'         => $info['meta']['icon'],
-                'iconSvg'      => svg_icon($info['meta']['icon'], 'w-5 h-5'),
-                'color'        => $info['meta']['color'],
-                'id'           => $docId,
-                'fullName'     => $fields['fullName'] ?? $fields['reporterName'] ?? '',
-                'contact'      => $fields['contact'] ?? $fields['reporterContact'] ?? '',
-                'mobileNumber' => $fields['mobileNumber'] ?? $fields['contact'] ?? $fields['reporterContact'] ?? '',
-                'location'     => $fields['location'] ?? '',
-                'purpose'      => $fields['purpose'] ?? $fields['description'] ?? '',
-                'reporterId'   => $fields['reporterId'] ?? ($fields['uid'] ?? ''),
-                'imageUrl'     => $fields['imageUrl'] ?? '',
-                'status'       => $fields['status'] ?? 'Pending',
-                'priority'     => $fields['priority'] ?? '',
-                'lat'          => $fields['latitude'] ?? ($fields['coordinates']['latitude'] ?? null),
-                'lng'          => $fields['longitude'] ?? ($fields['coordinates']['longitude'] ?? null),
-                'latitude'     => $fields['latitude'] ?? ($fields['coordinates']['latitude'] ?? null),
-                'longitude'    => $fields['longitude'] ?? ($fields['coordinates']['longitude'] ?? null),
-                'timestamp'    => $ts,
-                'tsDisplay'    => fmt_ts($ts),
-                'updatedBy'    => $fields['updatedBy'] ?? '',
-                'updatedAt'    => fmt_action_time($fields['updatedAt'] ?? ''),
-                'approvedBy'   => $approvedById,
-                'approvedByName' => $approvedByName,
-                'approvedAt'   => fmt_action_time($fields['approvedAt'] ?? $fields['updatedAt'] ?? ''),
-                'declinedBy'   => $declinedById,
-                'declinedByName' => $declinedByName,
-                'declinedAt'   => fmt_action_time($fields['declinedAt'] ?? $fields['updatedAt'] ?? ''),
-                'respondedBy'  => $respondedById,
-                'respondedByName' => $respondedByName,
-                'respondedAt'  => fmt_action_time($fields['respondedAt'] ?? ''),
-                '_created'     => $doc['createTime'] ?? null,
-                'collection'   => $info['collection'],
-            ];
-        }
-    }
-
-    curl_multi_close($mh);
-
-    // Sort by priority then time (newest first)
-    usort($recent, function($a, $b) use ($toEpoch) {
-        $aUrgent = ($a['priority'] ?? '') === 'HIGH';
-        $bUrgent = ($b['priority'] ?? '') === 'HIGH';
-        if ($aUrgent && !$bUrgent) return -1;
-        if (!$aUrgent && $bUrgent) return 1;
-
-        $ta = $a['timestamp'] ?? ($a['_created'] ?? '');
-        $tb = $b['timestamp'] ?? ($b['_created'] ?? '');
-        return $toEpoch($tb) <=> $toEpoch($ta);
-    });
-
-    // Keep payload bounded
-    $max = min(max($perCategoryLimit * 8, 60), 180);
-    if (count($recent) > $max) {
-        $recent = array_slice($recent, 0, $max);
-    }
-
-    return $recent;
-}
-
-// Ultra-fast recent feed builder using parallel RunQuery (ORDERED).
-// This is reliable for "newest" because list-documents is not ordered.
-function build_recent_feed_ultra_fast_runquery(array $categories, string $categoryFilter, string $statusFilter, string $search, int $perCategoryLimit = 10): array {
-    $categoriesToFetch = [];
-    if ($categoryFilter === 'all') {
-        $categoriesToFetch = $categories;
-    } else {
-        $categoriesToFetch = isset($categories[$categoryFilter]) ? [$categoryFilter => $categories[$categoryFilter]] : [];
-    }
-    if (empty($categoriesToFetch)) return [];
-
-    $searchNeedle = trim(strtolower((string)$search));
-    $statusNeedle = strtolower(trim((string)$statusFilter));
-
-    $toEpoch = function($t): int {
-        if (is_array($t)) {
-            if (isset($t['_seconds']) && is_numeric($t['_seconds'])) return (int)$t['_seconds'];
-            if (isset($t['seconds']) && is_numeric($t['seconds'])) return (int)$t['seconds'];
-            return 0;
-        }
-        if (is_int($t)) return $t;
-        if (is_float($t)) return (int)$t;
-        if (is_string($t) && $t !== '') {
-            $s = strtotime($t);
-            return $s === false ? 0 : (int)$s;
-        }
-        return 0;
-    };
-
-    // Pull a slightly larger window so docs missing timestamp fields (which sort last)
-    // still have a chance to be included and backfilled.
-    $pageSize = (int)min(max($perCategoryLimit * 4, 35), 80);
-    $nullLimit = (int)min(max($perCategoryLimit * 2, 20), 60);
-
-    $token = firestore_rest_token();
-    $runQueryUrl = firestore_base_url() . ':runQuery';
-
-    $selectFields = [
-        ['fieldPath' => 'fullName'],
-        ['fieldPath' => 'reporterName'],
-        ['fieldPath' => 'contact'],
-        ['fieldPath' => 'reporterContact'],
-        ['fieldPath' => 'mobileNumber'],
-        ['fieldPath' => 'location'],
-        ['fieldPath' => 'purpose'],
-        ['fieldPath' => 'description'],
-        ['fieldPath' => 'status'],
-        ['fieldPath' => 'priority'],
-        ['fieldPath' => 'latitude'],
-        ['fieldPath' => 'longitude'],
-        ['fieldPath' => 'coordinates'],
-        ['fieldPath' => 'reporterId'],
-        ['fieldPath' => 'uid'],
-        ['fieldPath' => 'imageUrl'],
-        ['fieldPath' => 'timestamp'],
-        ['fieldPath' => 'createdAt'],
-        ['fieldPath' => 'updatedBy'],
-        ['fieldPath' => 'updatedAt'],
-        ['fieldPath' => 'approvedBy'],
-        ['fieldPath' => 'approvedByName'],
-        ['fieldPath' => 'approvedAt'],
-        ['fieldPath' => 'declinedBy'],
-        ['fieldPath' => 'declinedByName'],
-        ['fieldPath' => 'declinedAt'],
-        ['fieldPath' => 'respondedBy'],
-        ['fieldPath' => 'respondedByName'],
-        ['fieldPath' => 'respondedAt'],
-    ];
-
-    $mh = curl_multi_init();
-    $handles = [];
-
-    foreach ($categoriesToFetch as $slug => $meta) {
-        $collection = $meta['collection'];
-        foreach (['timestamp', 'createdAt'] as $orderField) {
-            $body = [
-                'structuredQuery' => [
-                    'from' => [['collectionId' => $collection]],
-                    'select' => ['fields' => $selectFields],
-                    'orderBy' => [[
-                        'field' => ['fieldPath' => $orderField],
-                        'direction' => 'DESCENDING',
-                    ]],
-                    'limit' => $pageSize,
-                ]
-            ];
-            $ch = curl_init();
-            curl_setopt_array($ch, [
-                CURLOPT_URL => $runQueryUrl,
-                CURLOPT_POST => true,
-                CURLOPT_POSTFIELDS => json_encode($body),
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_HTTPHEADER => [
-                    'Authorization: Bearer ' . $token,
-                    'Accept: application/json',
-                    'Content-Type: application/json',
-                ],
-                CURLOPT_TIMEOUT => 10,
-                CURLOPT_CONNECTTIMEOUT => 4,
-                CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
-                CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
-            ]);
-            curl_multi_add_handle($mh, $ch);
-            $handles[] = ['ch' => $ch, 'slug' => $slug, 'meta' => $meta, 'collection' => $collection];
-        }
-
-        // Surface docs created without timestamp fields (common root-cause for "new report not showing").
-        // We can't order by createTime, but IS_NULL queries keep this set small in practice.
-        foreach (['timestamp', 'createdAt'] as $nullField) {
-            $bodyNull = [
-                'structuredQuery' => [
-                    'from' => [['collectionId' => $collection]],
-                    'select' => ['fields' => $selectFields],
-                    'where' => [
-                        'unaryFilter' => [
-                            'op' => 'IS_NULL',
-                            'field' => ['fieldPath' => $nullField],
-                        ]
-                    ],
-                    'limit' => $nullLimit,
-                ]
-            ];
-
-            $ch = curl_init();
-            curl_setopt_array($ch, [
-                CURLOPT_URL => $runQueryUrl,
-                CURLOPT_POST => true,
-                CURLOPT_POSTFIELDS => json_encode($bodyNull),
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_HTTPHEADER => [
-                    'Authorization: Bearer ' . $token,
-                    'Accept: application/json',
-                    'Content-Type: application/json',
-                ],
-                CURLOPT_TIMEOUT => 10,
-                CURLOPT_CONNECTTIMEOUT => 4,
-                CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
-                CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
-            ]);
-            curl_multi_add_handle($mh, $ch);
-            $handles[] = ['ch' => $ch, 'slug' => $slug, 'meta' => $meta, 'collection' => $collection];
-        }
-    }
-
-    $running = null;
-    do {
-        curl_multi_exec($mh, $running);
-        curl_multi_select($mh, 0.2);
-    } while ($running > 0);
-
-    $recentByKey = [];
-    $backfills = [];
-
-    foreach ($handles as $h) {
-        $ch = $h['ch'];
-        $raw = curl_multi_getcontent($ch);
-        $http = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_multi_remove_handle($mh, $ch);
-        curl_close($ch);
-        if ($http < 200 || $http >= 300) continue;
-
-        $rows = json_decode($raw ?: 'null', true);
-        if (!is_array($rows)) continue;
-
-        foreach ($rows as $row) {
-            if (!isset($row['document'])) continue;
-            $doc = $row['document'];
-            if (!isset($doc['name'])) continue;
-            $docId = basename($doc['name']);
-
-            $fields = isset($doc['fields']) ? firestore_decode_fields($doc['fields']) : [];
-            if (!is_array($fields)) $fields = [];
-
-            // Local status filter (case-insensitive)
-            if ($statusNeedle !== 'all') {
-                $st = strtolower(trim((string)($fields['status'] ?? '')));
-                if ($st !== $statusNeedle) continue;
-            }
-
-            // Local search filter
-            if ($searchNeedle !== '') {
-                $searchableText = strtolower(
-                    ($fields['fullName'] ?? $fields['reporterName'] ?? '') . ' ' .
-                    ($fields['location'] ?? '') . ' ' .
-                    ($fields['purpose'] ?? $fields['description'] ?? '') . ' ' .
-                    ($fields['contact'] ?? $fields['reporterContact'] ?? '')
-                );
-                if (strpos($searchableText, $searchNeedle) === false) continue;
-            }
-
-            $ts = $fields['timestamp'] ?? ($fields['createdAt'] ?? ($doc['createTime'] ?? null));
-            $epoch = $toEpoch($ts);
-            if ($epoch <= 0 && isset($doc['createTime'])) {
-                $epoch = $toEpoch($doc['createTime']);
-            }
-
-            // Collect candidates for backfilling missing timestamp fields using createTime.
-            if (isset($doc['createTime'])) {
-                $missingTs = !isset($fields['timestamp']) || $fields['timestamp'] === null || $fields['timestamp'] === '';
-                $missingCreated = !isset($fields['createdAt']) || $fields['createdAt'] === null || $fields['createdAt'] === '';
-                if ($missingTs || $missingCreated) {
-                    $backfills[] = [
-                        'collection' => $h['collection'],
-                        'id' => $docId,
-                        'createTime' => (string)$doc['createTime'],
-                        'epoch' => $toEpoch($doc['createTime']),
-                    ];
-                }
-            }
-
-            $key = $h['collection'] . ':' . $docId;
-            $existingEpoch = (int)($recentByKey[$key]['_epoch'] ?? 0);
-            if ($epoch <= $existingEpoch) {
-                continue;
-            }
-
-            // Resolve approver/decliner/responder names from user IDs
-            $approvedById = $fields['approvedBy'] ?? $fields['updatedBy'] ?? '';
-            $declinedById = $fields['declinedBy'] ?? '';
-            $respondedById = $fields['respondedBy'] ?? '';
-            
-            // Get names - prefer stored name, fallback to lookup by ID
-            $approvedByName = $fields['approvedByName'] ?? '';
-            if (empty($approvedByName) && !empty($approvedById)) {
-                $approvedByName = get_user_name_by_id($approvedById);
-            }
-            
-            $declinedByName = $fields['declinedByName'] ?? '';
-            if (empty($declinedByName) && !empty($declinedById)) {
-                $declinedByName = get_user_name_by_id($declinedById);
-            }
-            
-            $respondedByName = $fields['respondedByName'] ?? '';
-            if (empty($respondedByName) && !empty($respondedById)) {
-                $respondedByName = get_user_name_by_id($respondedById);
-            }
-            
-            // For approved status, also check updatedBy as fallback
-            $status = strtolower($fields['status'] ?? '');
-            if ($status === 'approved' && empty($approvedByName)) {
-                $updatedById = $fields['updatedBy'] ?? '';
-                if (!empty($updatedById)) {
-                    $approvedByName = get_user_name_by_id($updatedById);
-                }
-            }
-            if ($status === 'declined' && empty($declinedByName)) {
-                $updatedById = $fields['updatedBy'] ?? '';
-                if (!empty($updatedById)) {
-                    $declinedByName = get_user_name_by_id($updatedById);
-                }
-            }
-
-            $recentByKey[$key] = [
-                'slug'         => $h['slug'],
-                'label'        => $h['meta']['label'],
-                'icon'         => $h['meta']['icon'],
-                'iconSvg'      => svg_icon($h['meta']['icon'], 'w-5 h-5'),
-                'color'        => $h['meta']['color'],
-                'id'           => $docId,
-                'fullName'     => $fields['fullName'] ?? $fields['reporterName'] ?? '',
-                'contact'      => $fields['contact'] ?? $fields['reporterContact'] ?? '',
-                'mobileNumber' => $fields['mobileNumber'] ?? $fields['contact'] ?? $fields['reporterContact'] ?? '',
-                'location'     => $fields['location'] ?? '',
-                'purpose'      => $fields['purpose'] ?? $fields['description'] ?? '',
-                'reporterId'   => $fields['reporterId'] ?? ($fields['uid'] ?? ''),
-                'imageUrl'     => $fields['imageUrl'] ?? '',
-                'status'       => $fields['status'] ?? 'Pending',
-                'priority'     => $fields['priority'] ?? '',
-                'lat'          => $fields['latitude'] ?? ($fields['coordinates']['latitude'] ?? null),
-                'lng'          => $fields['longitude'] ?? ($fields['coordinates']['longitude'] ?? null),
-                'latitude'     => $fields['latitude'] ?? ($fields['coordinates']['latitude'] ?? null),
-                'longitude'    => $fields['longitude'] ?? ($fields['coordinates']['longitude'] ?? null),
-                'timestamp'    => $ts,
-                'tsDisplay'    => fmt_ts($ts),
-                'updatedBy'    => $fields['updatedBy'] ?? '',
-                'updatedAt'    => fmt_action_time($fields['updatedAt'] ?? ''),
-                'approvedBy'   => $approvedById,
-                'approvedByName' => $approvedByName,
-                'approvedAt'   => fmt_action_time($fields['approvedAt'] ?? $fields['updatedAt'] ?? ''),
-                'declinedBy'   => $declinedById,
-                'declinedByName' => $declinedByName,
-                'declinedAt'   => fmt_action_time($fields['declinedAt'] ?? $fields['updatedAt'] ?? ''),
-                'respondedBy'  => $respondedById,
-                'respondedByName' => $respondedByName,
-                'respondedAt'  => fmt_action_time($fields['respondedAt'] ?? ''),
-                '_created'     => $doc['createTime'] ?? null,
-                '_epoch'       => $epoch,
-                'collection'   => $h['collection'],
-            ];
-        }
-    }
-
-    curl_multi_close($mh);
-
-    // Backfill only a handful of the newest missing-timestamp docs per request.
-    // This helps make ordered queries reliable without turning the feed into a repair job.
-    if (!empty($backfills)) {
-        usort($backfills, function($a, $b) {
-            return ((int)($b['epoch'] ?? 0)) <=> ((int)($a['epoch'] ?? 0));
-        });
-        $backfills = array_slice($backfills, 0, 6);
-
-        $seenBackfill = [];
-        foreach ($backfills as $bf) {
-            $k = ($bf['collection'] ?? '') . ':' . ($bf['id'] ?? '');
-            if (isset($seenBackfill[$k])) continue;
-            $seenBackfill[$k] = true;
-            try {
-                $dt = new DateTimeImmutable($bf['createTime']);
-                firestore_set_document($bf['collection'], $bf['id'], [
-                    'timestamp' => $dt,
-                    'createdAt' => $dt,
-                ]);
-            } catch (Throwable $e) {
-                // ignore backfill failures
-            }
-        }
-    }
-
-    $recent = array_values($recentByKey);
-
-    usort($recent, function($a, $b) {
-        $aUrgent = ($a['priority'] ?? '') === 'HIGH';
-        $bUrgent = ($b['priority'] ?? '') === 'HIGH';
-        if ($aUrgent && !$bUrgent) return -1;
-        if (!$aUrgent && $bUrgent) return 1;
-        return ((int)($b['_epoch'] ?? 0)) <=> ((int)($a['_epoch'] ?? 0));
-    });
-
-    $max = min(max($perCategoryLimit * 8, 60), 180);
-    if (count($recent) > $max) {
-        $recent = array_slice($recent, 0, $max);
-    }
-
-    // Remove internal sort key
-    foreach ($recent as &$it) {
-        unset($it['_epoch']);
-    }
-    unset($it);
-
-    return $recent;
-}
-
-// Optimized function to get recent reports with filtering
-function get_recent_reports_optimized(string $collection, int $limit, string $statusFilter, string $search): array {
-    try {
-        $url = firestore_base_url() . ':runQuery';
-        // Fetch a larger window then sort locally so we don't miss new reports
-        // when some documents have missing/inconsistent timestamp fields.
-        $fetchLimit = min(max($limit * 6, 40), 120);
-
-        $bodyTs = [
-            'structuredQuery' => [
-                'from' => [['collectionId' => $collection]],
-                'orderBy' => [[
-                    'field' => ['fieldPath' => 'timestamp'],
-                    'direction' => 'DESCENDING'
-                ]],
-                'limit' => $fetchLimit
-            ]
-        ];
-
-        $bodyCreated = [
-            'structuredQuery' => [
-                'from' => [['collectionId' => $collection]],
-                'orderBy' => [[
-                    'field' => ['fieldPath' => 'createdAt'],
-                    'direction' => 'DESCENDING'
-                ]],
-                'limit' => $fetchLimit
-            ]
-        ];
-
-        $statusNeedle = strtolower(trim((string)$statusFilter));
-
-        // Run both ordered queries (timestamp + createdAt) and merge.
-        // If either fails (index/field issues), we still keep the other.
-        $respTs = [];
-        $respCreated = [];
-        try { $respTs = firestore_rest_request('POST', $url, $bodyTs); }
-        catch (Exception $e) { error_log("Recent query (timestamp) failed for {$collection}: " . $e->getMessage()); }
-        try { $respCreated = firestore_rest_request('POST', $url, $bodyCreated); }
-        catch (Exception $e) { error_log("Recent query (createdAt) failed for {$collection}: " . $e->getMessage()); }
-
-        // If both fail, fallback to an unordered limited fetch.
-        if (empty($respTs) && empty($respCreated)) {
-            $fallbackBody = ['structuredQuery' => ['from' => [['collectionId' => $collection]], 'limit' => $fetchLimit]];
-            $respTs = firestore_rest_request('POST', $url, $fallbackBody);
-        }
-
-        $items = [];
-        $seen = [];
-
-        $consume = function(array $response) use (&$items, &$seen, $collection, $search, $limit, $statusNeedle) {
-            if (!is_array($response)) return;
-            foreach ($response as $row) {
-                if (!isset($row['document'])) continue;
-                $doc = $row['document'];
-                $itemData = firestore_decode_fields($doc['fields'] ?? []);
-                $itemData['id'] = basename($doc['name'] ?? '');
-                $itemData['_created'] = $doc['createTime'] ?? null;
-
-                if (!$itemData['id'] || isset($seen[$itemData['id']])) continue;
-                $seen[$itemData['id']] = true;
-
-                // Apply search filter if specified
-                if ($search) {
-                    $searchableText = strtolower(
-                        ($itemData['fullName'] ?? $itemData['reporterName'] ?? '') . ' ' .
-                        ($itemData['location'] ?? '') . ' ' .
-                        ($itemData['purpose'] ?? $itemData['description'] ?? '') . ' ' .
-                        ($itemData['contact'] ?? $itemData['reporterContact'] ?? '')
-                    );
-                    if (strpos($searchableText, $search) === false) {
-                        continue;
-                    }
-                }
-
-                // Apply status filter locally (case-insensitive) to avoid missing docs
-                // where status values vary in casing (e.g., "pending" vs "Pending").
-                if ($statusNeedle !== 'all') {
-                    $st = strtolower(trim((string)($itemData['status'] ?? '')));
-                    if ($st !== $statusNeedle) {
-                        continue;
-                    }
-                }
-
-                // Debug: Log purpose field for tanod reports
-                if ($collection === 'tanod_reports') {
-                    error_log("Tanod report purpose debug (optimized) - ID: {$itemData['id']}, Purpose: '" . ($itemData['purpose'] ?? '') . "', Raw description: " . ($itemData['description'] ?? 'NULL'));
-                }
-
-                $items[] = $itemData;
-                if (count($items) >= ($limit * 3)) {
-                    // keep a cap; we'll sort/slice later
-                    return;
-                }
-            }
-        };
-
-        $consume($respTs);
-        $consume($respCreated);
-
-        // Extra robustness: merge in a small list-documents sample (createTime-based).
-        // This helps surface newly created reports that are missing/invalid timestamp fields,
-        // which otherwise sort last in the ordered queries and may not appear in the window.
-        try {
-            $rawDocs = rest_list_documents($collection, min(max($fetchLimit, 60), 200));
-            foreach ($rawDocs as $doc) {
-                if (!isset($doc['name'])) continue;
-                $id = basename($doc['name']);
-                if (!$id || isset($seen[$id])) continue;
-
-                $fields = isset($doc['fields']) && function_exists('firestore_decode_fields')
-                    ? firestore_decode_fields($doc['fields'])
-                    : [];
-
-                $itemData = is_array($fields) ? $fields : [];
-                $itemData['id'] = $id;
-                $itemData['_created'] = $doc['createTime'] ?? null;
-
-                // Apply search filter if specified
-                if ($search) {
-                    $searchableText = strtolower(
-                        ($itemData['fullName'] ?? $itemData['reporterName'] ?? '') . ' ' .
-                        ($itemData['location'] ?? '') . ' ' .
-                        ($itemData['purpose'] ?? $itemData['description'] ?? '') . ' ' .
-                        ($itemData['contact'] ?? $itemData['reporterContact'] ?? '')
-                    );
-                    if (strpos($searchableText, $search) === false) {
-                        continue;
-                    }
-                }
-
-                // Apply status filter if specified
-                if ($statusFilter !== 'all') {
-                    $st = strtolower((string)($itemData['status'] ?? ''));
-                    if ($st !== strtolower($statusFilter)) {
-                        continue;
-                    }
-                }
-
-                $seen[$id] = true;
-                $items[] = $itemData;
-
-                if (count($items) >= ($limit * 4)) {
-                    break;
-                }
-            }
-        } catch (Throwable $e) {
-            // ignore list-documents fallback errors
-        }
-        
-        // Ensure newest-first ordering even when using fallback / mixed timestamp formats.
-        // Prefer explicit timestamp; fallback to createdAt; then Firestore createTime.
-        usort($items, function($a, $b) {
-            $ta = $a['timestamp'] ?? ($a['createdAt'] ?? ($a['_created'] ?? ''));
-            $tb = $b['timestamp'] ?? ($b['createdAt'] ?? ($b['_created'] ?? ''));
-
-            $toEpoch = function($t): int {
-                if (is_array($t)) {
-                    if (isset($t['_seconds']) && is_numeric($t['_seconds'])) return (int)$t['_seconds'];
-                    if (isset($t['seconds']) && is_numeric($t['seconds'])) return (int)$t['seconds'];
-                    return 0;
-                }
-                if (is_int($t)) return $t;
-                if (is_float($t)) return (int)$t;
-                if (is_string($t)) {
-                    $s = strtotime($t);
-                    return $s === false ? 0 : (int)$s;
-                }
-                return 0;
-            };
-
-            return $toEpoch($tb) <=> $toEpoch($ta);
-        });
-
-        if (count($items) > $limit) {
-            $items = array_slice($items, 0, $limit);
-        }
-        
-    return $items;
-    } catch (Exception $e) {
-        error_log("Error in get_recent_reports_optimized: " . $e->getMessage());
-        return [];
-    }
-}
-
-
-# --- HELPER FUNCTIONS (Backend Logic) ---
-# Note: Backend logic is preserved from the original file.
-
-function update_report_status(string $collection, string $docId, string $newStatus, string $userId, string $userName = ''): bool {
-    $newStatus = in_array($newStatus, ['Approved','Declined'], true) ? $newStatus : 'Pending';
-    $now = date('c');
-    $payload = [
-        'status'    => $newStatus,
-        'updatedAt' => $now,
-        'updatedBy' => $userId,
-    ];
-    
-    // Add approver/decliner info based on status
-    if ($newStatus === 'Approved') {
-        $payload['approvedBy'] = $userId;
-        $payload['approvedByName'] = $userName ?: ($_SESSION['user_fullname'] ?? 'Admin');
-        $payload['approvedAt'] = $now;
-    } elseif ($newStatus === 'Declined') {
-        $payload['declinedBy'] = $userId;
-        $payload['declinedByName'] = $userName ?: ($_SESSION['user_fullname'] ?? 'Admin');
-        $payload['declinedAt'] = $now;
-    }
-    
-    error_log("Attempting to update status: {$collection}/{$docId} to {$newStatus} by user {$userId}");
-    
-    $updateSuccess = false;
-    
-    // Try the fast method first
-    if (function_exists('firestore_set_document_fast')) {
-        try { 
-            $result = firestore_set_document_fast($collection, $docId, $payload);
-            if ($result) {
-                error_log("Fast Firestore update successful: {$collection}/{$docId}");
-                $updateSuccess = true;
-            } else {
-                error_log("Fast Firestore update returned false: {$collection}/{$docId}");
-            }
-        } catch (Throwable $e) {
-            error_log("Fast Firestore update error: " . $e->getMessage());
-        }
-    }
-    
-    // Fallback to original REST API method if fast method failed
-    if (!$updateSuccess && function_exists('firestore_set_document')) {
-        try { 
-            $result = firestore_set_document($collection, $docId, $payload);
-            if ($result) {
-                error_log("REST API update successful: {$collection}/{$docId}");
-                $updateSuccess = true;
-            } else {
-                error_log("REST API update returned false: {$collection}/{$docId}");
-            }
-        } catch (Throwable $e) {
-            error_log("Firestore REST API error: " . $e->getMessage());
-        }
-    }
-    
-    // Final fallback to Firebase SDK if other methods failed
-    if (!$updateSuccess) {
-        global $firestore;
-        if ($firestore) {
-            try { 
-                $firestore->collection($collection)->document($docId)->set($payload, ['merge' => true]); 
-                error_log("Firebase SDK update successful: {$collection}/{$docId}");
-                $updateSuccess = true;
-            } catch (Throwable $e) {
-                error_log("Firebase SDK error: " . $e->getMessage());
-            }
-        }
-    }
-    
-    // Send FCM notifications only once after successful update
-    if ($updateSuccess) {
-        // DISABLED: Notifications are handled by other code path to avoid duplicates
-        error_log("Notifications handled by alternative code path for {$collection}/{$docId}");
-        return true;
-    }
-    
-    error_log("All update methods failed for document: {$collection}/{$docId}");
-    return false;
-}
-
-// New function to list pending users
-function list_pending_users(int $limit = 200): array {
-    global $firestore;
-    if (!$firestore) {
-        throw new Exception("Firestore is not initialized.");
-    }
-    
-    // Check for both 'accountStatus' and 'status' fields for backward compatibility
-    try {
-        // First try with 'accountStatus' field
-        $query = $firestore->collection('users')->where('accountStatus', '==', 'pending')->limit($limit);
-        $documents = $query->documents();
-        $users = [];
-        foreach ($documents as $doc) {
-            if ($doc->exists()) {
-                $userData = $doc->data();
-                $userData['id'] = $doc->id(); // Add the document ID
-                $users[] = $userData;
-            }
-        }
-        
-        // If no users found with 'accountStatus', try with 'status' field
-        if (empty($users)) {
-            $query = $firestore->collection('users')->where('status', '==', 'pending')->limit($limit);
-            $documents = $query->documents();
-            foreach ($documents as $doc) {
-                if ($doc->exists()) {
-                    $userData = $doc->data();
-                    $userData['id'] = $doc->id(); // Add the document ID
-                    // Map 'status' to 'accountStatus' for consistency
-                    $userData['accountStatus'] = $userData['status'] ?? 'pending';
-                    $users[] = $userData;
-                }
-            }
-        }
-        
-        return $users;
-    } catch (Throwable $e) {
-        // Fallback to 'status' field if 'accountStatus' query fails
-        try {
-            $query = $firestore->collection('users')->where('status', '==', 'pending')->limit($limit);
-            $documents = $query->documents();
-            $users = [];
-            foreach ($documents as $doc) {
-                if ($doc->exists()) {
-                    $userData = $doc->data();
-                    $userData['id'] = $doc->id(); // Add the document ID
-                    // Map 'status' to 'accountStatus' for consistency
-                    $userData['accountStatus'] = $userData['status'] ?? 'pending';
-                    $users[] = $userData;
-                }
-            }
-            return $users;
-        } catch (Throwable $e2) {
-            return [];
-        }
-    }
-}
-
-// New function to update user status
-function update_user_status(string $uid, string $newStatus): bool {
-    $newStatus = in_array($newStatus, ['approved', 'rejected'], true) ? $newStatus : 'pending';
-    $payload = [
-        'accountStatus' => $newStatus,
-        'status' => $newStatus, // Update both fields for backward compatibility
-        'statusUpdatedAt' => date('c'),
-        'isVerified' => ($newStatus === 'approved') // Update isVerified based on status
-    ];
-    if (function_exists('firestore_set_document')) {
-        try { firestore_set_document('users', $uid, $payload, true); return true; } catch (Throwable $e) {}
-    }
-    global $firestore;
-    if ($firestore) {
-        try { $firestore->collection('users')->document($uid)->set($payload, ['merge' => true]); return true; } catch (Throwable $e) {}
-    }
-    return false;
-}
-
-/* =========================
-   PENDING USERS HELPERS
-   ========================= */
-// If not yet defined, add a proper paginated fetcher (Firestore)
-if (!function_exists('list_pending_users_paginated')) {
-    function list_pending_users_paginated(int $limit = 20, int $offset = 0): array {
-        global $firestore;
-        if (!$firestore) return [];
-        try {
-            // Check for both 'accountStatus' and 'status' fields for backward compatibility
-            $out = [];
-            
-            // First try with 'accountStatus' field
-            try {
-                $q = $firestore->collection('users')
-                    ->where('accountStatus', '==', 'pending')
-                    ->orderBy('fullName')
-                    ->offset($offset)
-                    ->limit($limit);
-                $docs = $q->documents();
-                foreach ($docs as $doc) {
-                    if (!$doc->exists()) continue;
-                    $d = $doc->data();
-                    $out[] = [
-                        'id'     => $doc->id(),
-                        'fullName' => $d['fullName'] ?? '',
-                        'firstName' => $d['firstName'] ?? '',
-                        'lastName' => $d['lastName'] ?? '',
-                        'middleName' => $d['middleName'] ?? '',
-                        'email' => $d['email'] ?? '',
-                        'mobileNumber' => $d['mobileNumber'] ?? '',
-                        'contact' => $d['contact'] ?? '', // Fallback for old data
-                        'currentAddress' => $d['currentAddress'] ?? '',
-                        'permanentAddress' => $d['permanentAddress'] ?? '',
-                        'address' => $d['address'] ?? '', // Fallback for old data
-                        'birthdate' => $d['birthdate'] ?? '',
-                        'gender' => $d['gender'] ?? '',
-                        'accountStatus' => $d['accountStatus'] ?? 'pending',
-                        'frontIdImageUrl' => $d['frontIdImageUrl'] ?? '',
-                        'backIdImageUrl' => $d['backIdImageUrl'] ?? '',
-                        'selfieImageUrl' => $d['selfieImageUrl'] ?? '',
-                        'proofOfResidencyPath' => $d['proofOfResidencyPath'] ?? '', // Fallback for old data
-                    ];
-                }
-            } catch (Throwable $e1) {
-                // If 'accountStatus' fails, try with 'status' field
-                try {
-                    $q = $firestore->collection('users')
-                        ->where('status', '==', 'pending')
-                        ->orderBy('fullName')
-                        ->offset($offset)
-                        ->limit($limit);
-                    $docs = $q->documents();
-                    foreach ($docs as $doc) {
-                        if (!$doc->exists()) continue;
-                        $d = $doc->data();
-                        $out[] = [
-                            'id'     => $doc->id(),
-                            'fullName' => $d['fullName'] ?? '',
-                            'firstName' => $d['firstName'] ?? '',
-                            'lastName' => $d['lastName'] ?? '',
-                            'middleName' => $d['middleName'] ?? '',
-                            'email' => $d['email'] ?? '',
-                            'mobileNumber' => $d['mobileNumber'] ?? '',
-                            'contact' => $d['contact'] ?? '', // Fallback for old data
-                            'currentAddress' => $d['currentAddress'] ?? '',
-                            'permanentAddress' => $d['permanentAddress'] ?? '',
-                            'address' => $d['address'] ?? '', // Fallback for old data
-                            'birthdate' => $d['birthdate'] ?? '',
-                            'gender' => $d['gender'] ?? '',
-                            'accountStatus' => $d['status'] ?? 'pending', // Map 'status' to 'accountStatus'
-                            'frontIdImageUrl' => $d['frontIdImageUrl'] ?? '',
-                            'backIdImageUrl' => $d['backIdImageUrl'] ?? '',
-                            'selfieImageUrl' => $d['selfieImageUrl'] ?? '',
-                            'proofOfResidencyPath' => $d['proofOfResidencyPath'] ?? '', // Fallback for old data
-                        ];
-                    }
-                } catch (Throwable $e2) {
-                    return [];
-                }
-            }
-            
-            return $out;
-        } catch (Throwable $e) {
-            return [];
-        }
-    }
-}
-
-// --- AJAX/API REQUEST HANDLING ---
-if (isset($_POST['api_action'])) {
-    header('Content-Type: application/json');
-    $action = $_POST['api_action'];
-    $response = ['success' => false, 'message' => 'Invalid action.'];
-
-    // Admin: Create Staff
-    if ($isAdmin && $action === 'create_staff') {
-        $lastName = $_POST['lastName'] ?? '';
-        $firstName = $_POST['firstName'] ?? '';
-        $middleName = $_POST['middleName'] ?? '';
-        $email = $_POST['email'] ?? '';
-        $username = $_POST['username'] ?? '';
-        $password = $_POST['password'] ?? '';
-        $categories = $_POST['categories'] ?? [];
-        
-        // Construct full name in the format: Last Name, First Name Middle Name
-        $fullName = trim($lastName);
-        if (!empty($firstName)) {
-            $fullName .= ', ' . trim($firstName);
-            if (!empty($middleName)) {
-                $fullName .= ' ' . trim($middleName);
-            }
-        }
-        
-        if (empty($lastName) || empty($firstName) || empty($email) || empty($username) || empty($password)) {
-             $response['message'] = 'Staff creation failed. Last name, first name, email, username, and password are required.';
-        } else {
-            try {
-                // Initialize Firebase Auth
-                $auth = initialize_auth();
-                
-                // Create user in Firebase Auth
-                $userProperties = [
-                    'email' => $email,
-                    'password' => $password,
-                    'displayName' => $fullName,
-                    'emailVerified' => true
-                ];
-                
-                $userRecord = $auth->createUser($userProperties);
-                $uid = $userRecord->uid;
-                
-                // Create user document in Firestore
-                $userData = [
-                    'uid' => $uid,
-                    'fullName' => $fullName,
-                    'lastName' => $lastName,
-                    'firstName' => $firstName,
-                    'middleName' => $middleName,
-                    'email' => $email,
-                    'username' => $username,
-                    'role' => 'staff',
-                    'status' => 'approved',
-                    'categories' => $categories,
-                    'createdAt' => date('Y-m-d H:i:s'),
-                    'createdBy' => $userId,
-                    'lastLogin' => null
-                ];
-                
-                // Add to Firestore users collection
-                firestore_set_document('users', $uid, $userData);
-                
-                $response = ['success' => true, 'message' => "Staff account for {$fullName} created successfully."];
-                // Invalidate cached dashboard data
-                unset($_SESSION['__cache']['admin_stats'], $_SESSION['__cache']['recent_feed']);
-
-                // Trigger staff data refresh on the frontend
-                $response['refreshStaffData'] = true;
-                
-            } catch (EmailExists $e) {
-                error_log("Staff creation error - Email already exists: " . $e->getMessage());
-                $response['message'] = 'Staff creation failed: Email address is already registered.';
-            } catch (Exception $e) {
-                error_log("Staff creation error: " . $e->getMessage());
-                $response['message'] = 'Staff creation failed: ' . $e->getMessage();
-            }
-        }
-    }
-
-    // Admin: Get Staff Data
-    if ($isAdmin && $action === 'get_staff_data') {
-        try {
-            // Get all users with role 'staff' using REST API
-            $url = firestore_base_url() . ':runQuery';
-            $body = [
-                'structuredQuery' => [
-                    'from' => [['collectionId' => 'users']],
-                    'where' => [
-                        'fieldFilter' => [
-                            'field' => ['fieldPath' => 'role'],
-                            'op' => 'EQUAL',
-                            'value' => firestore_encode_value('staff')
-                        ]
-                    ]
-                ]
-            ];
-
-            $response = firestore_rest_request('POST', $url, $body);
-            $staffUsers = [];
-
-            if (isset($response[0]['document'])) {
-                foreach ($response as $doc) {
-                    if (isset($doc['document'])) {
-                        $userId = basename($doc['document']['name']);
-                        $userData = firestore_decode_fields($doc['document']['fields'] ?? []);
-                        $staffUsers[$userId] = $userData;
-                    }
-                }
-            }
-
-            $totalStaff = 0;
-            $activeStaff = 0;
-            $reportsAssigned = 0;
-            $staffList = [];
-
-            if ($staffUsers) {
-                foreach ($staffUsers as $userId => $userData) {
-                    $totalStaff++;
-
-                    // Check if staff is active (not disabled/removed)
-                    if (isset($userData['status']) && $userData['status'] === 'approved') {
-                        $activeStaff++;
-                    }
-
-                    // Count assigned categories
-                    if (isset($userData['categories']) && is_array($userData['categories'])) {
-                        $reportsAssigned += count($userData['categories']);
-                    }
-
-                    // Add to staff list
-                    $staffList[] = [
-                        'id' => $userId,
-                        'name' => $userData['fullName'] ?? 'Unknown',
-                        'email' => $userData['email'] ?? '',
-                        'username' => $userData['username'] ?? '',
-                        'status' => $userData['status'] ?? 'inactive',
-                        'categories' => $userData['categories'] ?? [],
-                        'createdAt' => $userData['createdAt'] ?? null,
-                        'lastLogin' => $userData['lastLogin'] ?? null
-                    ];
-                }
-            }
-
-            $response = [
-                'success' => true,
-                'data' => [
-                    'total' => $totalStaff,
-                    'active' => $activeStaff,
-                    'reportsAssigned' => $reportsAssigned,
-                    'staff' => $staffList
-                ]
-            ];
-
-        } catch (Exception $e) {
-            error_log("Get staff data error: " . $e->getMessage());
-            $response = [
-                'success' => false,
-                'message' => 'Failed to load staff data: ' . $e->getMessage()
-            ];
-        }
-    }
-
-    // Admin: Create Responder
-    if ($isAdmin && $action === 'create_responder') {
-        $lastName = trim($_POST['lastName'] ?? '');
-        $firstName = trim($_POST['firstName'] ?? '');
-        $middleName = trim($_POST['middleName'] ?? '');
-        $email = $_POST['email'] ?? '';
-        $username = $_POST['username'] ?? '';
-        $password = $_POST['password'] ?? '';
-        $categories = $_POST['categories'] ?? [];
-        
-        // Construct full name in "Last, First, Middle" format
-        $fullName = $lastName;
-        if (!empty($firstName)) {
-            $fullName .= ', ' . $firstName;
-        }
-        if (!empty($middleName)) {
-            $fullName .= ', ' . $middleName;
-        }
-        
-        if (empty($lastName) || empty($firstName) || empty($email) || empty($username) || empty($password)) {
-             $response['message'] = 'Responder creation failed. Last name, first name, email, username and password are required.';
-        } else {
-            try {
-                // Initialize Firebase Auth
-                $auth = initialize_auth();
-                
-                // Create user in Firebase Auth
-                $userProperties = [
-                    'email' => $email,
-                    'password' => $password,
-                    'displayName' => $fullName,
-                    'emailVerified' => true
-                ];
-                
-                $userRecord = $auth->createUser($userProperties);
-                $uid = $userRecord->uid;
-                
-                // Create user document in Firestore
-                $userData = [
-                    'uid' => $uid,
-                    'fullName' => $fullName,  // "Last, First, Middle" format
-                    'lastName' => $lastName,
-                    'firstName' => $firstName,
-                    'middleName' => $middleName,
-                    'email' => $email,
-                    'username' => $username,
-                    'role' => 'responder',
-                    'status' => 'approved',
-                    'categories' => $categories,
-                    'createdAt' => date('Y-m-d H:i:s'),
-                    'createdBy' => $userId,
-                    'lastLogin' => null
-                ];
-                
-                // Add to Firestore users collection
-                firestore_set_document('users', $uid, $userData);
-                
-                $response = ['success' => true, 'message' => "Responder account for {$fullName} created successfully."];
-                // Invalidate cached dashboard data
-                unset($_SESSION['__cache']['admin_stats'], $_SESSION['__cache']['recent_feed']);
-                
-            } catch (EmailExists $e) {
-                error_log("Responder creation error - Email already exists: " . $e->getMessage());
-                $response['message'] = 'Responder creation failed: Email address is already registered.';
-            } catch (Exception $e) {
-                error_log("Responder creation error: " . $e->getMessage());
-                $response['message'] = 'Responder creation failed: ' . $e->getMessage();
-            }
-        }
-    }
-
-    // Admin: Create Account (Multi-Role Support - Unified Staff/Responder Creation)
-    if ($isAdmin && $action === 'create_account') {
-        $lastName = trim($_POST['lastName'] ?? '');
-        $firstName = trim($_POST['firstName'] ?? '');
-        $middleName = trim($_POST['middleName'] ?? '');
-        $email = $_POST['email'] ?? '';
-        $username = $_POST['username'] ?? '';
-        $password = $_POST['password'] ?? '';
-        $accountTypes = $_POST['accountTypes'] ?? [];
-        $categories = $_POST['categories'] ?? [];
-        $assignedBarangay = $_POST['assignedBarangay'] ?? null;
-        
-        // Construct full name in "Last, First Middle" format
-        $fullName = $lastName;
-        if (!empty($firstName)) {
-            $fullName .= ', ' . $firstName;
-            if (!empty($middleName)) {
-                $fullName .= ' ' . $middleName;
-            }
-        }
-        
-        if (empty($lastName) || empty($firstName) || empty($email) || empty($username) || empty($password)) {
-             $response['message'] = 'Account creation failed. Last name, first name, email, username and password are required.';
-        } elseif (empty($accountTypes)) {
-            $response['message'] = 'Account creation failed. Please select at least one account type (Staff or Responder).';
-        } elseif ((in_array('tanod', $categories) || in_array('police', $categories)) && empty($assignedBarangay)) {
-            $response['message'] = 'Account creation failed. Assigned Barangay/Outpost is required for Tanod and Police categories.';
-        } else {
-            try {
-                // Initialize Firebase Auth
-                $auth = initialize_auth();
-                
-                // Create user in Firebase Auth
-                $userProperties = [
-                    'email' => $email,
-                    'password' => $password,
-                    'displayName' => $fullName,
-                    'emailVerified' => true
-                ];
-                
-                $userRecord = $auth->createUser($userProperties);
-                $uid = $userRecord->uid;
-                
-                // Determine primary role (if multiple selected, prefer staff over responder)
-                $primaryRole = in_array('staff', $accountTypes) ? 'staff' : 'responder';
-                
-                // Create user document in Firestore with multi-role support
-                $userData = [
-                    'uid' => $uid,
-                    'fullName' => $fullName,
-                    'lastName' => $lastName,
-                    'firstName' => $firstName,
-                    'middleName' => $middleName,
-                    'email' => $email,
-                    'username' => $username,
-                    'role' => $primaryRole,
-                    'roles' => $accountTypes, // Store all selected roles
-                    'status' => 'approved',
-                    'categories' => $categories,
-                    'assignedBarangay' => $assignedBarangay,
-                    'createdAt' => date('Y-m-d H:i:s'),
-                    'createdBy' => $userId,
-                    'lastLogin' => null
-                ];
-                
-                // Add to Firestore users collection
-                firestore_set_document('users', $uid, $userData);
-                
-                $roleText = implode(' and ', array_map('ucfirst', $accountTypes));
-                $response = ['success' => true, 'message' => "{$roleText} account for {$fullName} created successfully."];
-                
-                // Invalidate cached dashboard data
-                unset($_SESSION['__cache']['admin_stats'], $_SESSION['__cache']['recent_feed']);
-
-                // Trigger staff data refresh on the frontend
-                $response['refreshStaffData'] = true;
-                
-            } catch (EmailExists $e) {
-                error_log("Account creation error - Email already exists: " . $e->getMessage());
-                $response['message'] = 'Account creation failed: Email address is already registered.';
-            } catch (Exception $e) {
-                error_log("Account creation error: " . $e->getMessage());
-                $response['message'] = 'Account creation failed: ' . $e->getMessage();
-            }
-        }
-    }
-
-    // Admin: Update User Status (Approve/Reject Registration)
-    if ($isAdmin && $action === 'update_user_status') {
-        $uid = $_POST['uid'] ?? '';
-        $newStatus = $_POST['newStatus'] ?? '';
-
-        if (empty($uid) || !in_array($newStatus, ['approved', 'rejected'], true)) {
-            $response['message'] = 'Invalid user update request.';
-        } else {
-            $ok = update_user_status($uid, $newStatus);
-            if ($ok) {
-                $response = ['success' => true, 'message' => "User registration has been ".ucfirst($newStatus)."."];
-                // Notify the user about the registration decision via FCM
-                if (function_exists('send_fcm_notification_to_user')) {
-                    $title = ($newStatus === 'approved') ? 'Account Approved' : 'Account Rejected';
-                    $body  = ($newStatus === 'approved')
-                        ? 'Your registration has been approved. You can now log in.'
-                        : 'Your registration was rejected. Please give a complete and corrected information.';
-                    $data  = ['type' => 'registration_status', 'status' => $newStatus];
-                    try { send_fcm_notification_to_user($uid, $title, $body, $data); } catch (Throwable $e) { error_log('FCM notify (registration) failed: '.$e->getMessage()); }
-                }
-                // Invalidate cached dashboard data when user status changes
-                unset($_SESSION['__cache']['admin_stats'], $_SESSION['__cache']['recent_feed']);
-            } else {
-                $response['message'] = 'A server error occurred while updating the user status.';
-            }
-        }
-    }
-
-    // Admin: Test Notification Flow (for debugging triple notifications)
-    if ($isAdmin && $action === 'test_notifications') {
-        if (ob_get_length()) ob_clean();
-        header('Content-Type: application/json');
-        
-        $collection = trim($_POST['collection'] ?? '');
-        $docId = trim($_POST['docId'] ?? '');
-        
-        if (empty($collection) || empty($docId)) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Collection and docId are required for testing'
-            ]);
-            exit();
-        }
-        
-        try {
-            if (function_exists('test_new_notification_flow')) {
-                $testResults = test_new_notification_flow($collection, $docId);
-                echo json_encode([
-                    'success' => true,
-                    'message' => 'Notification test completed',
-                    'results' => $testResults
-                ]);
-            } else {
-                echo json_encode([
-                    'success' => false,
-                    'message' => 'Test function not available'
-                ]);
-            }
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Test failed: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // Admin: Clear All Cache
-    if ($isAdmin && $action === 'clear_cache') {
-        try {
-            // Clear file-based cache
-            $cleared = cache_clear();
-            
-            // Also cleanup expired cache files
-            $expired = cache_cleanup_expired();
-            
-            // Get cache stats
-            $stats = cache_stats();
-            
-            $response = [
-                'success' => true, 
-                'message' => "Cache cleared successfully. Removed {$cleared} files ({$expired} expired).",
-                'stats' => $stats
-            ];
-        } catch (Exception $e) {
-            error_log("Error clearing cache: " . $e->getMessage());
-            $response = [
-                'success' => false,
-                'message' => 'Failed to clear cache: ' . $e->getMessage()
-            ];
-        }
-        
-        if (ob_get_length()) ob_clean();
-        header('Content-Type: application/json');
-        echo json_encode($response);
-        exit();
-    }
-
-
-
-    // Staff: Update Report Status
-    if ($action === 'update_status') {
-        // Ensure notification + FCM helpers are available for both Approved and Declined flows
-        require_once __DIR__ . '/notification_system.php';
-        if (ob_get_length()) ob_clean();
-        header('Content-Type: application/json');
-        
-        $collection = trim($_POST['collection'] ?? '');
-        $docId      = trim($_POST['docId'] ?? '');
-        $newStatus  = trim($_POST['newStatus'] ?? '');
-        $declineReason = trim($_POST['declineReason'] ?? ''); // Capture decline reason
-
-        $profile  = get_user_profile($userId);
-        $assigned = $isAdmin ? array_keys($categories) : array_values(array_filter(array_map('strval', $profile['categories'] ?? [])));
-        $allowedCollections = array_map(fn($s) => $categories[$s]['collection'] ?? null, $assigned);
-
-        if (!$isAdmin && !in_array($collection, array_filter($allowedCollections), true)) {
-            echo json_encode(['success' => false, 'message' => 'Error: You are not permitted to modify this category.']);
-        } elseif ($docId === '' || !in_array($newStatus, ['Approved','Declined'], true)) {
-            echo json_encode(['success' => false, 'message' => 'Invalid update request.']);
-        } elseif ($newStatus === 'Declined' && empty($declineReason)) {
-            echo json_encode(['success' => false, 'message' => 'Decline reason is required when declining a report.']);
-        } else {
-            error_log("Attempting to update status: {$collection}/{$docId} to {$newStatus} by user {$userId}" . 
-                     ($declineReason ? " with reason: {$declineReason}" : ""));
-            
-            // Get current user's name for action attribution
-            $actionByName = $_SESSION['user_fullname'] ?? '';
-            
-            // If session doesn't have fullname, try to get it from the user profile
-            if (empty($actionByName) && !empty($userId)) {
-                $staffProfile = get_user_profile($userId);
-                $actionByName = $staffProfile['fullName'] ?? $staffProfile['name'] ?? '';
-                // Cache it in session for future use
-                if (!empty($actionByName)) {
-                    $_SESSION['user_fullname'] = $actionByName;
-                }
-            }
-            
-            // Final fallback
-            if (empty($actionByName)) {
-                $actionByName = 'Admin';
-            }
-            
-            error_log("Action by name resolved to: {$actionByName}");
-            
-            $now = date('c');
-            
-            // Try direct Firestore update first
-            $payload = [
-                'status'    => $newStatus,
-                'updatedAt' => $now,
-                'updatedBy' => $userId,
-            ];
-            
-            // Add approver info when approved
-            if ($newStatus === 'Approved') {
-                $payload['approvedBy'] = $userId;
-                $payload['approvedByName'] = $actionByName;
-                $payload['approvedAt'] = $now;
-            }
-            
-            // Add decline reason and decliner info to the document if provided
-            if ($newStatus === 'Declined') {
-                $payload['declinedBy'] = $userId;
-                $payload['declinedByName'] = $actionByName;
-                $payload['declinedAt'] = $now;
-                if (!empty($declineReason)) {
-                    $payload['declineReason'] = $declineReason;
-                }
-            }
-            
-            $updateSuccess = false;
-            
-                // Test Firestore connection first
-    try {
-        $testToken = firestore_rest_token();
-        error_log("Firestore token obtained: " . substr($testToken, 0, 20) . "...");
-        
-        // Test if we can read a document to verify connection
-        $testUrl = firestore_base_url() . '/documents/' . $collection . '/' . $docId;
-        error_log("Testing Firestore connection with URL: " . $testUrl);
-        
-    } catch (Exception $e) {
-        error_log("Firestore token error: " . $e->getMessage());
-    }
-            
-            // Try fast method
-            if (function_exists('firestore_set_document_fast')) {
-                error_log("Trying fast update method...");
-                $updateSuccess = firestore_set_document_fast($collection, $docId, $payload);
-                if ($updateSuccess) {
-                    error_log("Fast update successful: {$collection}/{$docId}");
-                } else {
-                    error_log("Fast update failed: {$collection}/{$docId}");
-                }
-            }
-            
-            // Try regular method if fast failed
-            if (!$updateSuccess && function_exists('firestore_set_document')) {
-                error_log("Trying regular update method...");
-                try {
-                    $updateSuccess = firestore_set_document($collection, $docId, $payload);
-                    if ($updateSuccess) {
-                        error_log("Regular update successful: {$collection}/{$docId}");
-                    } else {
-                        error_log("Regular update failed: {$collection}/{$docId}");
-                    }
-                } catch (Exception $e) {
-                    error_log("Regular update exception: " . $e->getMessage());
-                    $updateSuccess = false;
-                }
-            }
-            
-            // Try SDK method if both failed
-            if (!$updateSuccess) {
-                error_log("Trying SDK update method...");
-                global $firestore;
-                if ($firestore) {
-                    try {
-                        $firestore->collection($collection)->document($docId)->set($payload, ['merge' => true]);
-                        $updateSuccess = true;
-                        error_log("SDK update successful: {$collection}/{$docId}");
-                    } catch (Exception $e) {
-                        error_log("SDK update failed: " . $e->getMessage());
-                    }
-                } else {
-                    error_log("Firestore SDK not available");
-                }
-            }
-            
-            if ($updateSuccess) {
-                error_log("Status update successful: {$collection}/{$docId} to {$newStatus}");
-                
-                // Send appropriate notifications based on status
-                if ($newStatus === 'Approved') {
-                    if (function_exists('send_emergency_notification_directly') || function_exists('send_fcm_notification_for_approved_report')) {
-                        error_log("Sending approved notifications for {$collection}/{$docId}");
-
-                        // Reporter "approved" notifications are intentionally disabled (per earlier request)
-                        $userNotificationResult = true;
-
-                        if (function_exists('send_emergency_notification_directly')) {
-                            $responderNotificationResult = send_emergency_notification_directly($collection, $docId);
-                        } else {
-                            $responderNotificationResult = send_fcm_notification_for_approved_report($collection, $docId, false);
-                        }
-
-                        $notificationResult = $userNotificationResult || $responderNotificationResult;
-                    } else {
-                        error_log("FCM approved-notification functions not available");
-                    }
-                } elseif ($newStatus === 'Declined') {
-                    if (function_exists('send_fcm_notification_to_user_for_rejected_report')) {
-                        error_log("Sending declined notification for {$collection}/{$docId}" . ($declineReason ? " with reason: {$declineReason}" : ""));
-                        $notificationResult = send_fcm_notification_to_user_for_rejected_report($collection, $docId, $declineReason);
-                        error_log("Declined notification result: " . ($notificationResult ? 'success' : 'failed'));
-                    } else {
-                        error_log("Decline notification function not available");
-                    }
-                }
-                
-                // Update staff notifications when report status changes
-                if (function_exists('update_notification_for_report_status')) {
-                    error_log("Updating staff notifications for {$collection}/{$docId} status: {$newStatus}");
-                    update_notification_for_report_status($docId, $newStatus, $collection);
-                } else {
-                    error_log("update_notification_for_report_status function not available");
-                }
-                
-                // Update staff notifications when report status changes
-                if (function_exists('update_notification_for_report_status')) {
-                    error_log("Updating staff notifications for {$collection}/{$docId} status: {$newStatus}");
-                    update_notification_for_report_status($docId, $newStatus, $collection);
-                } else {
-                    error_log("update_notification_for_report_status function not available");
-                }
-                
-                $successMessage = ($newStatus === 'Declined') 
-                    ? "Report has been DECLINED" . (!empty($declineReason) ? " with custom reason" : "") . ". The reporter has been notified" . (!empty($declineReason) ? " with your specific feedback" : " with instructions to resubmit with better details") . "."
-                    : "Report status successfully updated to {$newStatus}.";
-                
-                echo json_encode(['success' => true, 'message' => $successMessage]);
-                // Invalidate cached dashboard data
-                unset($_SESSION['__cache']['admin_stats'], $_SESSION['__cache']['recent_feed']);
-                
-                // Also clear all specific recent_feed_* cache keys
-                if (isset($_SESSION['__cache']) && is_array($_SESSION['__cache'])) {
-                    foreach (array_keys($_SESSION['__cache']) as $key) {
-                        if (strpos($key, 'recent_feed_') === 0) {
-                            unset($_SESSION['__cache'][$key]);
-                        }
-                    }
-                }
-            } else {
-                error_log("All update methods failed: {$collection}/{$docId} to {$newStatus}");
-                echo json_encode(['success' => false, 'message' => 'Failed to update report status in database. Please check error logs.']);
-            }
-        }
-        exit();
-    }
-
-
-
-    // Admin: Check for new pending users (real-time sync) - Enhanced detection
-    if ($isAdmin && $action === 'get_new_pending_users') {
-        header('Content-Type: application/json');
-        
-        try {
-            $newUsers = [];
-            $allCurrentUsers = [];
-            
-            // Initialize session tracking if not exists
-            if (!isset($_SESSION['known_pending_users'])) {
-                $_SESSION['known_pending_users'] = [];
-            }
-            
-            global $firestore;
-            if ($firestore) {
-                // Get ALL current pending users with multiple field checks
-                $queries = [
-                    // Query with 'accountStatus' field
-                    $firestore->collection('users')->where('accountStatus', '==', 'pending'),
-                    // Query with 'status' field  
-                    $firestore->collection('users')->where('status', '==', 'pending'),
-                    // Query with 'Status' field (capitalized)
-                    $firestore->collection('users')->where('Status', '==', 'pending'),
-                    // Query with 'AccountStatus' field (capitalized)
-                    $firestore->collection('users')->where('AccountStatus', '==', 'pending')
-                ];
-                
-                $seenIds = [];
-                foreach ($queries as $query) {
-                    try {
-                        $docs = $query->documents();
-                        foreach ($docs as $doc) {
-                            if ($doc->exists()) {
-                                $userData = $doc->data();
-                                $docId = $doc->id();
-                                
-                                // Skip if we've already seen this user in this check
-                                if (isset($seenIds[$docId])) continue;
-                                $seenIds[$docId] = true;
-                                
-                                $userData['id'] = $docId;
-                                // Normalize fields for consistency - check multiple possible field names
-                                $userData['accountStatus'] = $userData['accountStatus'] ?? $userData['status'] ?? $userData['Status'] ?? $userData['AccountStatus'] ?? 'pending';
-                                
-                                $allCurrentUsers[$docId] = $userData;
-                                
-                                // Check if this is a NEW user (not in previous session)
-                                if (!isset($_SESSION['known_pending_users'][$docId])) {
-                                    $newUsers[] = $userData;
-                                    error_log("NEW USER DETECTED: " . $docId . " - " . ($userData['fullName'] ?? 'Unknown'));
-                                }
-                            }
-                        }
-                    } catch (Throwable $e) {
-                        error_log("Query error: " . $e->getMessage());
-                        continue;
-                    }
-                }
-                
-                // Update session with ALL current users
-                $_SESSION['known_pending_users'] = $allCurrentUsers;
-            }
-            
-            error_log("Real-time check: " . count($allCurrentUsers) . " total users, " . count($newUsers) . " new users");
-            
-            echo json_encode([
-                'success' => true,
-                'hasNew' => !empty($newUsers),
-                'newUsers' => array_values($newUsers),
-                'count' => count($newUsers),
-                'totalPending' => count($allCurrentUsers),
-                'sessionCount' => count($_SESSION['known_pending_users'] ?? []),
-                'timestamp' => date('Y-m-d H:i:s'),
-                'debug' => [
-                    'currentUserIds' => array_keys($allCurrentUsers),
-                    'sessionUserIds' => array_keys($_SESSION['known_pending_users'] ?? [])
-                ]
-            ]);
-        } catch (Exception $e) {
-            error_log('Error in get_new_pending_users: ' . $e->getMessage());
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to check for new users: ' . $e->getMessage()
-            ]);
-        } catch (Error $e) {
-            error_log('Fatal error in get_new_pending_users: ' . $e->getMessage());
-            echo json_encode([
-                'success' => false,
-                'message' => 'System error occurred while checking for new users'
-            ]);
-        }
-        exit();
-    }
-
-    // Admin: Reset user session for fresh start
-    if ($isAdmin && $action === 'reset_user_session') {
-        // Clean output buffer to ensure valid JSON
-        if (ob_get_length()) ob_clean();
-        header('Content-Type: application/json');
-        unset($_SESSION['known_pending_users']);
-        error_log("User session reset for fresh real-time detection");
-        echo json_encode(['success' => true, 'message' => 'Session reset']);
-        exit();
-    }
-
-    // AJAX: Check for new pending users (real-time sync)
-    if ($isAdmin && $action === 'check_new_pending_users') {
-        try {
-            $lastCheck = $_POST['last_check'] ?? '';
-            $hasNew = false;
-            $timestamp = date('c');
-            
-            // Always check for new users by comparing current count with stored count
-            global $firestore;
-            $currentPendingCount = 0;
-            
-            if ($firestore) {
-                try {
-                    // Get current count of pending users using both fields
-                    $query1 = $firestore->collection('users')->where('accountStatus', '==', 'pending');
-                    $docs1 = $query1->documents();
-                    $count1 = $docs1->size();
-                    
-                    $query2 = $firestore->collection('users')->where('status', '==', 'pending');
-                    $docs2 = $query2->documents();
-                    $count2 = $docs2->documents()->size();
-                    
-                    $currentPendingCount = max($count1, $count2);
-                } catch (Throwable $e) {
-                    // If direct query fails, try alternative approach
-                    try {
-                        $currentPendingCount = count(list_pending_users(1000)); // Get all pending users
-                    } catch (Throwable $e2) {
-                        $currentPendingCount = 0;
-                    }
-                }
-            }
-            
-            // Store the count in session for comparison
-            if (!isset($_SESSION['last_pending_count'])) {
-                $_SESSION['last_pending_count'] = $currentPendingCount;
-                $hasNew = false; // First time, no new users
-            } else {
-                $lastCount = $_SESSION['last_pending_count'];
-                if ($currentPendingCount > $lastCount) {
-                    $hasNew = true;
-                    $_SESSION['last_pending_count'] = $currentPendingCount;
-                }
-            }
-            
-            echo json_encode([
-                'success' => true,
-                'hasNew' => $hasNew,
-                'timestamp' => $timestamp,
-                'currentCount' => $currentPendingCount,
-                'lastCount' => $_SESSION['last_pending_count'] ?? 0
-            ]);
-        } catch (Throwable $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to check for new users: ' . $e->getMessage(),
-                'hasNew' => false
-            ]);
-        }
-        exit();
-    }
-
-    // AJAX: List pending users for verification view with optimized performance and error handling
-    if ($isAdmin && $action === 'list_pending_users') {
-        $startTime = microtime(true);
-        
-        try {
-            $page     = max(1, (int)($_POST['page'] ?? 1));
-            $pageSize = max(5, min(50, (int)($_POST['pageSize'] ?? 20)));
-            $search   = trim(strtolower($_POST['search'] ?? ''));
-            $offset   = ($page - 1) * $pageSize;
-    
-            // Create cache key for this request
-            $cacheKey = "pending_users_" . md5($search . $page . $pageSize);
-            $cachedResult = cache_get($cacheKey, 120); // 2-minute cache
-            
-            if ($cachedResult !== null) {
-                echo json_encode($cachedResult);
-                exit();
-            }
-    
-            $users = [];
-            $total = 0;
-    
-            // Use REST API approach which is more reliable
-            if ($search) {
-                // Search functionality using REST API
-                $searchResults = search_pending_users_rest($search, $pageSize, $offset);
-                $users = $searchResults['users'];
-                $total = $searchResults['total'];
-                
-                // Check for errors in search results
-                if (isset($searchResults['error'])) {
-                    throw new Exception('Search failed: ' . $searchResults['error']);
-                }
-            } else {
-                // Simple paginated query without search
-                    $restResults = get_pending_users_rest($pageSize, $offset);
-                    $users = $restResults['users'];
-                    $total = $restResults['total'];
-                
-                // Check for errors in rest results
-                if (isset($restResults['error'])) {
-                    throw new Exception('Query failed: ' . $restResults['error']);
-                }
-            }
-            
-            $result = [
-                'success' => true,
-                'data' => $users,
-                'total' => $total,
-                'page' => $page,
-                'pageSize' => $pageSize,
-                'hasMore' => ($offset + count($users)) < $total,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms',
-                'cached' => false
-            ];
-            
-            // Cache successful results
-            cache_set($cacheKey, $result);
-            
-            echo json_encode($result);
-        } catch (Throwable $e) {
-            $errorMessage = $e->getMessage();
-            
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to load pending users: ' . $errorMessage,
-                'retry' => true,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        }
-        exit();
-    }
-    
-    // DEBUG: Test specific user lookup
-    if ($isAdmin && $action === 'debug_user') {
-        // Clean output buffer to ensure valid JSON
-        if (ob_get_length()) ob_clean();
-        header('Content-Type: application/json');
-
-        $userId = $_POST['userId'] ?? '';
-        if (empty($userId)) {
-            echo json_encode(['success' => false, 'message' => 'User ID required']);
-            exit();
-        }
-        
-        try {
-            global $firestore;
-            if ($firestore) {
-                $userDoc = $firestore->collection('users')->document($userId)->snapshot();
-                if ($userDoc->exists()) {
-                    $userData = $userDoc->data();
-                    echo json_encode([
-                        'success' => true,
-                        'message' => 'User found in Firestore',
-                        'data' => $userData,
-                        'accountStatus' => $userData['accountStatus'] ?? 'not set',
-                        'hasAccountStatus' => isset($userData['accountStatus'])
-                    ]);
-                } else {
-                    echo json_encode(['success' => false, 'message' => 'User not found in Firestore']);
-                }
-            } else {
-                echo json_encode(['success' => false, 'message' => 'Firestore not initialized']);
-            }
-        } catch (Exception $e) {
-            echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
-        }
-        exit();
-    }
-
-    // AJAX: Recent feed for admin dashboard with optimized caching and filtering
-    if ($isAdmin && $action === 'recent_feed') {
-        // Disable error display to prevent JSON corruption
-        ini_set('display_errors', 0);
-        error_reporting(0);
-        
-        $startTime = microtime(true);
-        
-        // Clean output buffer to ensure valid JSON
-        if (ob_get_length()) ob_clean();
-        header('Content-Type: application/json');
-        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-        header('Pragma: no-cache');
-        
-        $page = max(1, (int)($_POST['page'] ?? 1));
-        $pageSize = max(5, min(50, (int)($_POST['pageSize'] ?? 20)));
-        $search = trim(strtolower($_POST['search'] ?? ''));
-        $categoryFilter = trim($_POST['category'] ?? 'all');
-        $statusFilter = trim($_POST['status'] ?? 'all');
-        
-        try {
-            // Check if force refresh is requested
-            $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
-            $debugClient = isset($_POST['debug']) && $_POST['debug'] === 'true';
-            
-            // For realtime: when force_refresh is true, always go directly to Firestore
-            if ($forceRefresh) {
-                // Parallel ORDERED runQuery fetch (reliable newest-first)
-                $allRecent = empty($categories) ? [] : build_recent_feed_ultra_fast_runquery($categories, $categoryFilter, $statusFilter, $search, 10);
-                $cacheHit = false;
-            } else {
-                // Create cache key based on filters
-                $cacheKey = "recent_feed_" . md5($search . $categoryFilter . $statusFilter);
-                
-                // Use cache with tiny TTL (1 second)
-                $cachedData = cache_get($cacheKey, 1);
-                $cacheHit = ($cachedData !== null);
-                
-                if ($cachedData === null) {
-                    $allRecent = empty($categories) ? [] : build_recent_feed_ultra_fast_runquery($categories, $categoryFilter, $statusFilter, $search, 10);
-                    cache_set($cacheKey, $allRecent, 1);
-                } else {
-                    $allRecent = $cachedData;
-                }
-            }
-            
-            $total = count($allRecent);
-            $offset = ($page - 1) * $pageSize;
-            $paginatedRecent = array_slice($allRecent, $offset, $pageSize);
-            
-            // Final buffer clean before output
-            if (ob_get_length()) ob_clean();
-            
-            echo json_encode([
-                'success' => true,
-                'data' => $paginatedRecent,
-                'total' => $total,
-                'page' => $page,
-                'pageSize' => $pageSize,
-                'hasMore' => ($offset + $pageSize) < $total,
-                'meta' => [
-                    'serverNow' => date('c'),
-                    'cache' => [
-                        'hit' => $cacheHit,
-                        'forceRefresh' => $forceRefresh,
-                    ],
-                ],
-                'filters' => [
-                    'search' => $search,
-                    'category' => $categoryFilter,
-                    'status' => $statusFilter
-                ],
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        } catch (Exception $e) {
-            // Final buffer clean before error output
-            if (ob_get_length()) ob_clean();
-            
-            error_log("Recent activity error: " . $e->getMessage() . " Stack: " . $e->getTraceAsString());
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to load recent activity: ' . $e->getMessage(),
-                'retry' => true,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        }
-        exit();
-    }
-
-    // AJAX: Load admin dashboard stats (optimized for performance)
-    if ($isAdmin && $action === 'load_admin_stats') {
-        $startTime = microtime(true);
-        
-        // Clean output buffer to ensure valid JSON
-        if (ob_get_length()) ob_clean();
-        header('Content-Type: application/json');
-        
-        try {
-            // Check cache first with aggressive caching for admin dashboard
-            $cacheKey = 'admin_stats_' . $userRole;
-            $adminStats = cache_get($cacheKey, 60); // 60-second cache for better performance
-            
-            // Check if we need to force refresh (cache busting)
-            $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
-            
-            if ($adminStats === null || $forceRefresh) {
-                if ($forceRefresh) {
-                    // Clear cache if forcing refresh
-                    cache_delete($cacheKey);
-                    $adminStats = null;
-                }
-                
-                $adminStats = [];
-                
-                // Get all collection names
-                $collections = array_map(fn($meta) => $meta['collection'], $categories);
-                
-                // Safety check
-                if (empty($collections)) {
-                    throw new Exception("No collections found");
-                }
-                
-                // Get optimized counts for all collections (using fallback to working method)
-                $countResults = get_admin_stats_counts_fallback($collections);
-                
-                // Map results back to category slugs
-                foreach ($categories as $slug => $meta) {
-                    $col = $meta['collection'];
-                    $adminStats[$slug] = [
-                        'total'    => $countResults[$col]['total'] ?? 0,
-                        'approved' => $countResults[$col]['approved'] ?? 0,
-                        'pending'  => $countResults[$col]['pending'] ?? 0,
-                        'declined' => $countResults[$col]['declined'] ?? 0,
-                        'responded' => $countResults[$col]['responded'] ?? 0,
-                    ];
-                }
-                
-                // Cache the results for 60 seconds
-                cache_set($cacheKey, $adminStats, 60);
-            }
-            
-            echo json_encode([
-                'success' => true,
-                'data' => $adminStats,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        } catch (Exception $e) {
-            error_log("Admin stats error: " . $e->getMessage() . " Stack: " . $e->getTraceAsString());
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to load admin stats: ' . $e->getMessage(),
-                'retry' => true,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        }
-        exit();
-    }
-
-    // AJAX: Load analytics counts (fast, cached) for both admin and staff
-    if ($action === 'load_analytics_counts') {
-        $startTime = microtime(true);
-
-        // Clean output buffer to ensure valid JSON
-        if (ob_get_length()) ob_clean();
-        header('Content-Type: application/json');
-        header('Cache-Control: no-cache');
-
-        try {
-            // Determine which category slugs are allowed for this user
-            $allowedSlugs = [];
-            if ($isAdmin) {
-                $allowedSlugs = array_keys($categories);
-            } else {
-                $profile = get_user_profile($userId);
-                $assigned = array_values(array_filter(array_map('strval', $profile['categories'] ?? [])));
-                foreach ($assigned as $slug) {
-                    if (isset($categories[$slug])) $allowedSlugs[] = $slug;
-                }
-            }
-
-            $allowedSlugs = array_values(array_unique($allowedSlugs));
-            sort($allowedSlugs);
-
-            $cacheKey = 'analytics_counts_' . ($isAdmin ? 'admin' : 'staff') . '_' . md5(implode(',', $allowedSlugs));
-            $forceRefresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] === 'true';
-            
-            // Always try to get cached data first for immediate response
-            $cachedPayload = cache_get($cacheKey, 300); // 5 minute cache
-            
-            // If we have cache and not forcing refresh, return immediately
-            if (is_array($cachedPayload) && !$forceRefresh) {
-                $cachedPayload['executionTime'] = round((microtime(true) - $startTime) * 1000, 2) . 'ms';
-                $cachedPayload['cached'] = true;
-                echo json_encode($cachedPayload);
-                exit();
-            }
-            
-            // Fetch fresh data
-            $payload = null;
-            if (!is_array($cachedPayload) || $forceRefresh) {
-                $collections = [];
-                foreach ($allowedSlugs as $slug) {
-                    $collections[] = $categories[$slug]['collection'];
-                }
-
-                if (empty($collections)) {
-                    $countResults = [];
-                } else {
-                    // Prefer parallel aggregation counts when available.
-                    $countResults = function_exists('get_admin_stats_counts_fast')
-                        ? get_admin_stats_counts_fast($collections)
-                        : get_admin_stats_counts_fallback($collections);
-                }
-
-                $bySlug = [];
-                $grand = ['total' => 0, 'pending' => 0, 'approved' => 0, 'declined' => 0, 'responded' => 0];
-
-                foreach ($allowedSlugs as $slug) {
-                    $col = $categories[$slug]['collection'];
-                    $row = [
-                        'total'     => (int)($countResults[$col]['total'] ?? 0),
-                        'pending'   => (int)($countResults[$col]['pending'] ?? 0),
-                        'approved'  => (int)($countResults[$col]['approved'] ?? 0),
-                        'declined'  => (int)($countResults[$col]['declined'] ?? 0),
-                        'responded' => (int)($countResults[$col]['responded'] ?? 0),
-                    ];
-                    $bySlug[$slug] = $row;
-                    $grand['total'] += $row['total'];
-                    $grand['pending'] += $row['pending'];
-                    $grand['approved'] += $row['approved'];
-                    $grand['declined'] += $row['declined'];
-                    $grand['responded'] += $row['responded'];
-                }
-
-                $payload = [
-                    'success' => true,
-                    'grand' => $grand,
-                    'bySlug' => $bySlug,
-                ];
-
-                cache_set($cacheKey, $payload, 120);
-            }
-
-            $payload['executionTime'] = round((microtime(true) - $startTime) * 1000, 2) . 'ms';
-            echo json_encode($payload);
-        } catch (Throwable $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to load analytics counts: ' . $e->getMessage(),
-                'retry' => true,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        }
-        exit();
-    }
-
-    // AJAX: Analytics charts + metrics (cached, minimal data)
-    if ($action === 'get_analytics_data') {
-        $startTime = microtime(true);
-        if (ob_get_length()) ob_clean();
-        header('Content-Type: application/json');
-
-        try {
-            $range = $_POST['range'] ?? 'week';
-            $range = in_array($range, ['day','week','month'], true) ? $range : 'week';
-
-            // Determine allowed slugs for current user
-            if ($isAdmin) {
-                $allowedSlugs = array_keys($categories);
-            } else {
-                $allowedSlugs = array_values(array_filter(array_map('strval', $_SESSION['user_categories'] ?? [])));
-                $allowedSlugs = array_values(array_filter($allowedSlugs, fn($s) => isset($categories[$s])));
-            }
-            $allowedSlugs = array_values(array_unique($allowedSlugs));
-            sort($allowedSlugs);
-
-            $cacheKey = 'analytics_data_' . $range . '_' . ($isAdmin ? 'admin' : 'staff') . '_' . md5(implode(',', $allowedSlugs));
-            $cached = cache_get($cacheKey, 120);
-            if (is_array($cached)) {
-                $cached['executionTime'] = round((microtime(true) - $startTime) * 1000, 2) . 'ms';
-                $cached['cached'] = true;
-                echo json_encode($cached);
-                exit();
-            }
-
-            // Category totals via existing fast counts
-            $collections = [];
-            foreach ($allowedSlugs as $slug) {
-                $collections[] = $categories[$slug]['collection'];
-            }
-            if (empty($collections)) {
-                $countResults = [];
-            } else {
-                // Prefer parallel aggregation counts when available.
-                $countResults = function_exists('get_admin_stats_counts_fast')
-                    ? get_admin_stats_counts_fast($collections)
-                    : get_admin_stats_counts_fallback($collections);
-            }
-
-            $categoryLabels = [];
-            $categoryData = [];
-            $respondedTotal = 0;
-            $totalReports = 0;
-
-            foreach ($allowedSlugs as $slug) {
-                $meta = $categories[$slug];
-                $col = $meta['collection'];
-                $total = (int)($countResults[$col]['total'] ?? 0);
-                $responded = (int)($countResults[$col]['responded'] ?? 0);
-                $totalReports += $total;
-                $respondedTotal += $responded;
-                $categoryLabels[] = $meta['label'];
-                $categoryData[] = $total;
-            }
-
-            // Trend data (fast heuristic): bucket last N recent docs by date
-            $days = ($range === 'day') ? 1 : (($range === 'month') ? 30 : 7);
-            $trendLabels = [];
-            $trendCounts = [];
-            for ($i = $days - 1; $i >= 0; $i--) {
-                $label = date('M j', strtotime("-$i day"));
-                $key = date('Y-m-d', strtotime("-$i day"));
-                $trendLabels[] = $label;
-                $trendCounts[$key] = 0;
-            }
-
-            $parseDateKey = function($ts): ?string {
-                if (is_array($ts) && isset($ts['_seconds'])) {
-                    return date('Y-m-d', (int)$ts['_seconds']);
-                }
-                if ($ts instanceof \Google\Cloud\Core\Timestamp) {
-                    try { return $ts->get()->format('Y-m-d'); } catch (Throwable $e) { return null; }
-                }
-                if (is_string($ts) && $ts !== '') {
-                    $t = strtotime($ts);
-                    if ($t !== false) return date('Y-m-d', $t);
-                }
-                return null;
-            };
-
-            // Parallel list-documents sampling for trend (fast + avoids sequential calls)
-            $sampleLimit = ($range === 'month') ? 40 : 20;
-            try {
-                $token = firestore_rest_token();
-                $base  = firestore_base_url();
-                $mh = curl_multi_init();
-                $handles = [];
-                foreach ($allowedSlugs as $slug) {
-                    $col = $categories[$slug]['collection'];
-                    $url = $base . '/' . rawurlencode($col) . '?pageSize=' . (int)$sampleLimit;
-                    $ch = curl_init();
-                    curl_setopt_array($ch, [
-                        CURLOPT_URL => $url,
-                        CURLOPT_RETURNTRANSFER => true,
-                        CURLOPT_HTTPHEADER => [
-                            'Authorization: Bearer ' . $token,
-                            'Accept: application/json',
-                        ],
-                        CURLOPT_TIMEOUT => 10,
-                        CURLOPT_CONNECTTIMEOUT => 4,
-                        CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
-                        CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
-                    ]);
-                    curl_multi_add_handle($mh, $ch);
-                    $handles[] = $ch;
-                }
-
-                $running = null;
-                do {
-                    curl_multi_exec($mh, $running);
-                    curl_multi_select($mh, 0.2);
-                } while ($running > 0);
-
-                foreach ($handles as $ch) {
-                    $raw  = curl_multi_getcontent($ch);
-                    $http = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                    curl_multi_remove_handle($mh, $ch);
-                    curl_close($ch);
-                    if ($http < 200 || $http >= 300) continue;
-
-                    $json = json_decode($raw ?: 'null', true);
-                    $docs = is_array($json) ? ($json['documents'] ?? []) : [];
-                    if (!is_array($docs)) continue;
-
-                    foreach ($docs as $doc) {
-                        // createTime exists for every doc and is enough for trend buckets.
-                        $k = $parseDateKey($doc['createTime'] ?? null);
-                        if ($k !== null && isset($trendCounts[$k])) {
-                            $trendCounts[$k]++;
-                        }
-                    }
-                }
-
-                curl_multi_close($mh);
-            } catch (Throwable $e) {
-                // If sampling fails, keep zeros; counts/metrics still work.
-            }
-            $trendData = array_values($trendCounts);
-
-            // Response time chart (optional; keep fast and safe)
-            $responseTimeData = [0, 0, 0, 0, 0];
-
-            $responseRate = $totalReports > 0 ? round(($respondedTotal / $totalReports) * 100, 1) : 0;
-
-            $payload = [
-                'success' => true,
-                'data' => [
-                    'categoryLabels' => $categoryLabels,
-                    'categoryData' => $categoryData,
-                    'trendLabels' => $trendLabels,
-                    'trendData' => $trendData,
-                    'responseTimeData' => $responseTimeData,
-                    'metrics' => [
-                        'totalReports' => $totalReports,
-                        'responseRate' => $responseRate,
-                        'avgResponseTime' => 0,
-                        'activeResponders' => 0,
-                    ]
-                ]
-            ];
-
-            cache_set($cacheKey, $payload, 120);
-            $payload['executionTime'] = round((microtime(true) - $startTime) * 1000, 2) . 'ms';
-            $payload['cached'] = false;
-            echo json_encode($payload);
-        } catch (Throwable $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to load analytics data: ' . $e->getMessage(),
-                'retry' => true,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        }
-        exit();
-    }
-
-    // Debug: Test Firestore connection
-    if ($isAdmin && $action === 'test_connection') {
-        $testResult = test_firestore_connection();
-        echo json_encode($testResult);
-        exit();
-    }
-
-    // Lightweight approve/reject (accept both userId & uid)
-    if ($isAdmin && $action === 'verify_user') {
-        require_once __DIR__ . '/notification_system.php';
-        $uid = trim($_POST['userId'] ?? ($_POST['uid'] ?? ''));
-        $decision = strtolower(trim($_POST['decision'] ?? ''));
-        if (!$uid || !in_array($decision, ['approved','rejected'], true)) {
-            echo json_encode(['success'=>false,'message'=>'Invalid request']); exit();
-        }
-        $ok = update_user_status($uid, $decision);
-        if ($ok) {
-            // Notify the user about the registration decision
-            if (function_exists('send_fcm_notification_to_user')) {
-                $title = ($decision === 'approved') ? 'Account Approved' : 'Account Rejected';
-                $body  = ($decision === 'approved')
-                    ? 'Your registration has been approved. You can now log in.'
-                    : 'Your registration was rejected. Please contact support for assistance.';
-                $data  = ['type' => 'registration_status', 'status' => $decision];
-                try { send_fcm_notification_to_user($uid, $title, $body, $data); } catch (Throwable $e) { error_log('FCM notify (verify_user) failed: '.$e->getMessage()); }
-            }
-            // Invalidate cached dashboard data when user status changes
-            unset($_SESSION['__cache']['admin_stats'], $_SESSION['__cache']['recent_feed']);
-            echo json_encode(['success'=>true,'message'=>"User {$decision}"]);
-        } else {
-            echo json_encode(['success'=>false,'message'=>'Update failed']);
-        }
-        exit();
-    }
-
-    // Staff: Load assigned reports data (optimized for performance)
-    if (!$isAdmin && $action === 'load_staff_data') {
-        $startTime = microtime(true);
-        
-        try {
-            $profile  = get_user_profile($userId);
-            $assigned = array_values(array_filter(array_map('strval', $profile['categories'] ?? [])));
-            
-            $cards = [];
-            foreach ($assigned as $slug) {
-                if (!isset($categories[$slug])) continue;
-                $reports = list_latest_reports($categories[$slug]['collection'], 50);
-                
-                // Sort reports by timestamp (newest first)
-                usort($reports, function($a, $b) {
-                    $timeA = $a['timestamp'] ?? '';
-                    $timeB = $b['timestamp'] ?? '';
-                    
-                    $secondsA = is_array($timeA) && isset($timeA['_seconds']) ? $timeA['_seconds'] : strtotime($timeA);
-                    $secondsB = is_array($timeB) && isset($timeB['_seconds']) ? $timeB['_seconds'] : strtotime($timeB);
-                    
-                    return $secondsB - $secondsA;
-                });
-                
-                $cards[$slug] = $reports;
-            }
-            
-            echo json_encode([
-                'success' => true,
-                'data' => [
-                    'profile' => $profile,
-                    'assigned' => $assigned,
-                    'cards' => $cards,
-                ],
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to load staff data: ' . $e->getMessage(),
-                'retry' => true,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        }
-        exit();
-    }
-
-    // Staff: Check for urgent reports
-    if (!$isAdmin && $action === 'check_urgent') {
-        $startTime = microtime(true);
-        
-        try {
-            require_once __DIR__ . '/notification_system.php';
-            // Get user profile to know assigned categories FIRST
-            $userProfile = get_user_profile($userId);
-            $userCategories = $userProfile['categories'] ?? [];
-            
-            // FIXED: Pass user categories to only get reports for their assigned categories
-            $urgentReports = check_urgent_reports($userCategories);
-            
-            // Create notifications for urgent reports
-            check_and_create_notifications($userCategories);
-            
-            echo json_encode([
-                'success' => true,
-                'data' => $urgentReports,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms',
-                'filteredFor' => $userCategories // Debug info
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to check urgent reports: ' . $e->getMessage(),
-                'retry' => true,
-                'executionTime' => round((microtime(true) - $startTime) * 1000, 2) . 'ms'
-            ]);
-        }
-        exit();
-    }
-
-    // Staff: Get notification count
-    if (!$isAdmin && $action === 'get_notification_count') {
-        try {
-            require_once __DIR__ . '/notification_system.php';
-            // Get user profile to know assigned categories
-            $userProfile = get_user_profile($userId);
-            $userCategories = $userProfile['categories'] ?? [];
-            
-            $notifications = get_staff_notifications(50, $userCategories);
-            $count = count($notifications);
-            
-            echo json_encode([
-                'success' => true,
-                'count' => $count
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'count' => 0,
-                'message' => 'Failed to get notification count: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // Staff: Get notifications
-    if (!$isAdmin && $action === 'get_notifications') {
-        try {
-            require_once __DIR__ . '/notification_system.php';
-            // Get user profile to know assigned categories
-            $userProfile = get_user_profile($userId);
-            $userCategories = $userProfile['categories'] ?? [];
-            
-            $notifications = get_staff_notifications(20, $userCategories);
-            
-            echo json_encode([
-                'success' => true,
-                'notifications' => $notifications
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'notifications' => [],
-                'message' => 'Failed to get notifications: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // Staff: Mark notification as read
-    if (!$isAdmin && $action === 'mark_notification_read') {
-        $notificationId = $_POST['notification_id'] ?? '';
-        
-        if (empty($notificationId)) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Notification ID is required'
-            ]);
-            exit();
-        }
-        
-        try {
-            require_once __DIR__ . '/notification_system.php';
-            $success = mark_notification_read($notificationId);
-            
-            echo json_encode([
-                'success' => $success,
-                'message' => $success ? 'Notification marked as read' : 'Failed to mark notification as read'
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to mark notification as read: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // Staff: Create notifications for urgent reports
-    if (!$isAdmin && $action === 'create_notifications') {
-        try {
-            require_once __DIR__ . '/notification_system.php';
-            // Get user profile to know assigned categories
-            $userProfile = get_user_profile($userId);
-            $userCategories = $userProfile['categories'] ?? [];
-            
-            check_and_create_notifications($userCategories);
-            
-            echo json_encode([
-                'success' => true,
-                'message' => 'Notifications created successfully'
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to create notifications: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // Staff: Cleanup notifications (debug and fix count issues)
-    if (!$isAdmin && $action === 'cleanup_notifications') {
-        try {
-            require_once __DIR__ . '/notification_system.php';
-            $cleanedCount = cleanup_orphaned_notifications();
-            
-            echo json_encode([
-                'success' => true,
-                'message' => "Cleaned up {$cleanedCount} orphaned notifications",
-                'cleanedCount' => $cleanedCount
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to cleanup notifications: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // Staff: Cleanup corrupted notifications (fix count issues)
-    if (!$isAdmin && $action === 'cleanup_corrupted_notifications') {
-        try {
-            $cleanedCount = cleanup_corrupted_notifications();
-            
-            echo json_encode([
-                'success' => true,
-                'message' => "Cleaned up {$cleanedCount} corrupted notifications",
-                'cleanedCount' => $cleanedCount
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to cleanup corrupted notifications: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // Staff: Debug notifications (get all notifications for troubleshooting)
-    if (!$isAdmin && $action === 'debug_notifications') {
-        try {
-            // Get user profile to know assigned categories
-            $userProfile = get_user_profile($userId);
-            $userCategories = $userProfile['categories'] ?? [];
-            
-            $allNotifications = debug_all_notifications();
-            $unreadNotifications = get_staff_notifications(100, $userCategories);
-            
-            echo json_encode([
-                'success' => true,
-                'allCount' => count($allNotifications),
-                'unreadCount' => count($unreadNotifications),
-                'allNotifications' => $allNotifications,
-                'unreadNotifications' => $unreadNotifications
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to debug notifications: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // Staff: Create notification for new report (real-time)
-    if (!$isAdmin && $action === 'create_notification_for_report') {
-        try {
-            $collection = $_POST['collection'] ?? '';
-            $reportId = $_POST['reportId'] ?? '';
-            $reportData = json_decode($_POST['reportData'] ?? '{}', true);
-            
-            if (empty($collection) || empty($reportId) || empty($reportData)) {
-                echo json_encode([
-                    'success' => false,
-                    'message' => 'Missing required data'
-                ]);
-                exit();
-            }
-            
-            // Get user profile to know assigned categories
-            $userProfile = get_user_profile($userId);
-            $userCategories = $userProfile['categories'] ?? [];
-            
-            // Check if user has access to this collection
-            $collectionToCategory = [
-                'ambulance_reports' => 'ambulance',
-                'fire_reports' => 'fire',
-                'flood_reports' => 'flood',
-                'other_reports' => 'other',
-                'tanod_reports' => 'tanod'
-            ];
-            
-            $category = $collectionToCategory[$collection] ?? '';
-            if (!empty($userCategories) && !in_array($category, $userCategories)) {
-                // User doesn't have access to this category
-                echo json_encode([
-                    'success' => true,
-                    'message' => 'Notification not created - user not assigned to this category'
-                ]);
-                exit();
-            }
-            
-            // Create notification for this new report
-            $reporterName = $reportData['fullName'] ?? $reportData['reporterName'] ?? 'Unknown';
-            $location = $reportData['location'] ?? 'Unknown location';
-            $description = $reportData['purpose'] ?? $reportData['description'] ?? 'No description';
-            
-            // Create appropriate title based on collection type
-            $collectionLabels = [
-                'ambulance_reports' => '🚑 Ambulance',
-                'fire_reports' => '🔥 Fire',
-                'flood_reports' => '🌊 Flood',
-                'other_reports' => '📋 Other',
-                'tanod_reports' => '👮 Tanod'
-            ];
-            
-            $collectionLabel = $collectionLabels[$collection] ?? '📋 Report';
-            
-            // Create notification for this new report
-            $title = "{$collectionLabel} - {$reporterName}";
-            $message = "New pending report from {$reporterName} at {$location}. {$description}";
-            
-            $notificationData = [
-                'reportId' => $reportId,
-                'reporterName' => $reporterName,
-                'location' => $location,
-                'description' => $description,
-                'timestamp' => $reportData['timestamp'] ?? null,
-                'status' => 'Pending',
-                'collection' => $collection
-            ];
-            
-            $success = create_staff_notification(
-                NOTIFICATION_TYPE_URGENT,
-                $title,
-                $message,
-                $notificationData
-            );
-            
-            echo json_encode([
-                'success' => $success,
-                'message' => $success ? 'Notification created successfully' : 'Failed to create notification'
-            ]);
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to create notification: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // AJAX: Get specific report data (for modal fallback)
-    if ($action === 'get_report_data') {
-        header('Content-Type: application/json');
-        
-        $collection = $_POST['collection'] ?? '';
-        $docId = $_POST['docId'] ?? '';
-        
-        if (empty($collection) || empty($docId)) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Collection and docId are required'
-            ]);
-            exit();
-        }
-        
-        try {
-            // Get the report data directly from Firestore
-            if (function_exists('firestore_get_doc_by_id')) {
-                $reportData = firestore_get_doc_by_id($collection, $docId);
-                if ($reportData) {
-                    echo json_encode([
-                        'success' => true,
-                        'data' => $reportData
-                    ]);
-                } else {
-                    echo json_encode([
-                        'success' => false,
-                        'message' => 'Report not found'
-                    ]);
-                }
-            } else {
-                // Fallback to REST API
-                $url = firestore_base_url() . '/documents/' . rawurlencode($collection) . '/' . rawurlencode($docId);
-                $response = firestore_rest_request('GET', $url);
-                
-                if (isset($response['fields'])) {
-                    $reportData = firestore_decode_fields($response['fields']);
-                    echo json_encode([
-                        'success' => true,
-                        'data' => $reportData
-                    ]);
-                } else {
-                    echo json_encode([
-                        'success' => false,
-                        'message' => 'Report not found'
-                    ]);
-                }
-            }
-        } catch (Exception $e) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to fetch report data: ' . $e->getMessage()
-            ]);
-        }
-        exit();
-    }
-
-    // Check for new reports (real-time sync) - For both Staff and Admin
-    if ($action === 'check_new_reports') {
-        // Ensure we return JSON
-        header('Content-Type: application/json');
-        $lastCheckTime = $_POST['last_check'] ?? '';
-        
-        try {
-            $newReports = [];
-            $userCategories = [];
-            
-            if ($isAdmin) {
-                // Admin checks all categories
-                $userCategories = array_keys($categories);
-            } else {
-                // Staff checks assigned categories
-                $userProfile = get_user_profile($_SESSION['user_id']);
-                if ($userProfile && !empty($userProfile['categories'])) {
-                    $userCategories = $userProfile['categories'];
-                }
-            }
-            
-            if (empty($userCategories)) {
-                echo json_encode([
-                    'success' => true,
-                    'hasNew' => false,
-                    'data' => []
-                ]);
-                exit();
-            }
-            
-            foreach ($userCategories as $category) {
-                // Use the global categories array instead of undefined function
-                if (!isset($categories[$category])) continue;
-                
-                $categoryMeta = $categories[$category];
-                $collection = $categoryMeta['collection'];
-                
-                // Get reports from the last 10 minutes (for real-time checking)
-                $url = firestore_base_url() . ':runQuery';
-                $body = [
-                    'structuredQuery' => [
-                        'from' => [['collectionId' => $collection]],
-                        'orderBy' => [
-                            ['field' => ['fieldPath' => 'timestamp'], 'direction' => 'DESCENDING']
-                        ],
-                        'limit' => 20
-                    ]
-                ];
-                
-                $response = firestore_rest_request('POST', $url, $body);
-                
-                if (is_array($response)) {
-                    foreach ($response as $row) {
-                        if (isset($row['document'])) {
-                            $doc = $row['document'];
-                            $data = firestore_decode_fields($doc['fields'] ?? []);
-                            $name = $doc['name'] ?? '';
-                            $data['id'] = $name ? basename($name) : '';
-                            $data['_created'] = $doc['createTime'] ?? null;
-                            
-                            // Check if this report is newer than last check
-                            $reportTime = $data['timestamp'] ?? '';
-                            if ($reportTime) {
-                                $reportSeconds = is_array($reportTime) && isset($reportTime['_seconds']) ? $reportTime['_seconds'] : strtotime($reportTime);
-                                $lastCheckSeconds = $lastCheckTime ? strtotime($lastCheckTime) : 0;
-                                
-                                if ($reportSeconds > $lastCheckSeconds) {
-                                    $newReports[] = [
-                                        'category' => $category,
-                                        'report' => $data
-                                    ];
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            echo json_encode([
-                'success' => true,
-                'hasNew' => !empty($newReports),
-                'data' => $newReports,
-                'timestamp' => date('Y-m-d H:i:s')
-            ]);
-        } catch (Exception $e) {
-            error_log('Error in check_new_reports: ' . $e->getMessage());
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to check for new reports: ' . $e->getMessage()
-            ]);
-        } catch (Error $e) {
-            error_log('Fatal error in check_new_reports: ' . $e->getMessage());
-            echo json_encode([
-                'success' => false,
-                'message' => 'System error occurred while checking for new reports'
-            ]);
-        }
-        exit();
-    }
-
-
-    echo json_encode($response);
-    exit();
-}
-
-
-# --- DATA FETCHING FOR VIEW (OPTIMIZED) ---
-$adminStats = [];
-$pendingUsers = [];
-$page_error_message = null; // Variable to hold any page-level error messages
-
-// OPTIMIZATION: Defer all heavy data loading to AJAX for faster page loads
-// This ensures pages load quickly and data is fetched asynchronously
-
-
-$cards = [];
-// Only pull staff profile and cards for staff users
-if (!$isAdmin) {
-    $profile  = get_user_profile($userId);
-    $assigned = array_values(array_filter(array_map('strval', $profile['categories'] ?? [])));
-    // OPTIMIZATION: Don't load heavy data during initial page render
-    // The cards will be loaded via AJAX after the page loads
-    $cards = []; // Empty initially, will be populated via AJAX
-} else {
-    // For admin, keep assigned list to all categories (used for labels elsewhere)
-    $assigned = array_keys($categories);
-}
-// --- VIEW HELPER FUNCTIONS ---
-function fmt_ts($ts): string {
-    if ($ts instanceof \Google\Cloud\Core\Timestamp) {
-        try { 
-            // Convert to Philippines timezone (UTC+8)
-            $timestamp = $ts->get();
-            if ($timestamp instanceof DateTime) {
-                return $timestamp->setTimezone(new DateTimeZone('Asia/Manila'))->format('M j, Y g:i A');
-            }
-            return '';
-        } catch (Throwable $e) { return ''; }
-    }
-    if (is_array($ts)) {
-        // Support Firestore timestamp-like arrays (e.g. ['_seconds'=>..., '_nanoseconds'=>...])
-        $sec = null;
-        if (isset($ts['_seconds']) && is_numeric($ts['_seconds'])) $sec = (int)$ts['_seconds'];
-        elseif (isset($ts['seconds']) && is_numeric($ts['seconds'])) $sec = (int)$ts['seconds'];
-        if ($sec !== null) {
-            try {
-                $dt = (new DateTimeImmutable('@' . $sec))->setTimezone(new DateTimeZone('Asia/Manila'));
-                return $dt->format('M j, Y g:i A');
-            } catch (Throwable $e) {
-                return '';
-            }
-        }
-    }
-    if (is_string($ts)) {
-        try { 
-            // Parse the timestamp and convert to Philippines timezone
-            $dateTime = new DateTimeImmutable($ts);
-            return $dateTime->setTimezone(new DateTimeZone('Asia/Manila'))->format('M j, Y g:i A'); 
-        } catch (Throwable $e) { return htmlspecialchars($ts); }
-    }
-    return '';
-}
-
-function svg_icon(string $name, string $class = 'w-6 h-6') {
-    $path = [
-        // ...existing icon paths...
-        'sun' => '<path stroke-linecap="round" stroke-linejoin="round" d="M12 3v2.25M12 18.75V21M4.219 4.219l1.591 1.591M18.19 18.19l1.591 1.59M3 12h2.25M18.75 12H21M4.219 19.781l1.591-1.591M18.19 5.81l1.591-1.591M12 8.25a3.75 3.75 0 100 7.5 3.75 3.75 0 000-7.5z" />',
-        'moon' => '<path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.718 9.718 0 1111 2.25a8.25 8.25 0 0010.752 12.752z" />',
-        'download' => '<path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M7.5 10.5L12 15m0 0l4.5-4.5M12 15V3" />',
-    ][$name] ?? ([
-        // keep original mapping
-        'dashboard' => '<path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />',
-        'logout' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9" />',
-        'truck' => '<path stroke-linecap="round" stroke-linejoin="round" d="M8.25 18.75a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h6m-9 0H3.375a1.125 1.125 0 01-1.125-1.125V14.25m17.25 4.5a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h1.125c.621 0 1.125-.504 1.125-1.125V14.25m-17.25 4.5v-1.875a3.375 3.375 0 003.375-3.375h1.5a1.125 1.125 0 011.125 1.125v-1.5a3.375 3.375 0 00-3.375-3.375H9.75V7.5h1.5a3.375 3.375 0 013.375 3.375v1.5a1.125 1.125 0 001.125 1.125h1.5a3.375 3.375 0 003.375-3.375V7.5a1.125 1.125 0 00-1.125-1.125H5.625" />',
-        'shield-check' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.286zm0 13.036h.008v.017h-.008v-.017z" />',
-        'fire' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15.362 5.214A8.252 8.252 0 0112 21 8.25 8.25 0 016.038 7.048 8.287 8.287 0 009 9.6a8.983 8.983 0 013.362-6.867 8.268 8.268 0 013 2.481z" /><path stroke-linecap="round" stroke-linejoin="round" d="M12 18a3.75 3.75 0 00.495-7.467 5.99 5.99 0 00-1.925 3.546 5.974 5.974 0 01-2.133-1.001A3.75 3.75 0 0012 18z" />',
-        'home' => '<path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M8.25 21h7.5" />',
-        'question-mark-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />',
-        'user-plus' => '<path stroke-linecap="round" stroke-linejoin="round" d="M19 7.5v3m0 0v3m0-3h3m-3 0h-3m-2.25-4.5a3 3 0 11-6 0 3 3 0 016 0zM4 18.75v-1.5a6.75 6.75 0 017.5-6.75h.5a6.75 6.75 0 016.75 6.75v1.5a6.75 6.75 0 01-6.75 6.75H9.75V21h7.5" />',
-        'user-shield' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z" />',
-        'user-check' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" /><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75" />',
-        'spinner' => '<path d="M21 12a9 9 0 11-6.219-8.56" />',
-        'x-mark' => '<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />',
-        'check' => '<path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" />',
-        'info' => '<path stroke-linecap="round" stroke-linejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.852l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />',
-        'eye' => '<path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />',
-        'check-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />',
-        'x-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M9.75 9.75l4.5 4.5m0-4.5l-4.5 4.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />',
-        'identification' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15 9h3.75M15 12h3.75M15 15h3.75M4.5 19.5h15a2.25 2.25 0 002.25-2.25V6.75A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25v10.5A2.25 2.25 0 004.5 19.5zm6-10.125a1.875 1.875 0 11-3.75 0 1.875 1.875 0 013.75 0zm1.294 6.336a6.721 6.721 0 01-3.17.789 6.721 6.721 0 01-3.168-.789 3.376 3.376 0 016.338 0z" />',
-        'user-circle' => '<path stroke-linecap="round" stroke-linejoin="round" d="M17.982 18.725A7.488 7.488 0 0012 15.75a7.488 7.488 0 00-5.982 2.975m11.963 0a9 9 0 10-11.963 0m11.963 0A8.966 8.966 0 0112 21a8.966 8.966 0 01-5.982-2.275M15 9.75a3 3 0 11-6 0 3 3 0 016 0z" />',
-        'chat' => '<path stroke-linecap="round" stroke-linejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z" />',
-        'paper-airplane' => '<path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />',
-        'map-pin' => '<path stroke-linecap="round" stroke-linejoin="round" d="M15 10.5a3 3 0 11-6 0 3 3 0 016 0z" /><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 10.5c0 7.142-7.5 11.25-7.5 11.25S4.5 17.642 4.5 10.5a7.5 7.5 0 1115 0z" />',
-    ][$name] ?? '');
-    return '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="'.$class.'">'.$path.'</svg>';
-}
-
-function render_report_table(array $list, string $collection, array $categories) {
-    if (empty($list)) {
-        echo '<div class="text-center py-16 animate-fade-in-up"><p class="text-slate-500">No reports in this list. ✨</p></div>';
-        return;
-    }
-
-    $slug = '';
-    foreach ($categories as $catSlug => $meta) {
-        if ($meta['collection'] === $collection) {
-            $slug = $catSlug;
-            break;
-        }
-    }
-
-    echo '<div class="overflow-x-auto table-premium"><table class="min-w-full text-sm">';
-    echo '<thead><tr>
-            <th class="p-4 text-left font-semibold text-slate-500 uppercase tracking-wider">Reporter Details</th>
-            <th class="p-4 text-left font-semibold text-slate-500 uppercase tracking-wider">Location</th>
-            <th class="p-4 text-left font-semibold text-slate-500 uppercase tracking-wider">Timestamp</th>
-            <th class="p-4 text-left font-semibold text-slate-500 uppercase tracking-wider">Status</th>
-            <th class="p-4 text-right font-semibold text-slate-500 uppercase tracking-wider">Actions</th>
-            </tr></thead><tbody class="divide-y divide-slate-200/50">';
-    foreach ($list as $i => $it) {
-        $st = strtolower((string)($it['status'] ?? ''));
-        $displayStatus = $it['status'] ?: 'Pending';
-        $isApproved = ($st === 'approved');
-        $isDeclined = ($st === 'declined');
-        $isFinal = $isApproved || $isDeclined;
-        $tDisplay = fmt_ts($it['timestamp']);
-        $imgUrl = $it['imageUrl'] ?? '';
-        
-        $statusClass = 'status-badge-pending';
-        if ($isApproved) $statusClass = 'status-badge-success';
-        if ($isDeclined) $statusClass = 'status-badge-declined';
-
-        // Check if this is an urgent report
-        $isUrgent = ($it['priority'] ?? '') === 'HIGH';
-        $urgentClass = $isUrgent ? 'bg-red-50/50 border-l-4 border-l-red-500' : '';
-        $urgentIcon = $isUrgent ? '🚨 ' : '';
-
-        $animDelay = 'style="--anim-delay: '.($i * 50).'ms"';
-
-        echo "<tr class='report-row animate-fade-in-up {$urgentClass}' {$animDelay} data-id='".htmlspecialchars($it['id'])."' data-collection='".htmlspecialchars($collection)."'>";
-        echo '<td class="p-4 whitespace-nowrap"><div class="font-semibold text-slate-800">'.$urgentIcon.htmlspecialchars($it['fullName'] ?: '—').'</div><div class="text-slate-500">'.htmlspecialchars(($it['mobileNumber'] ?? $it['contact']) ?: '—').'</div>'.($isUrgent ? '<div class="text-xs text-red-600 font-medium mt-1">⚡ HIGH PRIORITY</div>' : '').'</td>';
-        echo '<td class="p-4 text-slate-600 max-w-xs truncate">'.htmlspecialchars($it['location'] ?: '—').'</td>';
-        echo '<td class="p-4 text-slate-600 whitespace-nowrap">'.$tDisplay.'</td>';
-        echo '<td class="p-4"><span class="status-badge '.$statusClass.'"><span class="h-2 w-2 rounded-full bg-current mr-2"></span>'.htmlspecialchars($displayStatus).'</span>'.($isUrgent ? '<div class="text-xs text-red-600 font-medium mt-1">🚨 URGENT</div>' : '').'</td>';
-        
-        echo '<td class="p-4 text-right"><div class="inline-flex items-center gap-2">';
-        echo '<button type="button" class="btn btn-view" title="View Details"
-                    onclick="showReportModal(this)"
-                    data-slug="'.htmlspecialchars($slug).'"
-                    data-id="'.htmlspecialchars($it['id']).'"
-                    data-collection="'.htmlspecialchars($collection).'"
-                    data-fullname="'.htmlspecialchars($it['fullName'] ?? '').'" data-contact="'.htmlspecialchars($it['mobileNumber'] ?? $it['contact'] ?? '').'"
-                    data-location="'.htmlspecialchars($it['location'] ?? '').'"'.
-                    (($collection === 'tanod_reports' || $collection === 'other_reports') ? ' data-purpose="'.htmlspecialchars($it['purpose'] ?? $it['description'] ?? '', ENT_QUOTES).'"' : ' data-purpose=""').
-                    ' data-status="'.htmlspecialchars($displayStatus).'" data-timestamp="'.htmlspecialchars($tDisplay).'"'.
-                    ' data-reporterid="'.htmlspecialchars($it['reporterId'] ?? '').'" data-imageurl="'.htmlspecialchars($imgUrl).'">
-                    '.svg_icon('eye', 'w-4 h-4').'<span>View</span>
-                  </button>';
-        $approveBtnClass = $isFinal ? 'btn-disabled' : 'btn-approve';
-        echo '<button type="button" class="btn '.$approveBtnClass.'" '.($isFinal ? 'disabled' : '').' title="Approve Report" onclick="showApproveConfirmation(\''.htmlspecialchars($collection).'\', \''.htmlspecialchars($it['id']).'\', \''.htmlspecialchars($it['fullName']).'\', \''.htmlspecialchars($slug).'\')" '.($isFinal ? '' : '').'>
-                '.svg_icon('check-circle', 'w-4 h-4').'<span>Approve</span>
-              </button>';
-        $declineBtnClass = $isFinal ? 'btn-disabled' : 'btn-decline';
-        echo '<button type="button" class="btn '.$declineBtnClass.'" '.($isFinal ? 'disabled' : '').' title="Decline Report" onclick="showDeclineConfirmation(\''.htmlspecialchars($collection).'\', \''.htmlspecialchars($it['id']).'\', \''.htmlspecialchars($it['fullName']).'\', \''.htmlspecialchars($slug).'\')" '.($isFinal ? '' : '').'>
-                '.svg_icon('x-circle', 'w-4 h-4').'<span>Decline</span>
-              </button>';
-        echo '</div></td>';
-        echo '</tr>';
-    }
-    echo '</tbody></table></div>';
-}
-
-function render_user_verification_table(array $users) {
-    if (empty($users)) {
-        echo '<div class="text-center py-16"><p class="text-slate-500">No pending user registrations. ✨</p></div>';
-        return;
-    }
-
-    echo '<div class="overflow-x-auto table-premium"><table class="min-w-full text-sm">';
-    echo '<thead><tr>
-            <th class="p-4 text-left font-semibold text-slate-500 uppercase tracking-wider">User Details</th>
-            <th class="p-4 text-left font-semibold text-slate-500 uppercase tracking-wider">Contact</th>
-            <th class="p-4 text-left font-semibold text-slate-500 uppercase tracking-wider">Info</th>
-            <th class="p-4 text-right font-semibold text-slate-500 uppercase tracking-wider">Actions</th>
-            </tr></thead><tbody class="divide-y divide-slate-200/50">';
-    
-    foreach ($users as $i => $user) {
-        $uid = $user['id'] ?? '';
-        if (!$uid) continue; // Skip if no ID
-        
-        $fullName = htmlspecialchars($user['fullName'] ?? '—');
-        $username = htmlspecialchars($user['username'] ?? '—');
-        $email = htmlspecialchars($user['email'] ?? '—');
-        // Updated: prefer mobileNumber then legacy contact; add leading 0 if 10-digit PH mobile missing it
-        $contactRaw = $user['mobileNumber'] ?? $user['contact'] ?? '';
-        if ($contactRaw && strlen($contactRaw) === 10 && $contactRaw[0] === '9') {
-            $contactRaw = '0' . $contactRaw; // normalize to 11-digit format
-        }
-        $contact = htmlspecialchars($contactRaw ?: '—');
-        $address = htmlspecialchars($user['address'] ?? '—');
-        $birthdate = htmlspecialchars($user['birthdate'] ?? '—');
-        $proofPath = $user['proofOfResidencyPath'] ?? '';
-        $proofUrl = $proofPath ? 'proof_proxy.php?path=' . urlencode($proofPath) . '&user=' . urlencode($uid) : '';
-
-        $animDelay = 'style="--anim-delay: '.($i * 50).'ms"';
-
-        echo "<tr class='user-row animate-fade-in-up' {$animDelay} data-uid='{$uid}'>";
-        echo "<td class='p-4 whitespace-nowrap'>
-                <div class='font-semibold text-slate-800'>{$fullName}</div>
-                <div class='text-slate-500 font-mono text-xs'>@{$username}</div>
-              </td>";
-        echo "<td class='p-4 whitespace-nowrap'>
-                <div class='text-slate-800'>{$contact}</div>
-                <div class='text-slate-500 text-xs'>{$email}</div>
-              </td>";
-        echo "<td class='p-4 max-w-sm'>
-                <div class='text-slate-800 truncate' title='{$address}'>{$address}</div>
-                <div class='text-slate-500 text-xs'>Born: {$birthdate}</div>
-              </td>";
-        
-        echo '<td class="p-4 text-right"><div class="inline-flex items-center gap-2">';
-        
-        if ($proofUrl) {
-            echo '<button type="button" class="btn btn-view" title="View Proof of Residency"
-                    onclick="showProofModal(this)"
-                    data-fullname="'.htmlspecialchars($user['fullName'] ?? '').'"
-                    data-proofurl="'.htmlspecialchars($proofUrl).'">
-                    '.svg_icon('eye', 'w-4 h-4').'<span>View Proof</span>
-                  </button>';
-        }
-
-        echo '<form class="inline-flex" onsubmit="handleUserVerification(event)">
-                <input type="hidden" name="uid" value="'.htmlspecialchars($uid).'">
-                <input type="hidden" name="newStatus" value="approved">
-                <button type="submit" class="btn btn-approve" title="Approve Registration">
-                    '.svg_icon('check-circle', 'w-4 h-4').'<span>Approve</span>
-                </button>
-              </form>';
-        
-        echo '<form class="inline-flex" onsubmit="handleUserVerification(event)">
-                <input type="hidden" name="uid" value="'.htmlspecialchars($uid).'">
-                <input type="hidden" name="newStatus" value="rejected">
-                <button type="submit" class="btn btn-decline" title="Reject Registration">
-                    '.svg_icon('x-circle', 'w-4 h-4').'<span>Reject</span>
-                </button>
-              </form>';
-
-        echo '</div></td>';
-        echo '</tr>';
-    }
-    echo '</tbody></table></div>';
-}
-
-
-
-// REST API functions for getting pending users
-function get_pending_users_rest(int $pageSize, int $offset): array {
-    try {
-        $url = firestore_base_url() . ':runQuery';
-        // Try both 'accountStatus' and 'status' fields for backward compatibility
-        $body = [
-            'structuredQuery' => [
-                'from' => [['collectionId' => 'users']],
-                'where' => [
-                    'compositeFilter' => [
-                        'op' => 'OR',
-                        'filters' => [
-                            [
-                                'fieldFilter' => [
-                                    'field' => ['fieldPath' => 'accountStatus'],
-                                    'op' => 'EQUAL',
-                                    'value' => firestore_encode_value('pending')
-                                ]
-                            ],
-                            [
-                                'fieldFilter' => [
-                                    'field' => ['fieldPath' => 'status'],
-                                    'op' => 'EQUAL',
-                                    'value' => firestore_encode_value('pending')
-                                ]
-                            ]
-                        ]
-                    ]
-                ],
-                'limit' => $pageSize + $offset // Get enough documents to handle offset
-            ]
-        ];
-        
-        $response = firestore_rest_request('POST', $url, $body);
-        $allUsers = [];
-        
-        if (is_array($response)) {
-            foreach ($response as $row) {
-                if (!isset($row['document'])) continue;
-                $doc = $row['document'];
-                $userData = firestore_decode_fields($doc['fields'] ?? []);
-                $userData['id'] = basename($doc['name'] ?? '');
-                $allUsers[] = $userData;
-            }
-        }
-        
-        // Sort by fullName and apply offset and limit manually
-        usort($allUsers, function($a, $b) {
-            return strcasecmp($a['fullName'] ?? '', $b['fullName'] ?? '');
-        });
-        $users = array_slice($allUsers, $offset, $pageSize);
-        
-        // Get total count - using 'accountStatus' instead of 'status'
-        $total = firestore_count('users', 'accountStatus', 'pending');
-        
-        return ['users' => $users, 'total' => $total];
-    } catch (Exception $e) {
-        error_log("Error in get_pending_users_rest: " . $e->getMessage());
-        return ['users' => [], 'total' => 0, 'error' => $e->getMessage()];
-    }
-}
-
-
-
-// Search pending users using REST API
-function search_pending_users_rest(string $search, int $pageSize, int $offset): array {
-    try {
-        // Get all pending users (since Firestore doesn't support full-text search)
-        $url = firestore_base_url() . ':runQuery';
-        // Try both 'accountStatus' and 'status' fields for backward compatibility
-        $body = [
-            'structuredQuery' => [
-                'from' => [['collectionId' => 'users']],
-                'where' => [
-                    'compositeFilter' => [
-                        'op' => 'OR',
-                        'filters' => [
-                            [
-                                'fieldFilter' => [
-                                    'field' => ['fieldPath' => 'accountStatus'],
-                                    'op' => 'EQUAL',
-                                    'value' => firestore_encode_value('pending')
-                                ]
-                            ],
-                            [
-                                'fieldFilter' => [
-                                    'field' => ['fieldPath' => 'status'],
-                                    'op' => 'EQUAL',
-                                    'value' => firestore_encode_value('pending')
-                                ]
-                            ]
-                        ]
-                    ]
-                ],
-                'limit' => 1000 // Get more for search filtering
-            ]
-        ];
-        
-        $response = firestore_rest_request('POST', $url, $body);
-        $allUsers = [];
-        
-        if (is_array($response)) {
-            foreach ($response as $row) {
-                if (!isset($row['document'])) continue;
-                $doc = $row['document'];
-                $userData = firestore_decode_fields($doc['fields'] ?? []);
-                $userData['id'] = basename($doc['name'] ?? '');
-                $allUsers[] = $userData;
-            }
-        }
-        
-        // Filter users based on search term - updated to include new fields
-        $filteredUsers = array_filter($allUsers, function($user) use ($search) {
-            $searchableText = strtolower(
-                ($user['fullName'] ?? '') . ' ' .
-                ($user['firstName'] ?? '') . ' ' .
-                ($user['lastName'] ?? '') . ' ' .
-                ($user['middleName'] ?? '') . ' ' .
-                ($user['email'] ?? '') . ' ' .
-                ($user['mobileNumber'] ?? '') . ' ' .
-                ($user['contact'] ?? '') // Fallback for old data
-            );
-            return strpos($searchableText, $search) !== false;
-        });
-        
-        // Convert to indexed array, sort, and apply pagination
-        $filteredUsers = array_values($filteredUsers);
-        usort($filteredUsers, function($a, $b) {
-            return strcasecmp($a['fullName'] ?? '', $b['fullName'] ?? '');
-        });
-        $total = count($filteredUsers);
-        $users = array_slice($filteredUsers, $offset, $pageSize);
-        
-        return ['users' => $users, 'total' => $total];
-    } catch (Exception $e) {
-        error_log("Error in search_pending_users_rest: " . $e->getMessage());
-        return ['users' => [], 'total' => 0, 'error' => $e->getMessage()];
-    }
-}
-?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>ManResponde • Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <?php echo csrf_meta(); ?>
-    
-    <!-- Favicon -->
-    <link rel="icon" type="image/png" sizes="32x32" href="responde.png">
-    <link rel="icon" type="image/png" sizes="16x16" href="responde.png">
-    <link rel="apple-touch-icon" href="responde.png">
-    <link rel="shortcut icon" href="responde.png">
-    
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Leaflet Map -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-    <style>
-        /* ========================================
-           PREMIUM DESIGN SYSTEM - PROFESSIONAL DASHBOARD
-           Sophisticated Color Palette | Aurora Effects | Glassmorphism
-           ======================================== */
-        
-        :root {
-            /* === PREMIUM COLOR PALETTE === */
-            --primary: #2563eb;
-            --primary-light: #3b82f6;
-            --primary-dark: #1d4ed8;
-            --accent: #06b6d4;
-            --accent-light: #0891b2;
-            --success: #10b981;
-            --success-light: #34d399;
-            --warning: #f59e0b;
-            --warning-light: #fbbf24;
-            --danger: #ef4444;
-            --danger-light: #f87171;
-            
-            /* === SOPHISTICATED NEUTRALS === */
-            --white: #ffffff;
-            --gray-50: #f8fafc;
-            --gray-100: #f1f5f9;
-            --gray-200: #e2e8f0;
-            --gray-300: #cbd5e1;
-            --gray-400: #94a3b8;
-            --gray-500: #64748b;
-            --gray-600: #475569;
-            --gray-700: #334155;
-            --gray-800: #1e293b;
-            --gray-900: #0f172a;
-            
-            /* === PREMIUM SHADOWS === */
-            --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-            --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-            --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-            --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
-            --shadow-2xl: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-            --shadow-inner: inset 0 2px 4px 0 rgba(0, 0, 0, 0.06);
-            
-            /* === GLASSMORPHISM === */
-            --glass-bg: rgba(255, 255, 255, 0.75);
-            --glass-border: rgba(255, 255, 255, 0.2);
-            --glass-blur: blur(20px);
-            
-            /* === TRANSITIONS === */
-            --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
-            --transition-smooth: 300ms cubic-bezier(0.4, 0, 0.2, 1);
-            --transition-slow: 500ms cubic-bezier(0.4, 0, 0.2, 1);
-            
-            /* === BORDER RADIUS === */
-            --radius-sm: 0.375rem;
-            --radius-md: 0.5rem;
-            --radius-lg: 0.75rem;
-            --radius-xl: 1rem;
-            --radius-2xl: 1.25rem;
-            --radius-3xl: 1.5rem;
-        }
-
-        /* === DARK MODE VARIABLES (DISABLED) === */
-        /* 
-        html.dark {
-            --white: #1e293b;
-            --gray-50: #334155;
-            --gray-100: #475569;
-            --gray-200: #64748b;
-            --gray-300: #94a3b8;
-            --gray-400: #cbd5e1;
-            --gray-500: #e2e8f0;
-            --gray-600: #f1f5f9;
-            --gray-700: #f8fafc;
-            --gray-800: #ffffff;
-            --gray-900: #ffffff;
-            
-            --glass-bg: rgba(30, 41, 59, 0.85);
-            --glass-border: rgba(255, 255, 255, 0.15);
-        }
-        */
-
-        /* ========================================
-           FOUNDATION STYLES
-           ======================================== */
-        
-        * {
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: var(--gray-50);
-            color: var(--gray-900);
-            line-height: 1.6;
-            -webkit-font-smoothing: antialiased;
-            -moz-osx-font-smoothing: grayscale;
-            font-feature-settings: "cv02", "cv03", "cv04", "cv11";
-            margin: 0;
-            padding: 0;
-            overflow-x: hidden;
-        }
-
-        /* ========================================
-           STUNNING AURORA BACKGROUND
-           ======================================== */
-        
-        .aurora-background {
-            position: relative;
-            min-height: 100vh;
-            background: linear-gradient(135deg, 
-                var(--gray-50) 0%, 
-                #fafbff 25%, 
-                #f0f4ff 50%, 
-                #e8f2ff 75%, 
-                var(--gray-100) 100%);
-            overflow: hidden;
-        }
-
-        .aurora-background::before {
-            content: '';
-            position: fixed;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: 
-                radial-gradient(ellipse 800px 600px at -10% -20%, rgba(59, 130, 246, 0.15), transparent 50%),
-                radial-gradient(ellipse 600px 800px at 110% -10%, rgba(16, 185, 129, 0.12), transparent 50%),
-                radial-gradient(ellipse 700px 500px at 50% 120%, rgba(139, 92, 246, 0.1), transparent 50%),
-                radial-gradient(ellipse 500px 400px at 80% 80%, rgba(6, 182, 212, 0.08), transparent 50%);
-            animation: aurora-drift 20s ease-in-out infinite alternate;
-            z-index: -1;
-        }
-
-        .aurora-background::after {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: 
-                radial-gradient(ellipse 400px 300px at 30% 70%, rgba(236, 72, 153, 0.08), transparent 40%),
-                radial-gradient(ellipse 300px 400px at 70% 30%, rgba(245, 158, 11, 0.06), transparent 40%);
-            animation: aurora-pulse 15s ease-in-out infinite alternate-reverse;
-            z-index: -1;
-        }
-
-        @keyframes aurora-drift {
-            0% { transform: translateX(0) translateY(0) rotate(0deg); }
-            50% { transform: translateX(100px) translateY(-50px) rotate(180deg); }
-            100% { transform: translateX(0) translateY(0) rotate(360deg); }
-        }
-
-        @keyframes aurora-pulse {
-            0% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.8; transform: scale(1.1); }
-            100% { opacity: 1; transform: scale(1); }
-        }
-
-        /* ========================================
-           PREMIUM GLASSMORPHISM COMPONENTS
-           ======================================== */
-        
-        .glass-card {
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            border: 1px solid var(--glass-border);
-            border-radius: var(--radius-2xl);
-            box-shadow: var(--shadow-xl), 
-                        0 0 0 1px rgba(255, 255, 255, 0.05),
-                        inset 0 1px 0 rgba(255, 255, 255, 0.1);
-            position: relative;
-            overflow: hidden;
-            transition: all var(--transition-smooth);
-        }
-
-        .glass-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 1px;
-            background: linear-gradient(90deg, 
-                transparent, 
-                rgba(255, 255, 255, 0.4), 
-                transparent);
-        }
-
-        .glass-card:hover {
-            transform: translateY(-2px);
-            box-shadow: var(--shadow-2xl), 
-                        0 0 0 1px rgba(255, 255, 255, 0.1),
-                        inset 0 1px 0 rgba(255, 255, 255, 0.15);
-        }
-
-        /* ========================================
-           SOPHISTICATED KPI CARDS
-           ======================================== */
-        
-        .kpi-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 2rem;
-        }
-
-        .kpi-card {
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            border: 1px solid var(--glass-border);
-            border-radius: var(--radius-xl);
-            padding: 1.75rem;
-            position: relative;
-            overflow: hidden;
-            transition: all var(--transition-smooth);
-            box-shadow: var(--shadow-lg),
-                        0 0 0 1px rgba(255, 255, 255, 0.05);
-        }
-
-        .kpi-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 3px;
-            background: linear-gradient(90deg, 
-                var(--primary) 0%, 
-                var(--accent) 50%, 
-                var(--success) 100%);
-            opacity: 0.8;
-        }
-
-        .kpi-card:hover {
-            transform: translateY(-4px) scale(1.02);
-            box-shadow: var(--shadow-2xl),
-                        0 0 0 1px rgba(255, 255, 255, 0.1),
-                        0 0 50px rgba(37, 99, 235, 0.15);
-        }
-
-        .kpi-label {
-            font-size: 0.75rem;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--gray-500);
-            margin-bottom: 0.5rem;
-            display: block;
-        }
-
-        .kpi-value {
-            font-size: 2.25rem;
-            font-weight: 800;
-            letter-spacing: -0.025em;
-            color: var(--gray-900);
-            line-height: 1;
-            margin-bottom: 0.75rem;
-            background: linear-gradient(135deg, var(--primary), var(--accent));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .kpi-spark {
-            height: 32px;
-            margin-top: 0.75rem;
-            opacity: 0.8;
-        }
-
-        /* ========================================
-           ELEVATED STAT CARDS
-           ======================================== */
-        
-        .stat-card {
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            border: 1px solid var(--glass-border);
-            border-radius: var(--radius-xl);
-            padding: 2rem;
-            position: relative;
-            overflow: hidden;
-            transition: all var(--transition-smooth);
-            box-shadow: var(--shadow-lg),
-                        0 0 0 1px rgba(255, 255, 255, 0.05);
-        }
-
-        .stat-card::after {
-            content: '';
-            position: absolute;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: conic-gradient(from 0deg, transparent, rgba(37, 99, 235, 0.03), transparent);
-            animation: stat-card-rotate 20s linear infinite;
-            z-index: -1;
-        }
-
-        .stat-card:hover {
-            transform: translateY(-6px);
-            box-shadow: var(--shadow-2xl),
-                        0 0 0 1px rgba(255, 255, 255, 0.1),
-                        0 0 60px rgba(37, 99, 235, 0.2);
-        }
-
-        @keyframes stat-card-rotate {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        /* ========================================
-           PREMIUM BUTTON SYSTEM
-           ======================================== */
-        
-        .btn {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-            padding: 0.75rem 1.25rem;
-            font-size: 0.875rem;
-            font-weight: 600;
-            line-height: 1;
-            border-radius: var(--radius-lg);
-            border: 1px solid transparent;
-            cursor: pointer;
-            text-decoration: none;
-            transition: all var(--transition-fast);
-            position: relative;
-            overflow: hidden;
-            box-shadow: var(--shadow-sm);
-        }
-
-        .btn::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-            transition: left var(--transition-smooth);
-        }
-
-        .btn:hover::before {
-            left: 100%;
-        }
-
-        .btn:hover {
-            transform: translateY(-1px);
-            box-shadow: var(--shadow-lg);
-        }
-
-        .btn:active {
-            transform: translateY(0);
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, var(--primary), var(--primary-light));
-            color: var(--white);
-            box-shadow: var(--shadow-md), 0 0 20px rgba(37, 99, 235, 0.3);
-        }
-
-        .btn-primary:hover {
-            background: linear-gradient(135deg, var(--primary-dark), var(--primary));
-            box-shadow: var(--shadow-xl), 0 0 30px rgba(37, 99, 235, 0.4);
-        }
-
-        .btn-success {
-            background: linear-gradient(135deg, var(--success), var(--success-light));
-            color: var(--white);
-            box-shadow: var(--shadow-md), 0 0 20px rgba(16, 185, 129, 0.3);
-        }
-
-        .btn-success:hover {
-            background: linear-gradient(135deg, #059669, var(--success));
-            box-shadow: var(--shadow-xl), 0 0 30px rgba(16, 185, 129, 0.4);
-        }
-
-        .btn-warning {
-            background: linear-gradient(135deg, var(--warning), var(--warning-light));
-            color: var(--white);
-            box-shadow: var(--shadow-md), 0 0 20px rgba(245, 158, 11, 0.3);
-        }
-
-        .btn-warning:hover {
-            background: linear-gradient(135deg, #d97706, var(--warning));
-            box-shadow: var(--shadow-xl), 0 0 30px rgba(245, 158, 11, 0.4);
-        }
-
-        .btn-danger {
-            background: linear-gradient(135deg, var(--danger), var(--danger-light));
-            color: var(--white);
-            box-shadow: var(--shadow-md), 0 0 20px rgba(239, 68, 68, 0.3);
-        }
-
-        .btn-danger:hover {
-            background: linear-gradient(135deg, #dc2626, var(--danger));
-            box-shadow: var(--shadow-xl), 0 0 30px rgba(239, 68, 68, 0.4);
-        }
-
-        .btn-info {
-            background: linear-gradient(135deg, var(--accent), #0891b2);
-            color: var(--white);
-            box-shadow: var(--shadow-md), 0 0 20px rgba(6, 182, 212, 0.3);
-        }
-
-        .btn-info:hover {
-            background: linear-gradient(135deg, #0e7490, var(--accent));
-            box-shadow: var(--shadow-xl), 0 0 30px rgba(6, 182, 212, 0.4);
-        }
-
-        .btn-secondary {
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            border: 1px solid var(--glass-border);
-            color: var(--gray-700);
-        }
-
-        .btn-secondary:hover {
-            background: rgba(255, 255, 255, 0.9);
-            border-color: var(--gray-300);
-        }
-
-        /* Legacy button compatibility */
-        .btn-view { background: linear-gradient(135deg, #fbbf24, #f59e0b); color: var(--white); }
-        .btn-approve { background: linear-gradient(135deg, var(--success), var(--success-light)); color: var(--white); }
-        .btn-decline { background: linear-gradient(135deg, var(--danger), var(--danger-light)); color: var(--white); }
-        .btn-confirm { background: linear-gradient(135deg, var(--success), var(--success-light)); color: var(--white); }
-        .btn-disabled { background: var(--gray-200); color: var(--gray-400); cursor: not-allowed; box-shadow: none; }
-
-        /* ========================================
-           PREMIUM INPUT SYSTEM
-           ======================================== */
-        
-        .input, .activity-filter input, .activity-filter select,
-        #createStaffForm input, #createStaffForm select,
-        #createResponderForm input, #createResponderForm select,
-        #vuSearch, #vuPageSize {
-            width: 100%;
-            padding: 0.875rem 1rem;
-            font-size: 0.875rem;
-            font-weight: 500;
-            border: 1px solid var(--gray-300);
-            border-radius: var(--radius-lg);
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            color: var(--gray-900);
-            transition: all var(--transition-fast);
-            box-shadow: var(--shadow-sm), inset 0 1px 2px rgba(0, 0, 0, 0.05);
-            outline: none;
-        }
-
-        .input:focus, .activity-filter input:focus, .activity-filter select:focus,
-        #createStaffForm input:focus, #createStaffForm select:focus,
-        #createResponderForm input:focus, #createResponderForm select:focus,
-        #vuSearch:focus, #vuPageSize:focus {
-            border-color: var(--primary);
-            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.1),
-                        var(--shadow-md);
-            transform: translateY(-1px);
-        }
-
-        .input-group {
-            position: relative;
-        }
-
-        .input-icon {
-            position: absolute;
-            left: 0.875rem;
-            top: 50%;
-            transform: translateY(-50%);
-            color: var(--gray-400);
-            display: inline-flex;
-            z-index: 1;
-        }
-
-        .input.with-icon {
-            padding-left: 2.75rem;
-        }
-
-        .input-premium {
-            background: var(--glass-bg) !important;
-            backdrop-filter: var(--glass-blur) !important;
-            -webkit-backdrop-filter: var(--glass-blur) !important;
-            border: 1px solid var(--glass-border) !important;
-            border-radius: var(--radius-xl) !important;
-        }
-
-        .input-premium:focus {
-            border-color: var(--primary) !important;
-            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15) !important;
-        }
-
-        /* ========================================
-           SOPHISTICATED TABLE STYLING
-           ======================================== */
-        
-        .table-premium table {
-            width: 100%;
-            border-collapse: separate;
-            border-spacing: 0;
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            border-radius: var(--radius-xl);
-            overflow: hidden;
-            box-shadow: var(--shadow-lg);
-        }
-
-        .table-premium thead th {
-            background: linear-gradient(135deg, 
-                rgba(37, 99, 235, 0.05), 
-                rgba(6, 182, 212, 0.05));
-            color: var(--gray-700);
-            font-weight: 700;
-            font-size: 0.875rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            padding: 1.25rem 1.5rem;
-            border-bottom: 1px solid var(--gray-200);
-            position: relative;
-        }
-
-        .table-premium thead th::after {
-            content: '';
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            height: 2px;
-            background: linear-gradient(90deg, var(--primary), var(--accent));
-            opacity: 0.6;
-        }
-
-        .table-premium tbody td {
-            padding: 1.25rem 1.5rem;
-            border-bottom: 1px solid rgba(148, 163, 184, 0.1);
-            transition: all var(--transition-fast);
-        }
-
-        .table-premium tbody tr {
-            transition: all var(--transition-fast);
-        }
-
-        .table-premium tbody tr:nth-child(even) {
-            background: rgba(248, 250, 252, 0.4);
-        }
-
-        .table-premium tbody tr:hover {
-            background: rgba(37, 99, 235, 0.08);
-            transform: scale(1.01);
-        }
-
-        /* ========================================
-           ELEGANT CUSTOM CHECKBOX
-           ======================================== */
-        
-        .custom-checkbox {
-            position: relative;
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            padding: 1rem;
-            border: 1px solid var(--glass-border);
-            border-radius: var(--radius-lg);
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            cursor: pointer;
-            transition: all var(--transition-smooth);
-            user-select: none;
-            box-shadow: var(--shadow-sm);
-        }
-
-        .custom-checkbox:hover {
-            border-color: var(--primary);
-            background: rgba(37, 99, 235, 0.05);
-            transform: translateY(-1px);
-            box-shadow: var(--shadow-md);
-        }
-
-        .custom-checkbox input[type="checkbox"] {
-            position: absolute;
-            inset: 0;
-            margin: 0;
-            opacity: 0;
-            cursor: pointer;
-        }
-
-        .custom-checkbox .box {
-            width: 24px;
-            height: 24px;
-            border-radius: var(--radius-sm);
-            border: 2px solid var(--gray-300);
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            background: var(--white);
-            transition: all var(--transition-fast);
-            flex-shrink: 0;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .custom-checkbox .box::before {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 200%;
-            height: 200%;
-            background: linear-gradient(45deg, var(--primary), var(--accent));
-            transform: translate(-50%, -50%) scale(0);
-            transition: transform var(--transition-fast);
-            border-radius: 50%;
-        }
-
-        .custom-checkbox .box svg {
-            width: 16px;
-            height: 16px;
-            color: var(--white);
-            opacity: 0;
-            transform: scale(0.6);
-            transition: all var(--transition-fast);
-            z-index: 1;
-        }
-
-        .custom-checkbox input[type="checkbox"]:checked + .box {
-            background: var(--primary);
-            border-color: var(--primary);
-            box-shadow: 0 0 20px rgba(37, 99, 235, 0.4);
-        }
-
-        .custom-checkbox input[type="checkbox"]:checked + .box::before {
-            transform: translate(-50%, -50%) scale(1);
-        }
-
-        .custom-checkbox input[type="checkbox"]:checked + .box svg {
-            opacity: 1;
-            transform: scale(1);
-        }
-
-        .custom-checkbox .text {
-            font-size: 0.875rem;
-            font-weight: 600;
-            color: var(--gray-700);
-        }
-
-        /* ========================================
-           FLUID ANIMATIONS & MICRO-INTERACTIONS
-           ======================================== */
-        
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
-
-        @keyframes fadeInUp {
-            from { 
-                opacity: 0; 
-                transform: translateY(30px);
-            }
-            to { 
-                opacity: 1; 
-                transform: translateY(0);
-            }
-        }
-
-        @keyframes fadeInDown {
-            from { 
-                opacity: 0; 
-                transform: translateY(-30px);
-            }
-            to { 
-                opacity: 1; 
-                transform: translateY(0);
-            }
-        }
-
-        @keyframes fadeOutDown {
-            from { 
-                opacity: 1; 
-                transform: translateY(0);
-            }
-            to { 
-                opacity: 0; 
-                transform: translateY(20px);
-            }
-        }
-
-        @keyframes slideInRight {
-            from {
-                opacity: 0;
-                transform: translateX(100px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        @keyframes pulse {
-            0%, 100% { 
-                opacity: 1;
-                transform: scale(1);
-            }
-            50% { 
-                opacity: 0.8;
-                transform: scale(1.05);
-            }
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        @keyframes bounce {
-            0%, 20%, 53%, 80%, 100% {
-                animation-timing-function: cubic-bezier(0.215, 0.610, 0.355, 1.000);
-                transform: translate3d(0,0,0);
-            }
-            40%, 43% {
-                animation-timing-function: cubic-bezier(0.755, 0.050, 0.855, 0.060);
-                transform: translate3d(0, -30px, 0);
-            }
-            70% {
-                animation-timing-function: cubic-bezier(0.755, 0.050, 0.855, 0.060);
-                transform: translate3d(0, -15px, 0);
-            }
-            90% {
-                transform: translate3d(0,-4px,0);
-            }
-        }
-
-        /* Animation Classes */
-        .animate-fade-in {
-            animation: fadeIn 0.5s ease-out forwards;
-        }
-
-        .animate-fade-in-up {
-            opacity: 0;
-            animation: fadeInUp 0.6s cubic-bezier(0.215, 0.610, 0.355, 1.000) forwards;
-            animation-delay: var(--anim-delay, 0ms);
-        }
-
-        .animate-fade-in-down {
-            opacity: 0;
-            animation: fadeInDown 0.6s cubic-bezier(0.215, 0.610, 0.355, 1.000) forwards;
-            animation-delay: var(--anim-delay, 0ms);
-        }
-
-        .animate-fade-out-down {
-            animation: fadeOutDown 0.4s ease-in forwards;
-        }
-
-        .animate-slide-in-right {
-            opacity: 0;
-            animation: slideInRight 0.6s cubic-bezier(0.215, 0.610, 0.355, 1.000) forwards;
-            animation-delay: var(--anim-delay, 0ms);
-        }
-
-        .animate-pulse {
-            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-        }
-
-        .animate-spin {
-            animation: spin 1s linear infinite;
-        }
-
-        .animate-spin-fast {
-            animation: spin 0.8s linear infinite;
-        }
-
-        .animate-bounce {
-            animation: bounce 1s infinite;
-        }
-
-        /* ========================================
-           MODAL ENHANCEMENTS
-           ======================================== */
-        
-        .modal-header {
-            background: linear-gradient(135deg, 
-                rgba(37, 99, 235, 0.05), 
-                rgba(6, 182, 212, 0.03));
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            border-bottom: 1px solid var(--glass-border);
-            border-radius: var(--radius-xl) var(--radius-xl) 0 0;
-        }
-
-        .modal-content {
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            border: 1px solid var(--glass-border);
-            border-radius: var(--radius-xl);
-            box-shadow: var(--shadow-2xl);
-        }
-
-        /* ========================================
-           RESPONSIVE DESIGN
-           ======================================== */
-        
-        @media (max-width: 768px) {
-            .kpi-grid {
-                grid-template-columns: 1fr;
-                gap: 1rem;
-            }
-            
-            .kpi-card, .stat-card {
-                padding: 1.25rem;
-            }
-            
-            .btn {
-                padding: 0.625rem 1rem;
-                font-size: 0.8125rem;
-            }
-        }
-
-        /* ========================================
-           DARK MODE ENHANCEMENTS (DISABLED)
-           ======================================== */
-        /*
-        html.dark body {
-            background: linear-gradient(135deg, 
-                #0f172a 0%, 
-                #1e293b 25%, 
-                #334155 50%, 
-                #1e293b 75%, 
-                #0f172a 100%);
-        }
-
-        html.dark .aurora-background {
-            background: linear-gradient(135deg, 
-                #0f172a 0%, 
-                #1a1f2e 25%, 
-                #252a3a 50%, 
-                #1a1f2e 75%, 
-                #0f172a 100%);
-        }
-
-        html.dark .aurora-background::before {
-            background: 
-                radial-gradient(ellipse 800px 600px at -10% -20%, rgba(59, 130, 246, 0.2), transparent 50%),
-                radial-gradient(ellipse 600px 800px at 110% -10%, rgba(16, 185, 129, 0.15), transparent 50%),
-                radial-gradient(ellipse 700px 500px at 50% 120%, rgba(139, 92, 246, 0.12), transparent 50%);
-        }
-
-        html.dark .kpi-card,
-        html.dark .stat-card,
-        html.dark .glass-card,
-        html.dark .table-premium table,
-        html.dark .custom-checkbox {
-            background: rgba(15, 23, 42, 0.8);
-            border-color: rgba(255, 255, 255, 0.1);
-        }
-
-        html.dark .kpi-label {
-            color: var(--gray-400);
-        }
-
-        html.dark .kpi-value {
-            color: var(--gray-100);
-        }
-        */
-
-        /* ========================================
-           UTILITY CLASSES
-           ======================================== */
-        
-        .text-gradient {
-            background: linear-gradient(135deg, var(--primary), var(--accent));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .glow {
-            box-shadow: 0 0 30px rgba(37, 99, 235, 0.3);
-        }
-
-        .glow-success {
-            box-shadow: 0 0 30px rgba(16, 185, 129, 0.3);
-        }
-
-        .glow-warning {
-            box-shadow: 0 0 30px rgba(245, 158, 11, 0.3);
-        }
-
-        .glow-danger {
-            box-shadow: 0 0 30px rgba(239, 68, 68, 0.3);
-        }
-
-        .backdrop-blur {
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-        }
-
-        /* ========================================
-           LOADING STATES
-           ======================================== */
-        
-        .loading-shimmer {
-            background: linear-gradient(90deg, 
-                rgba(255, 255, 255, 0.0) 0%, 
-                rgba(255, 255, 255, 0.2) 20%, 
-                rgba(255, 255, 255, 0.5) 60%, 
-                rgba(255, 255, 255, 0.0) 100%);
-            background-size: 200% 100%;
-            animation: shimmer 2s infinite;
-        }
-
-        @keyframes shimmer {
-            0% { background-position: -200% 0; }
-            100% { background-position: 200% 0; }
-        }
-
-        /* ========================================
-           ADDITIONAL LEGACY STYLES INTEGRATION
-           ======================================== */
-        
-        @keyframes fadeOutDown {
-            from {
-                opacity: 1;
-                transform: translateY(0);
-            }
-            to {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-        }
-
-        @keyframes pulse { 
-            0% { transform: scale(0.9) rotate(0deg); } 
-            100% { transform: scale(1.2) rotate(20deg); } 
-        }
-
-        /* Stats progress bar */
-        .progress-track { 
-            height: 10px; 
-            width: 100%; 
-            background: rgba(148,163,184,0.28); 
-            border-radius: 9999px; 
-            overflow: hidden; 
-        }
-        
-        .progress-seg { 
-            height: 100%; 
-            display: inline-block; 
-            width: 0%; 
-            transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-        
-        .progress-seg.approved { 
-            background: linear-gradient(90deg, #10b981, #34d399); 
-        }
-        
-        .progress-seg.pending { 
-            background: linear-gradient(90deg, #f59e0b, #fbbf24); 
-        }
-        
-        .progress-seg.other { 
-            background: linear-gradient(90deg, #94a3b8, #cbd5e1); 
-        }
-        
-        .progress-seg.declined { 
-            background: linear-gradient(90deg, #ef4444, #f87171); 
-        }
-
-        /* Recent Activity */
-        .activity-filter { 
-            display: grid; 
-            gap: 0.5rem; 
-            grid-template-columns: 1fr; 
-        }
-        
-        @media (min-width: 768px) { 
-            .activity-filter { 
-                grid-template-columns: 1fr 180px 160px auto; 
-            } 
-        }
-        
-        .activity-scroll { 
-            max-height: calc(100vh - 360px); 
-            overflow-y: auto; 
-            overscroll-behavior: contain; 
-        }
-        
-        .activity-scroll::-webkit-scrollbar { 
-            width: 10px; 
-        }
-        
-        .activity-scroll::-webkit-scrollbar-track { 
-            background: var(--gray-100); 
-            border-radius: 9999px; 
-        }
-        
-        .activity-scroll::-webkit-scrollbar-thumb { 
-            background: var(--gray-300); 
-            border-radius: 9999px; 
-            transition: background var(--transition-fast);
-        }
-        
-        .activity-scroll::-webkit-scrollbar-thumb:hover { 
-            background: var(--gray-400); 
-        }
-        
-        /* Video Player Styles */
-        #m_video {
-            background: #000;
-            border-radius: var(--radius-lg);
-            box-shadow: var(--shadow-xl);
-        }
-        
-        #m_video::-webkit-media-controls-panel {
-            background-color: rgba(0, 0, 0, 0.8);
-            border-radius: 0 0 var(--radius-lg) var(--radius-lg);
-        }
-        
-        #m_video::-webkit-media-controls-play-button,
-        #m_video::-webkit-media-controls-pause-button {
-            background-color: rgba(255, 255, 255, 0.9);
-            border-radius: 50%;
-        }
-        
-        .video-container {
-            position: relative;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: var(--gray-50);
-            border-radius: var(--radius-xl);
-            overflow: hidden;
-        }
-        
-        /* Brand pill for section headers */
-        .brand-pill { 
-            display: inline-flex; 
-            align-items: center; 
-            gap: 0.5rem; 
-            padding: 0.375rem 0.75rem; 
-            border-radius: 9999px; 
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            border: 1px solid var(--glass-border); 
-            font-weight: 700; 
-            font-size: 0.75rem; 
-            color: var(--gray-700);
-            box-shadow: var(--shadow-sm);
-            transition: all var(--transition-fast);
-        }
-
-        .brand-pill:hover {
-            transform: translateY(-1px);
-            box-shadow: var(--shadow-md);
-        }
-
-        /* ========================================
-           PREMIUM ACTIVITY CARDS
-           ======================================== */
-        
-        .activity-card {
-            background: var(--glass-bg);
-            backdrop-filter: var(--glass-blur);
-            -webkit-backdrop-filter: var(--glass-blur);
-            border: 1px solid var(--glass-border);
-            border-radius: var(--radius-xl);
-            padding: 1.5rem;
-            transition: all var(--transition-smooth);
-            cursor: pointer;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .activity-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 2px;
-            background: linear-gradient(90deg, 
-                var(--primary) 0%, 
-                var(--accent) 50%, 
-                var(--success) 100%);
-            opacity: 0;
-            transition: opacity var(--transition-fast);
-        }
-
-        .activity-card:hover {
-            transform: translateY(-4px) scale(1.02);
-            box-shadow: var(--shadow-xl), 
-                        0 0 40px rgba(37, 99, 235, 0.15);
-        }
-
-        .activity-card:hover::before {
-            opacity: 1;
-        }
-
-        .activity-icon {
-            width: 56px;
-            height: 56px;
-            border-radius: var(--radius-2xl);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            position: relative;
-            box-shadow: var(--shadow-lg);
-        }
-
-        .activity-icon::after {
-            content: '';
-            position: absolute;
-            top: -2px;
-            right: -2px;
-            width: 20px;
-            height: 20px;
-            border-radius: 50%;
-            border: 2px solid white;
-            box-shadow: var(--shadow-sm);
-        }
-
-        .activity-status-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem 1rem;
-            border-radius: 9999px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            border: 1px solid;
-            background: linear-gradient(135deg, rgba(255, 255, 255, 0.9), rgba(248, 250, 252, 0.9));
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            transition: all var(--transition-fast);
-        }
-
-        .activity-status-badge .status-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-        }
-
-        .activity-status-approved {
-            color: var(--success);
-            border-color: rgba(16, 185, 129, 0.2);
-        }
-
-        .activity-status-approved .status-dot {
-            background: var(--success);
-            animation: pulse 2s infinite;
-        }
-
-        .activity-status-pending {
-            color: var(--warning);
-            border-color: rgba(245, 158, 11, 0.2);
-        }
-
-        .activity-status-pending .status-dot {
-            background: var(--warning);
-            animation: pulse 2s infinite;
-        }
-
-        .activity-status-declined {
-            color: var(--danger);
-            border-color: rgba(239, 68, 68, 0.2);
-        }
-
-        .activity-status-declined .status-dot {
-            background: var(--danger);
-            animation: pulse 2s infinite;
-        }
-
-        /* Status Badges for Tables */
-        .status-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.25rem 0.75rem;
-            border-radius: 9999px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            line-height: 1;
-        }
-        
-        .status-badge-success {
-            background-color: #dcfce7; /* green-100 */
-            color: #166534; /* green-800 */
-        }
-        
-        .status-badge-pending {
-            background-color: #fef3c7; /* amber-100 */
-            color: #92400e; /* amber-800 */
-        }
-        
-        .status-badge-declined {
-            background-color: #fee2e2; /* red-100 */
-            color: #991b1b; /* red-800 */
-        }
-
-        .activity-meta {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            color: var(--gray-400);
-            font-size: 0.875rem;
-        }
-
-        .activity-hover-arrow {
-            opacity: 0;
-            transform: translateX(-10px);
-            transition: all var(--transition-fast);
-        }
-
-        .activity-card:hover .activity-hover-arrow {
-            opacity: 1;
-            transform: translateX(0);
-        }
-
-        /* Enhanced scrollbar for activity list */
-        .activity-scroll::-webkit-scrollbar {
-            width: 12px;
-        }
-
-        .activity-scroll::-webkit-scrollbar-track {
-            background: rgba(148, 163, 184, 0.1);
-            border-radius: 6px;
-        }
-
-        .activity-scroll::-webkit-scrollbar-thumb {
-            background: linear-gradient(135deg, var(--primary), var(--accent));
-            border-radius: 6px;
-            border: 2px solid transparent;
-            background-clip: content-box;
-        }
-
-        .activity-scroll::-webkit-scrollbar-thumb:hover {
-            background: linear-gradient(135deg, var(--primary-dark), var(--primary));
-            background-clip: content-box;
-        }
-    </style>
-</head>
-<body class="antialiased">
-
-    <div class="flex h-screen bg-slate-100">
-        <aside class="hidden md:flex w-64 flex-shrink-0 bg-white text-slate-600 flex-col p-4 border-r border-slate-200">
-            <div class="h-16 flex items-center justify-center px-2">
-                <img src="responde.png" alt="ManResponde Logo" class="h-10 w-auto object-contain sm:h-12 md:h-14 lg:h-10" onerror="this.style.display='none'">
-            </div>
-            <nav class="flex-1 px-2 py-4 space-y-1.5">
-                <?php $isDashActive = ($view === 'dashboard'); ?>
-                <a href="dashboard?view=dashboard" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isDashActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50'; ?>">
-                    <?php echo svg_icon('dashboard', 'w-5 h-5'); ?>
-                    <span>Dashboard</span>
-                </a>
-
-                <?php $isAnalyticsActive = ($view === 'analytics'); ?>
-                <a href="dashboard?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isAnalyticsActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
-                    </svg>
-                    <span>Analytics</span>
-                </a>
-                
-                <?php $isMapActive = ($view === 'map'); ?>
-                <a href="dashboard?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isMapActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
-                    </svg>
-                    <span>Interactive Map</span>
-                </a>
-
-                <?php $isLiveSupportActive = ($view === 'live-support'); ?>
-                <a href="dashboard?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isLiveSupportActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50'; ?>">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
-                    </svg>
-                    <span>Live Support</span>
-                    <span id="liveSupportBadge" class="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
-                </a>
-
-                <?php if ($isAdmin): ?>
-                <?php $isCreateAccountActive = ($view === 'create-account'); ?>
-                <a href="dashboard?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isCreateAccountActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                    <?php echo svg_icon('user-plus', 'w-5 h-5'); ?>
-                    <span>Create Account</span>
-                </a>
-                <?php endif; ?>
-                
-                <?php if ($isAdmin || $isTanod): ?>
-                <?php $isVerifyUsersActive = ($view === 'verify-users'); ?>
-                <!-- Link to new standalone Verify Users page -->
-                <a href="verify_users.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isVerifyUsersActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                    <?php echo svg_icon('user-check', 'w-5 h-5'); ?>
-                    <span>Verify Users</span>
-                    <span id="verifyUsersBadge" class="ml-auto bg-amber-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
-                </a>
-                <?php endif; ?>
-
-                <?php if ($isAdmin): ?>
-                <!-- Export Reports -->
-                <button onclick="showExportModal()" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600 w-full text-left">
-                    <?php echo svg_icon('download', 'w-5 h-5'); ?>
-                    <span>Export Reports</span>
-                </button>
-                <?php endif; ?>
-            </nav>
-            <div class="p-2 border-t border-slate-200/70 pt-4">
-                 <div class="flex items-center gap-3 mb-4">
-                    <div class="w-10 h-10 rounded-full bg-sky-500 flex items-center justify-center font-bold text-white ring-2 ring-sky-200">
-                        <?php echo strtoupper(substr($userName, 0, 1)); ?>
-                    </div>
-                    <div>
-                        <p class="font-semibold text-slate-800 text-sm"><?php echo htmlspecialchars($userName); ?></p>
-                        <p class="text-xs text-slate-500"><?php echo htmlspecialchars(ucfirst($userRole)); ?></p>
-                    </div>
-                </div>
-                <a href="logout" class="flex items-center justify-center gap-2 rounded-lg bg-slate-100 text-slate-700 hover:bg-slate-200 w-full px-4 py-2.5 text-sm font-semibold">
-                    <?php echo svg_icon('logout', 'w-5 h-5'); ?>
-                    <span>Logout</span>
-                </a>
-            </div>
-        </aside>
-
-        <!-- Mobile Header -->
-        <div class="md:hidden fixed top-0 left-0 right-0 z-50 bg-white border-b border-slate-200 px-4 py-3">
-            <div class="flex items-center justify-between">
-                <button id="mobileMenuBtn" class="p-2 rounded-lg text-slate-600 hover:bg-slate-100">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
-                    </svg>
-                </button>
-                <div class="flex items-center justify-center flex-1">
-                    <img src="responde.png" alt="ManResponde Logo" class="h-8 w-auto object-contain" onerror="this.style.display='none'">
-                </div>
-                <div class="w-10"></div> <!-- Spacer to keep logo centered -->
-            </div>
-        </div>
-
-        <!-- Mobile Menu Overlay -->
-        <div id="mobileMenuOverlay" class="md:hidden fixed inset-0 z-40 bg-black bg-opacity-50 hidden">
-            <div class="fixed inset-y-0 left-0 w-64 bg-white shadow-xl">
-                <div class="flex flex-col h-full">
-                    <div class="h-16 flex items-center justify-center px-4 border-b border-slate-200">
-                        <img src="responde.png" alt="ManResponde Logo" class="h-10 w-auto object-contain" onerror="this.style.display='none'">
-                    </div>
-                    <nav class="flex-1 px-4 py-4 space-y-1.5 overflow-y-auto">
-                        <?php $isDashActive = ($view === 'dashboard'); ?>
-                        <a href="dashboard?view=dashboard" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isDashActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                            <?php echo svg_icon('dashboard', 'w-5 h-5'); ?>
-                            <span>Dashboard</span>
-                        </a>
-
-                        <?php $isAnalyticsActive = ($view === 'analytics'); ?>
-                        <a href="dashboard?view=analytics" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isAnalyticsActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
-                            </svg>
-                            <span>Analytics</span>
-                        </a>
-                        
-                        <?php $isMapActive = ($view === 'map'); ?>
-                        <a href="dashboard?view=map" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isMapActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
-                            </svg>
-                            <span>Interactive Map</span>
-                        </a>
-
-                        <?php $isLiveSupportActive = ($view === 'live-support'); ?>
-                        <a href="dashboard?view=live-support" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isLiveSupportActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
-                            </svg>
-                            <span>Live Support</span>
-                            <span id="liveSupportBadgeMobile" class="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
-                        </a>
-                        
-                        <?php if ($isAdmin): ?>
-                            <?php $isCreateAccountActive = ($view === 'create-account'); ?>
-                            <a href="dashboard?view=create-account" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isCreateAccountActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                                <?php echo svg_icon('user-plus', 'w-5 h-5'); ?>
-                                <span>Create Account</span>
-                            </a>
-                        <?php endif; ?>
-                        
-                        <?php if ($isAdmin || $isTanod): ?>
-                            <?php $isVerifyUsersActive = ($view === 'verify-users'); ?>
-                            <a href="verify_users.php" class="flex items-center gap-3 px-3 py-2.5 rounded-lg <?php echo $isVerifyUsersActive ? 'bg-sky-100 text-sky-700 font-semibold' : 'hover:bg-slate-50 text-slate-600'; ?>">
-                                <?php echo svg_icon('user-check', 'w-5 h-5'); ?>
-                                <span>Verify Users</span>
-                                <span id="verifyUsersBadgeMobile" class="ml-auto bg-amber-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
-                            </a>
-                        <?php endif; ?>
-
-                        <?php if ($isAdmin): ?>
-                            <!-- Export Reports for mobile -->
-                            <button onclick="showExportModal(); closeMobileSidebar();" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 text-slate-600 w-full text-left">
-                                <?php echo svg_icon('download', 'w-5 h-5'); ?>
-                                <span>Export Reports</span>
-                            </button>
-                        <?php endif; ?>
-                        
-                        <div class="border-t border-slate-200 pt-4 mt-4">
-                            <a href="logout" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-600 hover:bg-slate-50">
-                                <?php echo svg_icon('logout', 'w-5 h-5'); ?>
-                                <span>Logout</span>
-                            </a>
-                        </div>
-                    </nav>
-                </div>
-            </div>
-        </div>
-
-        <main class="flex-1 overflow-y-auto aurora-background">
-            <div class="pt-20 md:pt-6 pb-6 px-4 sm:px-6 md:px-8 lg:px-10 animate-fade-in relative z-10">
-                
-                <header class="mb-6">
-                    <div class="flex items-center justify-between">
-                        <div>
-                    <h1 class="text-3xl md:text-4xl font-extrabold text-slate-900 tracking-tighter">
-                        <?php
-                            if ($view === 'live-support') echo 'Live Support';
-                            elseif ($isAdmin && $view === 'create-account') echo 'Create Account';
-                            elseif ($view === 'analytics') echo 'Analytics';
-                            elseif ($view === 'map') echo 'Interactive Map';
-                            else echo 'Dashboard';
-                        ?>
-                    </h1>
-                    <p class="text-slate-500 mt-1 text-base md:text-lg">
-                        <?php
-                            if ($view === 'live-support') {
-                                echo 'Connect with residents in real-time.';
-                            } elseif ($isAdmin && $view === 'create-account') {
-                                echo 'Create new user accounts with flexible role assignment (Staff/Responder).';
-                            } elseif ($view === 'analytics') {
-                                echo 'Comprehensive statistical overview of emergency reports.';
-                            } elseif ($view === 'map') {
-                                echo 'Real-time visualization of emergency incidents and responder locations.';
-                            } else {
-                                echo 'Welcome back, '.htmlspecialchars($userName).'. Here\'s what\'s happening.';
-                            }
-                        ?>
-                    </p>
-                        </div>
-                        
-                        <?php if ($userRole === 'staff'): ?>
-                        <div class="relative">
-                            <button id="notificationBell" class="relative p-3 text-slate-600 hover:text-red-600 transition-colors bg-white/80 backdrop-blur-sm rounded-full shadow-lg border border-slate-200/80">
-                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"></path>
-                                </svg>
-                                <span id="notificationBadge" class="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center hidden">0</span>
-                            </button>
-                            
-                            <div id="notificationDropdown" class="absolute right-0 mt-2 w-80 bg-white rounded-lg shadow-lg border border-slate-200 z-50 hidden">
-                                <div class="p-4 border-b border-slate-200">
-                                    <h3 class="text-lg font-semibold text-slate-800">Emergency Notifications</h3>
-                                </div>
-                                <div id="notificationList" class="max-h-96 overflow-y-auto">
-                                    </div>
-                                <div class="p-4 border-t border-slate-200">
-                                    <button id="markAllRead" class="text-sm text-blue-600 hover:text-blue-800">Mark all as read</button>
-                                </div>
-                            </div>
-                        </div>
-                        <?php endif; ?>
-                    </div>
-                </header>
-
-
-                <?php if ($view === 'live-support'): ?>
-                    <?php include 'views/live_support.php'; ?>
-
-                <?php elseif ($view === 'map'): ?>
-                    <?php include 'views/interactive_map.php'; ?>
-
-                <?php elseif ($isAdmin): ?>
-                    <?php if ($view === 'create-account'): ?>
-                        <?php include 'views/create_account.php'; ?>
-
-                    <?php elseif ($view === 'analytics'): ?>
-                        <?php include 'views/analytics.php'; ?>
-
-                    <?php else: // Default Admin Dashboard View ?>
-                        <?php include 'views/dashboard_home.php'; ?>
-                    <?php endif; ?>
-                
-                <?php else: // Staff View ?>
-                    <?php if ($view === 'analytics'): ?>
-                        <?php include 'views/analytics.php'; ?>
-                    <?php else: ?>
-                        <div class="mb-4 rounded-xl bg-white/70 backdrop-blur-sm border border-slate-200/80 shadow-sm p-4 animate-fade-in-up" style="--anim-delay: 100ms;">
-                            <p class="text-sm text-slate-600">
-                                Your assigned categories:
-                                <?php
-                                    if (!empty($userCategories)) {
-                                        foreach ($userCategories as $cat) {
-                                            $catSlug = strtolower($cat);
-                                            $catLabel = $categories[$catSlug]['label'] ?? ucfirst($cat);
-                                            echo '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 mr-2">' . htmlspecialchars($catLabel) . '</span>';
-                                        }
-                                    } else {
-                                        echo '<span class="text-slate-400 italic">None</span>';
-                                    }
-                                ?>
-                            </p>
-                        </div>
-
-                        <section class="space-y-6" id="staffReportCards">
-                            <div class="text-center py-12 text-slate-500">
-                                <div class="inline-flex items-center gap-3">
-                                    <?php echo svg_icon('spinner', 'w-5 h-5 animate-spin'); ?>
-                                    <div>
-                                        <div class="text-lg font-medium">Loading your reports...</div>
-                                        <div class="text-sm text-slate-400">Please wait a moment.</div>
-                                    </div>
-                                </div>
-                            </div>
-                        </section>
-                    <?php endif; ?>
-                <?php endif; ?>
-
-            </div>
-        </main>
-    </div>
-    
-    <?php include 'includes/modals_dashboard.php'; ?>
-    
-    <div id="reportModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 transition-all duration-500 opacity-0 pointer-events-none backdrop-blur-sm">
-        <div class="absolute inset-0 bg-gradient-to-br from-slate-900/80 via-slate-800/70 to-slate-900/80" onclick="closeReportModal()"></div>
-        <div id="modalContent" class="relative max-w-6xl w-full glass-card overflow-hidden transition-all duration-500 scale-90 opacity-0 animate-fade-in-up">
-            <!-- Premium Header with Gradient -->
-            <div class="relative px-8 py-6 bg-gradient-to-r from-emerald-600 via-cyan-600 to-teal-600 text-white overflow-hidden">
-                <div class="absolute inset-0 bg-black/10"></div>
-                <div class="relative z-10 flex items-center justify-between">
-                    <div id="m_header" class="flex items-center gap-4">
-                        <div class="w-12 h-12 rounded-2xl bg-white/20 backdrop-blur-sm flex items-center justify-center">
-                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                            </svg>
-                        </div>
-                        <div>
-                            <h2 class="text-xl font-bold">Emergency Report Details</h2>
-                            <p class="text-white/80 text-sm">Detailed incident information</p>
-                        </div>
-                    </div>
-                    <button class="w-10 h-10 rounded-xl bg-white/20 hover:bg-white/30 backdrop-blur-sm transition-all duration-300 flex items-center justify-center group" onclick="closeReportModal()">
-                        <svg class="w-5 h-5 group-hover:rotate-90 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-                        </svg>
-                    </button>
-                </div>
-                <div class="absolute -bottom-1 left-0 right-0 h-1 bg-gradient-to-r from-emerald-400 via-cyan-400 to-teal-400 opacity-60"></div>
-            </div>
-
-            <!-- Content Area with Premium Cards -->
-            <div class="p-8 max-h-[75vh] overflow-y-auto bg-gradient-to-br from-gray-50/50 to-white/80">
-                <div class="grid grid-cols-1 xl:grid-cols-3 gap-8">
-                    
-                    <!-- Reporter Information Card -->
-                    <div class="xl:col-span-2 space-y-6">
-                        <div class="glass-card p-6">
-                            <div class="flex items-center gap-3 mb-6">
-                                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white">
-                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path>
-                                    </svg>
-                                </div>
-                                <h3 class="text-lg font-bold text-gray-800">Reporter Information</h3>
-                            </div>
-                            
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                <div class="space-y-1">
-                                    <label class="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-2">
-                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path>
-                                        </svg>
-                                        Full Name
-                                    </label>
-                                    <div id="m_fullName" class="text-xl font-bold text-gray-900 bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">—</div>
-                                </div>
-                                <div class="space-y-1">
-                                    <label class="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-2">
-                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"></path>
-                                        </svg>
-                                        Contact Number
-                                    </label>
-                                    <div id="m_contact" class="text-lg font-semibold text-gray-700">—</div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Location & Details Card -->
-                        <div class="glass-card p-6">
-                            <div class="flex items-center gap-3 mb-6">
-                                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center text-white">
-                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path>
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path>
-                                    </svg>
-                                </div>
-                                <h3 class="text-lg font-bold text-gray-800">Incident Details</h3>
-                            </div>
-                            
-                            <div class="space-y-6">
-                                <div class="space-y-2">
-                                    <label class="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-2">
-                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path>
-                                        </svg>
-                                        Location
-                                    </label>
-                                    <div id="m_location" class="text-base font-semibold text-gray-700 p-3 bg-gray-50/80 rounded-xl border border-gray-200">—</div>
-                                    
-                                    <!-- Embedded Map Container -->
-                                    <div id="m_map_container" class="hidden mt-3 rounded-xl overflow-hidden border border-gray-200 shadow-sm">
-                                        <div id="m_map" class="w-full h-64 z-0"></div>
-                                        <div class="bg-gray-50 px-3 py-2 text-xs text-gray-500 flex justify-between items-center border-t border-gray-200">
-                                            <span><i class="fas fa-map-marker-alt mr-1"></i> Incident Location</span>
-                                            <span id="m_map_status">Loading map...</span>
-                                        </div>
-                                    </div>
-                                </div>
-                                
-                                <div class="space-y-2">
-                                    <label class="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-2">
-                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                                        </svg>
-                                        Incident Description
-                                    </label>
-                                    <div id="m_purpose" class="text-gray-700 p-4 bg-gray-50/80 rounded-xl border border-gray-200 leading-relaxed">—</div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Metadata Card -->
-                        <div class="glass-card p-6">
-                            <div class="flex items-center gap-3 mb-6">
-                                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-white">
-                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                </div>
-                                <h3 class="text-lg font-bold text-gray-800">Report Metadata</h3>
-                            </div>
-                            
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                <div class="space-y-2">
-                                    <label class="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-2">
-                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                        </svg>
-                                        Submitted At
-                                    </label>
-                                    <div id="m_timestamp" class="text-base font-semibold text-gray-700 p-3 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg border border-blue-200">—</div>
-                                </div>
-                                <div class="space-y-2">
-                                    <label class="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-2">
-                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                                        </svg>
-                                        Reporter ID
-                                    </label>
-                                    <div id="m_reporterId" class="text-sm font-mono text-gray-600 p-3 bg-gray-50/80 rounded-lg border border-gray-200 break-all">—</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- Media & Actions Sidebar -->
-                    <div class="space-y-6">
-                        <!-- Media Card -->
-                        <div class="glass-card p-6">
-                            <div class="flex items-center gap-3 mb-6">
-                                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center text-white">
-                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-                                    </svg>
-                                </div>
-                                <h3 class="text-lg font-bold text-gray-800">Attached Evidence</h3>
-                            </div>
-                            
-                            <a id="m_image_link" href="#" target="_blank" class="group block rounded-2xl overflow-hidden border-2 border-dashed border-gray-200 bg-gradient-to-br from-gray-50 to-gray-100 aspect-[4/3] flex items-center justify-center hover:border-blue-300 hover:bg-gradient-to-br hover:from-blue-50 hover:to-indigo-50 transition-all duration-300">
-                                <img id="m_image" src="" alt="Report evidence" class="w-full h-full object-cover hidden transition-all duration-500 group-hover:scale-105 rounded-xl">
-                                <video id="m_video" controls class="w-full h-full object-cover hidden rounded-xl shadow-lg" preload="metadata">
-                                    <source id="m_video_source" src="" type="">
-                                    Your browser does not support the video tag.
-                                </video>
-                                <div id="m_image_none" class="text-center text-gray-400">
-                                    <svg class="w-12 h-12 mx-auto mb-3 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-                                    </svg>
-                                    <p class="font-medium">No Evidence Attached</p>
-                                    <p class="text-sm">No media was provided with this report</p>
-                                </div>
-                            </a>
-                            <div class="text-center mt-3">
-                                <span id="m_media_hint" class="text-xs text-gray-500 bg-gray-100 px-3 py-1 rounded-full">Click to view full size</span>
-                            </div>
-                        </div>
-
-                        <!-- Status Card -->
-                        <div class="glass-card p-6">
-                            <div class="flex items-center gap-3 mb-6">
-                                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-green-500 to-emerald-600 flex items-center justify-center text-white">
-                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                </div>
-                                <h3 class="text-lg font-bold text-gray-800">Current Status</h3>
-                            </div>
-                            
-                            <div id="m_status_container" class="text-center">
-                                <span id="m_status" class="inline-flex items-center gap-3 px-6 py-3 rounded-2xl text-base font-bold shadow-lg">—</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Actions Footer -->
-            <div class="px-8 py-6 bg-gradient-to-r from-gray-50 to-gray-100 border-t border-gray-200/50 flex items-center justify-between">
-                <div class="flex items-center gap-3 text-gray-500">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                    </svg>
-                    <span class="text-sm font-medium">Review and take action on this emergency report</span>
-                </div>
-                <div id="m_actions" class="flex items-center gap-3"></div>
-            </div>
-        </div>
-    </div>
-
-    <div id="proofModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 transition-opacity duration-300 opacity-0 pointer-events-none">
-        <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onclick="closeProofModal()"></div>
-        <div id="proofModalContent" class="relative max-w-lg w-full bg-white rounded-2xl shadow-xl overflow-hidden transition-transform duration-300 scale-95 opacity-0">
-            <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-                <h3 id="p_header" class="text-lg font-bold text-slate-900">Proof of Residency</h3>
-                <button class="text-slate-400 hover:text-slate-800 transition-colors" onclick="closeProofModal()"><?php echo svg_icon('x-mark', 'w-6 h-6'); ?></button>
-            </div>
-            <div class="p-6">
-                <a id="p_image_link" href="#" target="_blank" class="block rounded-lg overflow-hidden border-2 border-slate-200 bg-slate-50 aspect-w-16 aspect-h-9 flex items-center justify-center group">
-                    <img id="p_image" src="" alt="Proof of Residency" class="w-full h-full object-contain transition-transform duration-300 group-hover:scale-105">
-                </a>
-                <div class="text-xs text-slate-400 mt-2 text-center">Click image to open in new tab.</div>
-            </div>
-        </div>
-    </div>
-    
-    <div id="toastContainer" class="fixed top-5 right-5 z-[100] w-full max-w-xs space-y-3"></div>
-
-    <script>
         // Dashboard configuration for JavaScript
         window.dashboardConfig = {
             isAdmin: <?php echo $isAdmin ? 'true' : 'false'; ?>,
             userRole: '<?php echo htmlspecialchars($userRole); ?>',
-            view: '<?php echo htmlspecialchars($view); ?>'
+            view: '<?php echo htmlspecialchars($view); ?>',
+            userCategories: <?php echo json_encode(array_values($userCategories ?? [])); ?>,
+            userBarangay: <?php echo json_encode((string)($userProfile['assignedBarangay'] ?? ($_SESSION['assignedBarangay'] ?? ''))); ?>
         };
         
         // Set your Firebase Web config here to enable realtime updates (onSnapshot).
@@ -5722,7 +23,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         // Enhanced FormData with CSRF token
         function createFormDataWithCsrf() {
             const formData = new FormData();
-            formData.append('<?php echo CSRF_TOKEN_NAME; ?>', getCsrfToken());
+            formData.append('window.dashboardConfig.csrfTokenName', getCsrfToken());
             return formData;
         }
         
@@ -5731,14 +32,16 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         window.FormData = function(form) {
             const formData = new originalFormData(form);
             const csrfToken = getCsrfToken();
-            if (csrfToken && !formData.has('<?php echo CSRF_TOKEN_NAME; ?>')) {
-                formData.append('<?php echo CSRF_TOKEN_NAME; ?>', csrfToken);
+            if (csrfToken && !formData.has('window.dashboardConfig.csrfTokenName')) {
+                formData.append('window.dashboardConfig.csrfTokenName', csrfToken);
             }
             return formData;
         };
-    </script>
-    
-    <script>
+
+
+// --- End of Block 1 ---
+
+
     // Ensure theme preference is applied ASAP
     (function() {
       try {
@@ -5747,8 +50,11 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         localStorage.setItem('theme', 'light');
       } catch(e) {}
     })();
-    </script>
-    <script>
+
+
+// --- End of Block 2 ---
+
+
         document.addEventListener('DOMContentLoaded', () => {
         
             // Request notification permission on page load
@@ -5758,7 +64,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                 });
             }
     
-        const categories = <?php echo json_encode($categories); ?>;
+        const categories = window.dashboardConfig.categories;
     
         // Helper function for SVG icons in JavaScript
         function svg_icon(name, className = 'w-6 h-6') {
@@ -5898,9 +204,9 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             if (!toastContainer) return;
             const toast = document.createElement('div');
             const icons = {
-                success: `<?php echo svg_icon('check', 'w-6 h-6 text-emerald-500'); ?>`,
-                error: `<?php echo svg_icon('x-mark', 'w-6 h-6 text-red-500'); ?>`,
-                info: `<?php echo svg_icon('info', 'w-6 h-6 text-sky-500'); ?>`
+                success: `${window.svg_icon('check', 'w-6 h-6 text-emerald-500')}`,
+                error: `${window.svg_icon('x-mark', 'w-6 h-6 text-red-500')}`,
+                info: `${window.svg_icon('info', 'w-6 h-6 text-sky-500')}`
             };
             const colors = {
                 success: 'border-emerald-500/30 bg-emerald-50 text-emerald-800',
@@ -6092,7 +398,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
     
         // --- API & FORM HANDLING ---
         async function handleApiFormSubmit(form, button) {
-            const btnSpinner = '<?php echo svg_icon('spinner', 'w-4 h-4 animate-spin-fast'); ?>';
+            const btnSpinner = '${window.svg_icon('spinner', 'w-4 h-4 animate-spin-fast')}';
             const btnOriginalContent = button.innerHTML;
             
             button.innerHTML = btnSpinner;
@@ -6101,7 +407,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             try {
                 const formData = new FormData(form);
                 // Add CSRF token
-                formData.append('<?php echo CSRF_TOKEN_NAME; ?>', getCsrfToken());
+                formData.append('window.dashboardConfig.csrfTokenName', getCsrfToken());
                 if (!formData.has('api_action')) {
                     let action = 'update_status';
                     if (form.id === 'createStaffForm') action = 'create_staff';
@@ -6159,12 +465,12 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             const docId = form.querySelector('input[name="docId"]').value;
             
             // Show loading state
-            button.innerHTML = '<?php echo svg_icon('spinner', 'w-4 h-4 animate-spin'); ?>';
+            button.innerHTML = '${window.svg_icon('spinner', 'w-4 h-4 animate-spin')}';
             button.disabled = true;
             
             try {
                 const formData = new FormData(form);
-                formData.append('<?php echo CSRF_TOKEN_NAME; ?>', getCsrfToken());
+                formData.append('window.dashboardConfig.csrfTokenName', getCsrfToken());
                 formData.append('api_action', 'update_status');
                 
                 const response = await fetch(window.location.href, {
@@ -6333,10 +639,10 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                             data-fullname="${reportData.fullName}" data-contact="${reportData.mobileNumber || reportData.contact}"
                             data-location="${reportData.location}" data-status="${reportData.status}"
                             data-timestamp="${reportData.timestamp}">
-                            <?php echo svg_icon('eye', 'w-4 h-4'); ?><span>View</span>
+                            ${window.svg_icon('eye', 'w-4 h-4')}<span>View</span>
                         </button>
                         <button type="button" class="btn btn-disabled" disabled title="Report Processed">
-                            <?php echo svg_icon('check-circle', 'w-4 h-4'); ?><span>Processed</span>
+                            ${window.svg_icon('check-circle', 'w-4 h-4')}<span>Processed</span>
                         </button>
                     </div>
                 </td>
@@ -6608,6 +914,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                 setTimeout(async () => {
                     const formData = createFormDataWithCsrf();
                     formData.append('api_action', 'load_staff_data');
+                    formData.append('force_refresh', 'true');
                     
                     try {
                         const response = await fetch(window.location.href, {
@@ -6656,7 +963,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
             formData.append('uid', uid);
             formData.append('decision', form.querySelector('input[name="newStatus"]')?.value);
 
-            const btnSpinner = '<?php echo svg_icon('spinner', 'w-4 h-4 animate-spin-fast'); ?>';
+            const btnSpinner = '${window.svg_icon('spinner', 'w-4 h-4 animate-spin-fast')}';
             const btnOriginalContent = button.innerHTML;
             
             button.innerHTML = btnSpinner;
@@ -6791,7 +1098,7 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
         }
 
         // Staff Statistics and Management
-        if (window.location.search.includes('view=create-staff')) {
+        if (window.location.search.includes('view=create-account') || window.location.search.includes('view=create-staff')) {
             loadStaffData();
 
             // Auto-refresh staff data every 30 seconds
@@ -6817,12 +1124,12 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                 staffEmpty.classList.add('hidden');
 
                 // Fetch staff data
-                const response = await fetch('api.php', {
+                const formData = new FormData();
+                formData.append('api_action', 'get_staff_data');
+
+                const response = await fetch(window.location.href, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: 'api_action=get_staff_data'
+                    body: formData
                 });
 
                 const result = await response.json();
@@ -6867,9 +1174,15 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
 
             staffEmpty.classList.add('hidden');
 
-            // Generate staff list HTML
+            // Generate staff/responder list HTML
             const staffHtml = staff.map(staffMember => {
-                const isActive = staffMember.status === 'active';
+                const normalizedStatus = String(staffMember.status || '').toLowerCase();
+                const isActive = normalizedStatus === 'active' || normalizedStatus === 'approved';
+                const normalizedRole = String(staffMember.role || 'staff').toLowerCase();
+                const roleLabel = normalizedRole === 'responder' ? 'Responder' : 'Staff';
+                const roleBadgeClass = normalizedRole === 'responder'
+                    ? 'bg-violet-100 text-violet-700'
+                    : 'bg-sky-100 text-sky-700';
                 const categoryCount = staffMember.categories ? staffMember.categories.length : 0;
 
                 return `
@@ -6880,7 +1193,10 @@ function search_pending_users_rest(string $search, int $pageSize, int $offset): 
                                     ${staffMember.name ? staffMember.name.charAt(0).toUpperCase() : '?'}
                                 </div>
                                 <div>
-                                    <h4 class="font-semibold text-slate-800">${staffMember.name || 'Unknown'}</h4>
+                                    <div class="flex items-center gap-2">
+                                        <h4 class="font-semibold text-slate-800">${staffMember.name || 'Unknown'}</h4>
+                                        <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${roleBadgeClass}">${roleLabel}</span>
+                                    </div>
                                     <p class="text-sm text-slate-600">${staffMember.email || 'No email'}</p>
                                 </div>
                             </div>
@@ -7214,17 +1530,19 @@ const meta = categories[ds.slug] || {};
             const color = meta.color || 'gray';
             document.getElementById('m_header').innerHTML = `
                 <div class="w-10 h-10 rounded-lg bg-${color}-100 text-${color}-600 flex items-center justify-center flex-shrink-0">
-                    <?php echo svg_icon($meta['icon'] ?? 'question-mark-circle', 'w-6, h-6'); ?>
+                    ${window.svg_icon($meta['icon'] ?? 'question-mark-circle', 'w-6, h-6')}
                 </div>
                 <h3 class="text-lg font-bold text-slate-900">Report Details</h3>
             `;
 
             const statusEl = document.getElementById('m_status');
-            const st = (ds.status || 'Pending').toLowerCase();
-            statusEl.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${ds.status || 'Pending'}`;
+            const stRaw = String(ds.status || 'Pending').trim().toLowerCase();
+            const st = stRaw === 'faile' ? 'failed' : stRaw;
+            const statusLabel = st === 'failed' ? 'Failed' : (ds.status || 'Pending');
+            statusEl.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${statusLabel}`;
             statusEl.className = 'status-badge ml-2';
             if (st === 'approved') statusEl.classList.add('status-badge-success');
-            else if (st === 'declined') statusEl.classList.add('status-badge-declined');
+            else if (st === 'declined' || st === 'failed') statusEl.classList.add('status-badge-declined');
             else statusEl.classList.add('status-badge-pending');
 
             const imgEl = document.getElementById('m_image');
@@ -7311,7 +1629,7 @@ const meta = categories[ds.slug] || {};
             }
             
             const actionsContainer = document.getElementById('m_actions');
-            const isFinal = st === 'approved' || st === 'declined';
+            const isFinal = st === 'approved' || st === 'declined' || st === 'responded';
             
             const approveBtnClass = isFinal ? 'btn-disabled' : 'btn-approve';
             const declineBtnClass = isFinal ? 'btn-disabled' : 'btn-decline';
@@ -7319,10 +1637,10 @@ const meta = categories[ds.slug] || {};
     
             actionsContainer.innerHTML = `
                 <button type="button" class="btn ${approveBtnClass}" ${disabledAttr} title="Approve Report" onclick="showApproveConfirmation('${ds.collection}', '${ds.id}', '${ds.fullName}', '${ds.slug}')">
-                    <?php echo svg_icon('check-circle', 'w-4 h-4'); ?><span>Approve</span>
+                    ${window.svg_icon('check-circle', 'w-4 h-4')}<span>Approve</span>
                 </button>
                 <button type="button" class="btn ${declineBtnClass}" ${disabledAttr} title="Decline Report" onclick="showDeclineConfirmation('${ds.collection}', '${ds.id}', '${ds.fullName}', '${ds.slug}')">
-                    <?php echo svg_icon('x-circle', 'w-4 h-4'); ?><span>Decline</span>
+                    ${window.svg_icon('x-circle', 'w-4 h-4')}<span>Decline</span>
                 </button>
             `;
             
@@ -7671,7 +1989,8 @@ const meta = categories[ds.slug] || {};
                     }
                     
                     const html = data.length > 0 ? data.map((row, index) => {
-                        const st = String(row.status || 'Pending').toLowerCase();
+                        const stRaw = String(row.status || 'Pending').trim().toLowerCase();
+                        const st = stRaw === 'faile' ? 'failed' : stRaw;
                         const getStatusConfig = (status) => {
                             switch(status) {
                                 case 'approved':
@@ -7689,6 +2008,22 @@ const meta = categories[ds.slug] || {};
                                         dotColor: 'bg-red-500',
                                         borderColor: 'border-red-200',
                                         label: 'Declined'
+                                    };
+                                case 'failed':
+                                    return {
+                                        bgColor: 'from-red-500 to-rose-600',
+                                        textColor: 'text-red-700',
+                                        dotColor: 'bg-red-500',
+                                        borderColor: 'border-red-200',
+                                        label: 'Failed'
+                                    };
+                                case 'responding':
+                                    return {
+                                        bgColor: 'from-purple-500 to-fuchsia-600',
+                                        textColor: 'text-purple-700',
+                                        dotColor: 'bg-purple-500',
+                                        borderColor: 'border-purple-200',
+                                        label: 'Responding'
                                     };
                                 case 'responded':
                                     return {
@@ -7733,7 +2068,7 @@ const meta = categories[ds.slug] || {};
                                     <span>Approved by <strong>${esc(approverName)}</strong>${approveTime ? ' • ' + esc(approveTime) : ''}</span>
                                 </div>`;
                             }
-                        } else if (st === 'declined') {
+                        } else if (st === 'declined' || st === 'failed') {
                             const declinerName = row.declinedByName || row.updatedBy || '';
                             const declineTime = row.declinedAt || row.updatedAt || '';
                             if (declinerName) {
@@ -7741,7 +2076,7 @@ const meta = categories[ds.slug] || {};
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                                     </svg>
-                                    <span>Declined by <strong>${esc(declinerName)}</strong>${declineTime ? ' • ' + esc(declineTime) : ''}</span>
+                                    <span>${st === 'failed' ? 'Failed' : 'Declined'} by <strong>${esc(declinerName)}</strong>${declineTime ? ' • ' + esc(declineTime) : ''}</span>
                                 </div>`;
                             }
                         } else if (st === 'responded') {
@@ -8036,25 +2371,27 @@ const meta = categories[ds.slug] || {};
 
         // KPI Helper Functions for Overview Section
         function getKpiAggregatesFromStats(stats) {
-            let totalPending = 0, totalApproved = 0, totalDeclined = 0, totalResponded = 0, grandTotal = 0;
-            
+            let totalPending = 0, totalApproved = 0, totalDeclined = 0, totalResponding = 0, totalResponded = 0, grandTotal = 0;
+
             Object.values(stats).forEach(stat => {
                 totalPending += parseInt(stat.pending || 0);
                 totalApproved += parseInt(stat.approved || 0);
                 totalDeclined += parseInt(stat.declined || 0);
+                totalResponding += parseInt(stat.responding || 0);
                 totalResponded += parseInt(stat.responded || 0);
                 grandTotal += parseInt(stat.total || 0);
             });
-            
+
             return {
                 pending: totalPending,
                 approved: totalApproved,
                 declined: totalDeclined,
+                responding: totalResponding,
                 responded: totalResponded,
                 total: grandTotal
             };
         }
-        
+
         function pushKpiHistory(aggregates) {
             try {
                 const history = JSON.parse(localStorage.getItem('kpiHistory') || '[]');
@@ -8118,6 +2455,7 @@ const meta = categories[ds.slug] || {};
                 const kpis = [
                     { key: 'pending', label: 'Pending', value: aggregates.pending, color: 'amber' },
                     { key: 'approved', label: 'Approved', value: aggregates.approved, color: 'emerald' },
+                    { key: 'responding', label: 'Responding', value: aggregates.responding, color: 'purple' },
                     { key: 'responded', label: 'Responded', value: aggregates.responded, color: 'cyan' },
                     { key: 'declined', label: 'Declined', value: aggregates.declined, color: 'rose' },
                     { key: 'total', label: 'Total', value: aggregates.total, color: 'slate' }
@@ -8174,25 +2512,31 @@ const meta = categories[ds.slug] || {};
         }
 
         // Function to refresh admin statistics
-        window.refreshAdminStats = async function() {
+        window.refreshAdminStats = async function(options = {}) {
+            const config = (typeof options === 'boolean') ? { forceRefresh: options } : (options || {});
+            const forceRefresh = config.forceRefresh === true;
+            const showLoading = config.showLoading !== false;
             const container = document.getElementById('adminStatsContainer');
             if (!container) return;
             
-            // Show brief loading state
             const originalContent = container.innerHTML;
-            container.innerHTML = `
-                <div class="col-span-full text-center py-6 text-slate-500">
-                    <div class="inline-flex items-center gap-2">
-                        ${svg_icon('spinner', 'w-4 h-4 animate-spin')}
-                        Refreshing statistics...
+            if (showLoading) {
+                container.innerHTML = `
+                    <div class="col-span-full text-center py-6 text-slate-500">
+                        <div class="inline-flex items-center gap-2">
+                            ${svg_icon('spinner', 'w-4 h-4 animate-spin')}
+                            Refreshing statistics...
+                        </div>
                     </div>
-                </div>
-            `;
+                `;
+            }
             
             try {
                 const formData = createFormDataWithCsrf();
                 formData.append('api_action', 'load_admin_stats');
-                formData.append('force_refresh', 'true'); // Force fresh data
+                if (forceRefresh) {
+                    formData.append('force_refresh', 'true');
+                }
                 
                 const response = await fetch(window.location.href, {
                     method: 'POST',
@@ -8204,7 +2548,7 @@ const meta = categories[ds.slug] || {};
                 if (result.success) {
                     const container = document.getElementById('adminStatsContainer');
                     if (container) {
-                        const categories = <?php echo json_encode($categories); ?>;
+                        const categories = window.dashboardConfig.categories;
                         const stats = result.data;
                         
                         // Clear loading state
@@ -8212,19 +2556,19 @@ const meta = categories[ds.slug] || {};
                         
                         // Render stats cards
                         Object.entries(categories).forEach(([slug, meta]) => {
-                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0, responded: 0 };
+                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0, responding: 0, responded: 0 };
                             const total = Math.max(0, parseInt(stat.total) || 0);
                             const approved = Math.max(0, parseInt(stat.approved) || 0);
                             const pending = Math.max(0, parseInt(stat.pending) || 0);
                             const declined = Math.max(0, parseInt(stat.declined) || 0);
+                            const responding = Math.max(0, parseInt(stat.responding) || 0);
                             const responded = Math.max(0, parseInt(stat.responded) || 0);
-                            
+
                             const approvedPct = total > 0 ? Math.round((approved / total) * 100) : 0;
                             const pendingPct = total > 0 ? Math.round((pending / total) * 100) : 0;
                             const declinedPct = total > 0 ? Math.round((declined / total) * 100) : 0;
-                            const respondedPct = total > 0 ? Math.round((responded / total) * 100) : 0;
-                            
-                            const card = document.createElement('div');
+                            const respondingPct = total > 0 ? Math.round((responding / total) * 100) : 0;
+                            const respondedPct = total > 0 ? Math.round((responded / total) * 100) : 0;                            const card = document.createElement('div');
                             card.className = 'stat-card p-5';
                             card.innerHTML = `
                                 <div class="flex items-center gap-4 mb-4">
@@ -8266,6 +2610,7 @@ const meta = categories[ds.slug] || {};
                                     <div class="progress-track">
                                         <span class="progress-seg pending" data-w="${pendingPct}%"></span>
                                         <span class="progress-seg approved" data-w="${approvedPct}%"></span>
+                                        <span class="progress-seg responding" style="background-color: #9333ea;" data-w="${respondingPct}%"></span>
                                         <span class="progress-seg responded" style="background-color: #06b6d4;" data-w="${respondedPct}%"></span>
                                         <span class="progress-seg declined" data-w="${declinedPct}%"></span>
                                     </div>
@@ -8277,6 +2622,10 @@ const meta = categories[ds.slug] || {};
                                         <div class="flex items-center gap-1">
                                             <span class="inline-block w-2 h-2 rounded-full bg-emerald-500"></span>
                                             <span>${approvedPct}% Appr</span>
+                                        </div>
+                                        <div class="flex items-center gap-1">
+                                            <span class="inline-block w-2 h-2 rounded-full" style="background-color: #9333ea;"></span>
+                                            <span>${respondingPct}% Rdng</span>
                                         </div>
                                         <div class="flex items-center gap-1">
                                             <span class="inline-block w-2 h-2 rounded-full bg-cyan-500"></span>
@@ -8311,21 +2660,20 @@ const meta = categories[ds.slug] || {};
                 } else {
                     console.error('Failed to refresh admin stats:', result.message);
                     showToast('Failed to refresh statistics: ' + result.message, 'error');
-                    // Restore original content on error
-                    container.innerHTML = originalContent;
+                    if (showLoading) {
+                        container.innerHTML = originalContent;
+                    }
                 }
             } catch (error) {
                 console.error('Error refreshing admin stats:', error);
                 showToast('Error refreshing statistics: ' + error.message, 'error');
-                // Restore original content on error
-                container.innerHTML = originalContent;
+                if (showLoading) {
+                    container.innerHTML = originalContent;
+                }
             }
         };
 
-        // Initial load of admin statistics and Overview KPIs
-        setTimeout(() => {
-            refreshAdminStats();
-        }, 1000);
+        // Stats panel removed from dashboard home; no auto-init required.
 
         // Quick Action: Clear All Cache
         window.clearAllCache = async function() {
@@ -8345,7 +2693,7 @@ const meta = categories[ds.slug] || {};
                 if (result.success) {
                     showToast('Cache cleared successfully', 'success');
                     // Refresh stats after clearing cache
-                    setTimeout(() => refreshAdminStats(), 500);
+                    setTimeout(() => refreshAdminStats({ forceRefresh: true, showLoading: true }), 500);
                 } else {
                     showToast('Failed to clear cache: ' + result.message, 'error');
                 }
@@ -8418,7 +2766,7 @@ const meta = categories[ds.slug] || {};
         };
 
         // Admin: Load dashboard statistics asynchronously
-        <?php if ($isAdmin && $view === 'analytics'): ?>
+        if (window.dashboardConfig.isAdmin && window.dashboardConfig.view === "analytics") {
         (async () => {
             try {
                 // Show loading states for both sections
@@ -8427,11 +2775,10 @@ const meta = categories[ds.slug] || {};
                 
                 if (statsContainer) {
                     statsContainer.innerHTML = `
-                        <div class="col-span-full text-center py-6 text-slate-500">
-                            <div class="inline-flex items-center gap-2">
-                                ${svg_icon('spinner', 'w-4 h-4 animate-spin')}
-                                <span class="text-sm">Loading statistics...</span>
-                            </div>
+                        <div class="col-span-full grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 animate-pulse">
+                            <div class="h-40 rounded-2xl bg-slate-100"></div>
+                            <div class="h-40 rounded-2xl bg-slate-100"></div>
+                            <div class="h-40 rounded-2xl bg-slate-100"></div>
                         </div>
                     `;
                 }
@@ -8448,24 +2795,23 @@ const meta = categories[ds.slug] || {};
                 recentFormData.append('category', 'all');
                 recentFormData.append('status', 'all');
                 
-                // Execute both requests simultaneously
-                const [statsResponse, recentResponse] = await Promise.all([
-                    fetch(window.location.href, {
+                // Execute both requests simultaneously, but render statistics first
+                const statsRequest = fetch(window.location.href, {
                     method: 'POST',
-                        body: statsFormData
-                    }),
-                    fetch(window.location.href, {
-                        method: 'POST',
-                        body: recentFormData
-                    })
-                ]);
-                
-                // Process stats response
+                    body: statsFormData
+                });
+                const recentRequest = fetch(window.location.href, {
+                    method: 'POST',
+                    body: recentFormData
+                });
+
+                // Process stats response as soon as it arrives
+                const statsResponse = await statsRequest;
                 const statsResult = await statsResponse.json();
                 if (statsResult.success) {
                     const container = document.getElementById('adminStatsContainer');
                     if (container) {
-                        const categories = <?php echo json_encode($categories); ?>;
+                        const categories = window.dashboardConfig.categories;
                         const stats = statsResult.data;
                         
                         // Clear loading state
@@ -8473,15 +2819,19 @@ const meta = categories[ds.slug] || {};
                         
                         // Render stats cards
                         Object.entries(categories).forEach(([slug, meta]) => {
-                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0 };
+                            const stat = stats[slug] || { total: 0, approved: 0, pending: 0, declined: 0, responding: 0, responded: 0 };
                             const total = Math.max(0, parseInt(stat.total) || 0);
                             const approved = Math.max(0, parseInt(stat.approved) || 0);
                             const pending = Math.max(0, parseInt(stat.pending) || 0);
                             const declined = Math.max(0, parseInt(stat.declined) || 0);
-                            
+                            const responding = Math.max(0, parseInt(stat.responding) || 0);
+                            const responded = Math.max(0, parseInt(stat.responded) || 0);
+
                             const approvedPct = total > 0 ? Math.round((approved / total) * 100) : 0;
                             const pendingPct = total > 0 ? Math.round((pending / total) * 100) : 0;
                             const declinedPct = total > 0 ? Math.round((declined / total) * 100) : 0;
+                            const respondingPct = total > 0 ? Math.round((responding / total) * 100) : 0;
+                            const respondedPct = total > 0 ? Math.round((responded / total) * 100) : 0;
                             
                             const card = document.createElement('div');
                             card.className = 'stat-card p-5';
@@ -8577,17 +2927,20 @@ const meta = categories[ds.slug] || {};
                     }
                 }
                 
-                // Process recent activity response in parallel
-                const recentResult = await recentResponse.json();
-                if (recentResult.success && recentContainer) {
-                    // Update recent activity list immediately
-                    if (typeof loadRecentPage === 'function') {
-                        // Manually trigger the recent activity update with the cached data
-                        displayRecentItems(recentResult.data);
-                        console.log('Recent activity loaded successfully:', recentResult.executionTime);
+                // Process recent activity after the stats are already visible
+                try {
+                    const recentResponse = await recentRequest;
+                    const recentResult = await recentResponse.json();
+                    if (recentResult.success && recentContainer) {
+                        if (typeof loadRecentPage === 'function') {
+                            displayRecentItems(recentResult.data);
+                            console.log('Recent activity loaded successfully:', recentResult.executionTime);
+                        }
+                    } else if (recentResult && !recentResult.success) {
+                        console.error('Failed to load recent activity:', recentResult.message);
                     }
-                } else if (recentResult && !recentResult.success) {
-                    console.error('Failed to load recent activity:', recentResult.message);
+                } catch (recentError) {
+                    console.error('Error loading recent activity:', recentError);
                 }
                 
                 // Prefetch data for next load (background refresh)
@@ -8651,22 +3004,23 @@ const meta = categories[ds.slug] || {};
                 }
             }
         })();
-        <?php endif; ?>
+        }
 
         window.updateActivityItemStatus = function(id, newStatus) {
             const li = document.querySelector(`#activityList li[data-id="${id}"]`);
             if (!li) return;
 
             const st = (newStatus || 'Pending').toLowerCase();
-            li.dataset.status = st;
+            const normalizedStatus = st === 'faile' ? 'failed' : st;
+            li.dataset.status = normalizedStatus;
 
             const badge = li.querySelector('.status-badge');
             if (badge) {
                 badge.className = 'mt-2 inline-flex status-badge';
-                if (st === 'approved') badge.classList.add('status-badge-success');
-                else if (st === 'declined') badge.classList.add('status-badge-declined');
+                if (normalizedStatus === 'approved') badge.classList.add('status-badge-success');
+                else if (normalizedStatus === 'declined' || normalizedStatus === 'failed') badge.classList.add('status-badge-declined');
                 else badge.classList.add('status-badge-pending');
-                badge.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${newStatus}`;
+                badge.innerHTML = `<span class="h-2 w-2 rounded-full bg-current mr-2"></span>${normalizedStatus === 'failed' ? 'Failed' : newStatus}`;
             }
         }
 
@@ -8893,7 +3247,7 @@ const meta = categories[ds.slug] || {};
                                                             data-fullname="${escapeHtml(user.fullName || '')}"
                                                             data-imageurl="${escapeHtml(frontIdUrl)}"
                                                             data-imagetype="Front ID">
-                                                        <?php echo svg_icon('identification', 'w-3 h-3'); ?><span>Front ID</span>
+                                                        ${window.svg_icon('identification', 'w-3 h-3')}<span>Front ID</span>
                                                     </button>
                                                 ` : ''}
                                                 ${backIdUrl ? `
@@ -8902,7 +3256,7 @@ const meta = categories[ds.slug] || {};
                                                             data-fullname="${escapeHtml(user.fullName || '')}"
                                                             data-imageurl="${escapeHtml(backIdUrl)}"
                                                             data-imagetype="Back ID">
-                                                        <?php echo svg_icon('identification', 'w-3 h-3'); ?><span>Back ID</span>
+                                                        ${window.svg_icon('identification', 'w-3 h-3')}<span>Back ID</span>
                                                     </button>
                                                 ` : ''}
                                                 ${selfieUrl ? `
@@ -8911,7 +3265,7 @@ const meta = categories[ds.slug] || {};
                                                             data-fullname="${escapeHtml(user.fullName || '')}"
                                                             data-imageurl="${escapeHtml(selfieUrl)}"
                                                             data-imagetype="Selfie">
-                                                        <?php echo svg_icon('user-circle', 'w-3 h-3'); ?><span>Selfie</span>
+                                                        ${window.svg_icon('user-circle', 'w-3 h-3')}<span>Selfie</span>
                                                     </button>
                                                 ` : ''}
                                                 ${proofUrl ? `
@@ -8919,7 +3273,7 @@ const meta = categories[ds.slug] || {};
                                                             onclick="showProofModal(this)"
                                                             data-fullname="${escapeHtml(user.fullName || '')}"
                                                             data-proofurl="${escapeHtml(proofUrl)}">
-                                                        <?php echo svg_icon('home', 'w-3 h-3'); ?><span>Proof</span>
+                                                        ${window.svg_icon('home', 'w-3 h-3')}<span>Proof</span>
                                                     </button>
                                                 ` : ''}
                                             </div>
@@ -8933,14 +3287,14 @@ const meta = categories[ds.slug] || {};
                                                 <input type="hidden" name="uid" value="${uid}">
                                                 <input type="hidden" name="newStatus" value="approved">
                                                 <button type="submit" class="btn btn-approve" title="Approve Registration">
-                                                    <?php echo svg_icon('check-circle', 'w-4 h-4'); ?><span>Approve</span>
+                                                    ${window.svg_icon('check-circle', 'w-4 h-4')}<span>Approve</span>
                                                 </button>
                                             </form>
                                             <form class="inline-flex" onsubmit="handleUserVerification(event)">
                                                 <input type="hidden" name="uid" value="${uid}">
                                                 <input type="hidden" name="newStatus" value="rejected">
                                                 <button type="submit" class="btn btn-decline" title="Reject Registration">
-                                                    <?php echo svg_icon('x-circle', 'w-4 h-4'); ?><span>Reject</span>
+                                                    ${window.svg_icon('x-circle', 'w-4 h-4')}<span>Reject</span>
                                                 </button>
                                             </form>
                                         </div>
@@ -8987,7 +3341,7 @@ const meta = categories[ds.slug] || {};
                         if (vuList.children.length === 0 || vuList.querySelector('.user-card') === null) {
                             vuLoading.style.display = 'block';
                             vuEmpty.classList.add('hidden');
-                            vuList.innerHTML = '<div class="text-center py-10 text-slate-500 text-sm"><div class="inline-flex items-center gap-2"><?php echo svg_icon('spinner', 'w-5 h-5 animate-spin'); ?> Loading users...</div></div>';
+                            vuList.innerHTML = '<div class="text-center py-10 text-slate-500 text-sm"><div class="inline-flex items-center gap-2">${window.svg_icon('spinner', 'w-5 h-5 animate-spin')} Loading users...</div></div>';
                         }
                     }
 
@@ -9056,7 +3410,7 @@ const meta = categories[ds.slug] || {};
                             
                             vuList.innerHTML = `<div class="text-center py-10 text-slate-500 text-sm">
                                 <div class="inline-flex items-center gap-2 mb-2">
-                                    <?php echo svg_icon('spinner', 'w-5 h-5 animate-spin'); ?>
+                                    ${window.svg_icon('spinner', 'w-5 h-5 animate-spin')}
                                     Retrying... (${retryCount + 1}/${maxRetries})
                                 </div>
                                 <div class="text-xs text-slate-400">
@@ -9076,7 +3430,7 @@ const meta = categories[ds.slug] || {};
                             
                             vuList.innerHTML = `<div class="text-center py-10">
                                 <div class="text-red-500 mb-3 text-sm">
-                                    <?php echo svg_icon('x-mark', 'w-6 h-6 mx-auto mb-2'); ?>
+                                    ${window.svg_icon('x-mark', 'w-6 h-6 mx-auto mb-2')}
                                     ${errorMsg}
                                 </div>
                                 <div class="space-y-2">
@@ -9174,7 +3528,7 @@ const meta = categories[ds.slug] || {};
                                                             data-fullname="${escapeHtml(user.fullName || '')}"
                                                             data-imageurl="${escapeHtml(frontIdUrl)}"
                                                             data-imagetype="Front ID">
-                                                        <?php echo svg_icon('identification', 'w-3 h-3'); ?><span>Front ID</span>
+                                                        ${window.svg_icon('identification', 'w-3 h-3')}<span>Front ID</span>
                                                     </button>
                                                 ` : ''}
                                                 ${backIdUrl ? `
@@ -9183,7 +3537,7 @@ const meta = categories[ds.slug] || {};
                                                             data-fullname="${escapeHtml(user.fullName || '')}"
                                                             data-imageurl="${escapeHtml(backIdUrl)}"
                                                             data-imagetype="Back ID">
-                                                        <?php echo svg_icon('identification', 'w-3 h-3'); ?><span>Back ID</span>
+                                                        ${window.svg_icon('identification', 'w-3 h-3')}<span>Back ID</span>
                                                     </button>
                                                 ` : ''}
                                                 ${selfieUrl ? `
@@ -9192,7 +3546,7 @@ const meta = categories[ds.slug] || {};
                                                             data-fullname="${escapeHtml(user.fullName || '')}"
                                                             data-imageurl="${escapeHtml(selfieUrl)}"
                                                             data-imagetype="Selfie">
-                                                        <?php echo svg_icon('user-circle', 'w-3 h-3'); ?><span>Selfie</span>
+                                                        ${window.svg_icon('user-circle', 'w-3 h-3')}<span>Selfie</span>
                                                     </button>
                                                 ` : ''}
                                                 ${proofUrl ? `
@@ -9200,7 +3554,7 @@ const meta = categories[ds.slug] || {};
                                                             onclick="showProofModal(this)"
                                                             data-fullname="${escapeHtml(user.fullName || '')}"
                                                             data-proofurl="${escapeHtml(proofUrl)}">
-                                                        <?php echo svg_icon('home', 'w-3 h-3'); ?><span>Proof</span>
+                                                        ${window.svg_icon('home', 'w-3 h-3')}<span>Proof</span>
                                                     </button>
                                                 ` : ''}
                                             </div>
@@ -9214,14 +3568,14 @@ const meta = categories[ds.slug] || {};
                                                 <input type="hidden" name="uid" value="${uid}">
                                                 <input type="hidden" name="newStatus" value="approved">
                                                 <button type="submit" class="btn btn-approve" title="Approve Registration">
-                                                    <?php echo svg_icon('check-circle', 'w-4 h-4'); ?><span>Approve</span>
+                                                    ${window.svg_icon('check-circle', 'w-4 h-4')}<span>Approve</span>
                                                 </button>
                                             </form>
                                             <form class="inline-flex" onsubmit="handleUserVerification(event)">
                                                 <input type="hidden" name="uid" value="${uid}">
                                                 <input type="hidden" name="newStatus" value="rejected">
                                                 <button type="submit" class="btn btn-decline" title="Reject Registration">
-                                                    <?php echo svg_icon('x-circle', 'w-4 h-4'); ?><span>Reject</span>
+                                                    ${window.svg_icon('x-circle', 'w-4 h-4')}<span>Reject</span>
                                                 </button>
                                             </form>
                                         </div>
@@ -9402,7 +3756,7 @@ const meta = categories[ds.slug] || {};
         }
         
         // Staff: Load assigned reports data via AJAX for better performance
-        <?php if (!$isAdmin): ?>
+        if (!window.dashboardConfig.isAdmin) {
         (async () => {
             const cardsContainer = document.getElementById('staffReportCards');
             if (!cardsContainer) return;
@@ -9411,6 +3765,7 @@ const meta = categories[ds.slug] || {};
                 // Load staff data
                 const formData = new FormData();
                 formData.append('api_action', 'load_staff_data');
+                formData.append('force_refresh', 'true');
                 
                 const response = await fetch(window.location.href, {
                     method: 'POST',
@@ -9493,6 +3848,7 @@ const meta = categories[ds.slug] || {};
                         // Reload full staff data
                         const fullDataForm = new FormData();
                         fullDataForm.append('api_action', 'load_staff_data');
+                        fullDataForm.append('force_refresh', 'true');
                         
                         const fullResponse = await fetch(window.location.href, {
                             method: 'POST',
@@ -9649,7 +4005,9 @@ const meta = categories[ds.slug] || {};
         window.refreshStaffReports = async function() {
                 try {
                     const formData = createFormDataWithCsrf();
-                    formData.append('api_action', 'load_staff_data');                const response = await fetch(window.location.href, {
+                    formData.append('api_action', 'load_staff_data');
+                    formData.append('force_refresh', 'true');
+                    const response = await fetch(window.location.href, {
                     method: 'POST',
                     body: formData
                 });
@@ -9683,6 +4041,7 @@ const meta = categories[ds.slug] || {};
                 // Force immediate refresh without checking last update time
                 const formData = new FormData();
                 formData.append('api_action', 'load_staff_data');
+                formData.append('force_refresh', 'true');
                 
                 const response = await fetch(window.location.href, {
                     method: 'POST',
@@ -9717,6 +4076,7 @@ const meta = categories[ds.slug] || {};
                 // Immediate refresh with minimal delay
                 const formData = new FormData();
                 formData.append('api_action', 'load_staff_data');
+                formData.append('force_refresh', 'true');
                 
                 const response = await fetch(window.location.href, {
                     method: 'POST',
@@ -9766,6 +4126,7 @@ const meta = categories[ds.slug] || {};
                 const pendingItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'pending');
                 const approvedItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'approved');
                 const declinedItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'declined');
+                const respondingItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'responding');
                 const respondedItems = reports.filter(r => (r.status || 'pending').toLowerCase() === 'responded');
                 // Emergency alerts section removed
                 let emergencySection = '';
@@ -9781,7 +4142,7 @@ const meta = categories[ds.slug] || {};
                     <div class="p-4 border-b border-slate-200/80 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
                         <div class="flex items-center gap-3">
                             <div class="w-11 h-11 rounded-lg bg-${meta.color}-100 text-${meta.color}-600 flex items-center justify-center flex-shrink-0">
-                                <?php echo svg_icon($meta['icon'], 'w-6 h-6'); ?>
+                                ${window.svg_icon($meta['icon'], 'w-6 h-6')}
                             </div>
                             <h3 class="text-lg font-bold text-slate-800">${meta.label} Reports</h3>
                         </div>
@@ -9797,6 +4158,10 @@ const meta = categories[ds.slug] || {};
                             <button type="button" class="seg-btn" data-tab="declined" onclick="switchTab('${slug}', 'declined')">
                                 <span class="seg-label">Declined</span>
                                 <span class="tab-count">${declinedItems.length}</span>
+                            </button>
+                            <button type="button" class="seg-btn" data-tab="responding" onclick="switchTab('${slug}', 'responding')">
+                                <span class="seg-label">Responding</span>
+                                <span class="tab-count">${respondingItems.length}</span>
                             </button>
                             <button type="button" class="seg-btn" data-tab="responded" onclick="switchTab('${slug}', 'responded')">
                                 <span class="seg-label">Responded</span>
@@ -10308,13 +4673,13 @@ const meta = categories[ds.slug] || {};
                                     data-rawtimestamp="${report.timestamp}"
                                     data-reporterid="${report.reporterId || ''}" 
                                     data-imageurl="${report.imageUrl || ''}">
-                                    <?php echo svg_icon('eye', 'w-3 h-3'); ?><span>View</span>
+                                    ${window.svg_icon('eye', 'w-3 h-3')}<span>View</span>
                                 </button>
                                 <button type="button" class="btn btn-approve text-xs px-2 py-1" title="Approve Report" onclick="showApproveConfirmation('ambulance_reports', '${report.id || report._id || ''}', '${report.fullName || report.reporterName || ''}', 'ambulance')">
-                                    <?php echo svg_icon('check-circle', 'w-3 h-3'); ?><span>Approve</span>
+                                    ${window.svg_icon('check-circle', 'w-3 h-3')}<span>Approve</span>
                                 </button>
                                 <button type="button" class="btn btn-decline text-xs px-2 py-1" title="Decline Report" onclick="showDeclineConfirmation('ambulance_reports', '${report.id || report._id || ''}', '${report.fullName || report.reporterName || ''}', 'ambulance')">
-                                    <?php echo svg_icon('x-circle', 'w-3 h-3'); ?><span>Decline</span>
+                                    ${window.svg_icon('x-circle', 'w-3 h-3')}<span>Decline</span>
                                 </button>
                             </div>
                         </div>
@@ -10335,11 +4700,13 @@ const meta = categories[ds.slug] || {};
 
             let tableRows = '';
             reports.forEach((it, i) => {
-                const st = (it.status || 'Pending').toLowerCase();
-                const displayStatus = it.status || 'Pending';
+                const stRaw = String(it.status || 'Pending').trim().toLowerCase();
+                const st = stRaw === 'faile' ? 'failed' : stRaw;
+                const displayStatus = st === 'failed' ? 'Failed' : (it.status || 'Pending');
                 const isApproved = (st === 'approved');
-                const isDeclined = (st === 'declined');
-                const isFinal = isApproved || isDeclined;
+                const isDeclined = (st === 'declined' || st === 'failed');
+                const isResponded = (st === 'responded');
+                const isFinal = isApproved || isDeclined || isResponded;
                 const tDisplay = it.tsDisplay || formatFirebaseTimestamp(it.timestamp);
                 const imgUrl = it.imageUrl || '';
                 
@@ -10376,13 +4743,13 @@ const meta = categories[ds.slug] || {};
                                     data-status="${displayStatus}" data-timestamp="${tDisplay}"
                                     data-rawtimestamp="${JSON.stringify(it.timestamp).replace(/"/g, '&quot;')}"
                                     data-reporterid="${normalizedData.reporterId}" data-imageurl="${imgUrl}">
-                                    <?php echo svg_icon('eye', 'w-4 h-4'); ?><span>View</span>
+                                    ${window.svg_icon('eye', 'w-4 h-4')}<span>View</span>
                                 </button>
                                 <button type="button" class="btn ${isFinal ? 'btn-disabled' : 'btn-approve'}" ${isFinal ? 'disabled' : ''} title="Approve Report" onclick="showApproveConfirmation('${collection}', '${it.id}', '${normalizedData.fullName}', '${slug}')">
-                                    <?php echo svg_icon('check-circle', 'w-4 h-4'); ?><span>Approve</span>
+                                    ${window.svg_icon('check-circle', 'w-4 h-4')}<span>Approve</span>
                                 </button>
                                 <button type="button" class="btn ${isFinal ? 'btn-disabled' : 'btn-decline'}" ${isFinal ? 'disabled' : ''} title="Decline Report" onclick="showDeclineConfirmation('${collection}', '${it.id}', '${normalizedData.fullName}', '${slug}')">
-                                    <?php echo svg_icon('x-circle', 'w-4 h-4'); ?><span>Decline</span>
+                                    ${window.svg_icon('x-circle', 'w-4 h-4')}<span>Decline</span>
                                 </button>
                             </div>
                         </td>
@@ -10410,11 +4777,13 @@ const meta = categories[ds.slug] || {};
             `;
         }
 
-        <?php endif; ?>
+        }
     });
-    </script>
 
-    <script type="module">
+
+// --- End of Block 3 ---
+
+
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
     import { getFirestore, doc, onSnapshot, collection, query, where, orderBy, limit } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
@@ -10566,7 +4935,10 @@ const meta = categories[ds.slug] || {};
         loadNotificationCount();
         
         // Refresh notification count every 30 seconds
-        setInterval(loadNotificationCount, 30000);
+        setInterval(() => {
+            if (document.hidden) return;
+            loadNotificationCount();
+        }, 30000);
         
         // Real-time notification updates
         if (window.FIREBASE_CLIENT_CONFIG && window.FIREBASE_CLIENT_CONFIG.projectId) {
@@ -11235,7 +5607,7 @@ const meta = categories[ds.slug] || {};
                 <div class="relative max-w-md w-full bg-white rounded-2xl shadow-xl overflow-hidden animate-fade-in-up">
                     <div class="p-6 text-center">
                         <div class="w-16 h-16 bg-${color}-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                            <?php echo svg_icon('${icon}', 'w-8 h-8 text-${color}-600'); ?>
+                            ${window.svg_icon('${icon}', 'w-8 h-8 text-${color}-600')}
                         </div>
                         <h3 class="text-xl font-bold text-${color}-800 mb-2">${title}</h3>
                         <p class="text-gray-600 mb-6">${message}</p>
@@ -11369,7 +5741,7 @@ const meta = categories[ds.slug] || {};
             let originalExternalText = '';
             if (externalApproveBtn) {
                 originalExternalText = externalApproveBtn.innerHTML;
-                externalApproveBtn.innerHTML = '<?php echo svg_icon('spinner', 'w-4 h-4 animate-spin'); ?> Approving...';
+                externalApproveBtn.innerHTML = '${window.svg_icon('spinner', 'w-4 h-4 animate-spin')} Approving...';
                 externalApproveBtn.disabled = true;
                 externalApproveBtn.classList.add('opacity-75');
                 console.log('✅ External button set to loading state');
@@ -11382,7 +5754,7 @@ const meta = categories[ds.slug] || {};
             console.log('🔍 Confirm button found:', confirmBtn);
             if (confirmBtn) {
                 const originalText = confirmBtn.innerHTML;
-                confirmBtn.innerHTML = '<?php echo svg_icon('spinner', 'w-4 h-4 animate-spin'); ?> Approving...';
+                confirmBtn.innerHTML = '${window.svg_icon('spinner', 'w-4 h-4 animate-spin')} Approving...';
                 confirmBtn.disabled = true;
                 
                 // Restore button after action completes
@@ -11582,7 +5954,7 @@ const meta = categories[ds.slug] || {};
             let originalExternalText = '';
             if (externalDeclineBtn) {
                 originalExternalText = externalDeclineBtn.innerHTML;
-                externalDeclineBtn.innerHTML = '<?php echo svg_icon('spinner', 'w-4 h-4 animate-spin'); ?> Declining...';
+                externalDeclineBtn.innerHTML = '${window.svg_icon('spinner', 'w-4 h-4 animate-spin')} Declining...';
                 externalDeclineBtn.disabled = true;
                 externalDeclineBtn.classList.add('opacity-75');
                 console.log('✅ External decline button set to loading state');
@@ -11594,7 +5966,7 @@ const meta = categories[ds.slug] || {};
             const confirmBtn = document.querySelector('#declineModal button[onclick="confirmDecline()"]');
             if (confirmBtn) {
                 const originalText = confirmBtn.innerHTML;
-                confirmBtn.innerHTML = '<?php echo svg_icon('spinner', 'w-4 h-4 animate-spin'); ?> Declining...';
+                confirmBtn.innerHTML = '${window.svg_icon('spinner', 'w-4 h-4 animate-spin')} Declining...';
                 confirmBtn.disabled = true;
                 
                 // Restore button after action completes
@@ -11637,6 +6009,7 @@ const meta = categories[ds.slug] || {};
         function startRealTimeTabCountUpdates() {
             // Update tab counts every 10 seconds
             setInterval(async () => {
+                if (document.hidden) return;
                 try {
                     // Get fresh data from server
                     const formData = new FormData();
@@ -11834,6 +6207,39 @@ const meta = categories[ds.slug] || {};
                 }
             }
 
+            function normalizeChatCategory(value) {
+                const v = String(value || '').trim().toLowerCase();
+                if (!v) return '';
+                if (v.includes('ambulance')) return 'ambulance';
+                if (v.includes('fire')) return 'fire';
+                if (v.includes('tanod')) return 'tanod';
+                if (v.includes('barangay') || v.includes('brgy')) return 'barangay';
+                return v;
+            }
+
+            function getChatCategory(chat) {
+                return normalizeChatCategory(
+                    chat.chatCategory || chat.category || chat.relatedReportType || chat.reportType || chat.type || ''
+                );
+            }
+
+            const pendingCategorySelections = {};
+
+            window.setPendingChatCategory = function(chatId, category, buttonEl = null) {
+                if (!chatId) return;
+                pendingCategorySelections[chatId] = normalizeChatCategory(category);
+
+                const group = document.querySelector(`[data-chat-category-group="${chatId}"]`);
+                if (!group) return;
+
+                group.querySelectorAll('button[data-category]').forEach(btn => {
+                    const isActive = btn.dataset.category === pendingCategorySelections[chatId];
+                    btn.className = isActive
+                        ? 'px-3 py-1.5 rounded-full text-xs font-semibold border bg-sky-600 text-white border-sky-600 transition-all'
+                        : 'px-3 py-1.5 rounded-full text-xs font-semibold border bg-white text-slate-700 border-slate-300 hover:border-sky-400 hover:text-sky-700 transition-all';
+                });
+            };
+
             function renderChatItem(chat) {
                 const chatId = chat.id || chat._id || chat.userId || chat.user_id || chat.uid || '';
                 if (!chatId) {
@@ -11849,6 +6255,13 @@ const meta = categories[ds.slug] || {};
                 const time = chat.lastMessageTime ? new Date(chat.lastMessageTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '';
                 const isPending = !chat.status || chat.status === 'pending' || chat.status === 'waiting';
                 const isEnded = chat.status === 'ended';
+                const chatCategory = getChatCategory(chat);
+                const chatCategoryLabel = {
+                    ambulance: '🚑 Ambulance',
+                    fire: '🔥 Fire',
+                    tanod: '👮 Tanod',
+                    barangay: '🏘️ Barangay'
+                }[chatCategory] || '';
                 
                 const chatName = chat.userName || 'Unknown User';
                 const chatInitials = chatName.substring(0, 2).toUpperCase();
@@ -11859,9 +6272,9 @@ const meta = categories[ds.slug] || {};
 
                 div.innerHTML = `
                     <div class="flex items-center gap-3">
-                        <div class="w-10 h-10 rounded-full ${avatarClass} flex items-center justify-center font-bold text-sm relative">
+                        <div class="w-10 h-10 rounded-full ${avatarClass} flex items-center justify-center font-bold text-sm relative overflow-visible shadow-none ring-0">
                             ${chatInitials}
-                            ${isPending ? '<span class="absolute -top-1 -right-1 w-3 h-3 bg-amber-500 rounded-full border-2 border-white"></span>' : ''}
+                            ${isPending ? '<span class="absolute -top-1 -right-1 w-3 h-3 bg-amber-500 rounded-full border border-white"></span>' : ''}
                         </div>
                         <div class="flex-1 min-w-0">
                             <div class="flex justify-between items-start">
@@ -11869,6 +6282,7 @@ const meta = categories[ds.slug] || {};
                                 <span class="text-xs text-slate-400 whitespace-nowrap ml-2">${time}</span>
                             </div>
                             <p class="text-xs text-slate-500 truncate mt-0.5 ${isPending ? 'font-semibold text-slate-700' : ''}">${lastMessage}</p>
+                            ${chatCategoryLabel ? `<span class="inline-flex items-center px-2 py-0.5 mt-1 text-[10px] font-semibold rounded-full bg-sky-50 text-sky-700 border border-sky-200">${chatCategoryLabel}</span>` : ''}
                             ${chat.unreadCount > 0 ? `<span class="inline-flex items-center justify-center px-2 py-0.5 mt-1 text-xs font-bold leading-none text-white bg-red-500 rounded-full">${chat.unreadCount}</span>` : ''}
                         </div>
                     </div>
@@ -11919,6 +6333,36 @@ const meta = categories[ds.slug] || {};
                 const inputArea = document.getElementById('messageInputArea');
                 if (currentChatStatus === 'pending' || currentChatStatus === 'waiting') {
                     inputArea.classList.add('hidden');
+
+                    const detectedCategory = getChatCategory(chat);
+                    if (!pendingCategorySelections[resolvedChatId] && detectedCategory) {
+                        pendingCategorySelections[resolvedChatId] = detectedCategory;
+                    }
+
+                    const selectedCategory = pendingCategorySelections[resolvedChatId] || '';
+                    const categoryButtons = [
+                        { key: 'ambulance', label: '🚑 Ambulance' },
+                        { key: 'fire', label: '🔥 Fire' },
+                        { key: 'tanod', label: '👮 Tanod' },
+                        { key: 'barangay', label: '🏘️ Barangay' }
+                    ];
+
+                    const categoryChooser = `
+                        <div class="mb-4 w-full max-w-xs text-left">
+                            <p class="text-xs font-bold text-slate-600 mb-2 uppercase tracking-wide">Category Routing</p>
+                            <div class="flex flex-wrap gap-2" data-chat-category-group="${resolvedChatId}">
+                                ${categoryButtons.map(item => {
+                                    const isActive = selectedCategory === item.key;
+                                    const cls = isActive
+                                        ? 'px-3 py-1.5 rounded-full text-xs font-semibold border bg-sky-600 text-white border-sky-600 transition-all'
+                                        : 'px-3 py-1.5 rounded-full text-xs font-semibold border bg-white text-slate-700 border-slate-300 hover:border-sky-400 hover:text-sky-700 transition-all';
+                                    return `<button type="button" class="${cls}" data-category="${item.key}" onclick="setPendingChatCategory('${resolvedChatId}', '${item.key}', this)">${item.label}</button>`;
+                                }).join('')}
+                            </div>
+                            <p class="text-[11px] text-slate-500 mt-2">Choose a category before accepting to route this chat to the correct responders.</p>
+                        </div>
+                    `;
+
                     // Show Accept Button in messages area
                     messagesArea.innerHTML = `
                         <div class="h-full flex flex-col items-center justify-center p-6 text-center">
@@ -11934,6 +6378,7 @@ const meta = categories[ds.slug] || {};
                                 <p class="text-slate-600">Type: ${chat.relatedReportType || 'Report'}</p>
                                 <p class="text-slate-600 text-xs mt-1">ID: ${chat.relatedReportId}</p>
                             </div>` : ''}
+                            ${categoryChooser}
                             <button onclick="acceptChat('${resolvedChatId}', this)" class="bg-sky-600 hover:bg-sky-700 text-white px-6 py-3 rounded-xl font-bold shadow-lg shadow-sky-500/20 transition-all hover:scale-105 flex items-center gap-2">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
@@ -12051,6 +6496,10 @@ const meta = categories[ds.slug] || {};
                 try {
                     const formData = new FormData();
                     formData.append('chat_id', chatId);
+                    const selectedCategory = pendingCategorySelections[chatId] || '';
+                    if (selectedCategory) {
+                        formData.append('chat_category', selectedCategory);
+                    }
                     
                     if(btn) {
                         // Store original content to restore on error
@@ -12098,6 +6547,7 @@ const meta = categories[ds.slug] || {};
                             id: chatId, 
                             userName: chatName, 
                             status: 'active',
+                            chatCategory: selectedCategory,
                             lastMessageTime: new Date()
                         };
                         
@@ -12230,7 +6680,7 @@ const meta = categories[ds.slug] || {};
                         lastDate = date;
                     }
 
-                    const isMe = msg.senderId === '<?php echo $_SESSION['user_id'] ?? ''; ?>';
+                    const isMe = msg.senderId === 'window.dashboardConfig.userId';
                     const isSystem = msg.isSystem === true;
                     const isPending = msg.isPending === true;
                     
@@ -12268,7 +6718,7 @@ const meta = categories[ds.slug] || {};
                     const tempId = 'temp-' + Date.now();
                     const optimisticMsg = {
                         text: message,
-                        senderId: '<?php echo $_SESSION['user_id'] ?? ''; ?>',
+                        senderId: 'window.dashboardConfig.userId',
                         timestamp: new Date(),
                         isPending: true,
                         id: tempId
@@ -12343,8 +6793,11 @@ const meta = categories[ds.slug] || {};
         window.closeDeclineModal = closeDeclineModal;
         window.confirmDecline = confirmDecline;
         window.updateReportStatus = updateReportStatus;
-    </script>
-    <script>
+
+
+// --- End of Block 4 ---
+
+
         // Live Support Badge Logic
         async function updateLiveSupportBadge() {
             try {
@@ -12392,7 +6845,10 @@ const meta = categories[ds.slug] || {};
         (function() {
             const startPolling = () => {
                 updateLiveSupportBadge();
-                setInterval(updateLiveSupportBadge, 5000); // Poll every 5 seconds
+                setInterval(() => {
+                    if (document.hidden) return;
+                    updateLiveSupportBadge();
+                }, 5000); // Poll every 5 seconds
             };
 
             if (document.readyState === 'loading') {
@@ -12401,45 +6857,11 @@ const meta = categories[ds.slug] || {};
                 startPolling();
             }
         })();
-    </script>
-    <!-- End Chat Confirmation Modal -->
-    <div id="endChatModal" class="fixed inset-0 z-50 hidden" aria-labelledby="modal-title" role="dialog" aria-modal="true">
-        <!-- Backdrop -->
-        <div class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm transition-opacity opacity-0" id="endChatModalBackdrop"></div>
 
-        <div class="fixed inset-0 z-10 overflow-y-auto">
-            <div class="flex min-h-full items-end justify-center p-4 text-center sm:items-center sm:p-0">
-                <!-- Modal Panel -->
-                <div class="relative transform overflow-hidden rounded-2xl bg-white text-left shadow-2xl transition-all sm:my-8 sm:w-full sm:max-w-md opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95" id="endChatModalPanel">
-                    
-                    <!-- Decorative Header Pattern -->
-                    <div class="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-red-400 to-red-600"></div>
 
-                    <div class="bg-white px-4 pb-4 pt-5 sm:p-6 sm:pb-4">
-                        <div class="sm:flex sm:items-start">
-                            <div class="mx-auto flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-full bg-red-100 sm:mx-0 sm:h-10 sm:w-10 mb-4 sm:mb-0">
-                                <svg class="h-6 w-6 text-red-600" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" aria-hidden="true">
-                                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
-                                </svg>
-                            </div>
-                            <div class="mt-3 text-center sm:ml-4 sm:mt-0 sm:text-left w-full">
-                                <h3 class="text-lg font-bold leading-6 text-slate-900" id="modal-title">End Chat Session</h3>
-                                <div class="mt-2">
-                                    <p class="text-sm text-slate-500">Are you sure you want to end this chat session? This action cannot be undone and the user will be notified.</p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="bg-slate-50 px-4 py-3 sm:flex sm:flex-row-reverse sm:px-6 border-t border-slate-100">
-                        <button type="button" onclick="confirmEndChatAction()" class="inline-flex w-full justify-center rounded-xl bg-red-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-red-500 sm:ml-3 sm:w-auto transition-all hover:shadow-lg hover:shadow-red-500/30 active:scale-95">End Chat</button>
-                        <button type="button" onclick="closeEndChatModal()" class="mt-3 inline-flex w-full justify-center rounded-xl bg-white px-3 py-2 text-sm font-semibold text-slate-900 shadow-sm ring-1 ring-inset ring-slate-300 hover:bg-slate-50 sm:mt-0 sm:w-auto transition-all hover:shadow-md active:scale-95">Cancel</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
+// --- End of Block 5 ---
 
-    <script>
+
         // End Chat Modal Functions
         function showEndChatModal() {
             const modal = document.getElementById('endChatModal');
@@ -12474,8 +6896,11 @@ const meta = categories[ds.slug] || {};
                 }, 300);
             }
         }
-    </script>
-    <script>
+
+
+// --- End of Block 6 ---
+
+
         // Verify Users Badge Logic
         async function updateVerifyUsersBadge() {
             try {
@@ -12520,7 +6945,10 @@ const meta = categories[ds.slug] || {};
         (function() {
             const startPolling = () => {
                 updateVerifyUsersBadge();
-                setInterval(updateVerifyUsersBadge, 10000); // Poll every 10 seconds
+                setInterval(() => {
+                    if (document.hidden) return;
+                    updateVerifyUsersBadge();
+                }, 10000); // Poll every 10 seconds
             };
 
             if (document.readyState === 'loading') {
@@ -12529,17 +6957,7 @@ const meta = categories[ds.slug] || {};
                 startPolling();
             }
         })();
-    </script>
-    
-    <!-- Dashboard Core JS for realtime polling -->
-    <script src="assets/js/dashboard-core.js?v=<?php echo time(); ?>"></script>
-</body>
-</html>
 
-<?php
-if (defined('DEBUG_MODE') && DEBUG_MODE) {
-    $ms = round((microtime(true) - ($__reqStart ?? microtime(true))) * 1000, 2);
-    $v = $_GET['view'] ?? 'dashboard';
-    error_log('[perf] dashboard.php end view=' . $v . ' ms=' . $ms . ' sid=' . session_id());
-}
-?>
+
+// --- End of Block 7 ---
+

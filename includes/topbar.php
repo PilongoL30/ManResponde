@@ -42,19 +42,19 @@
                         <span class="font-medium">Dashboard</span>
                     </a>
 
-                    <a href="dashboard.php?view=map" class="flex items-center gap-3 px-4 py-3 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all">
+                    <a href="interactive_map.php" class="flex items-center gap-3 px-4 py-3 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all">
                         <i class="fas fa-map-marked-alt w-5 text-center"></i>
                         <span class="font-medium">Live Map</span>
                     </a>
 
-                    <a href="dashboard.php?view=live-support" class="flex items-center gap-3 px-4 py-3 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all">
+                    <a href="live_support.php" class="flex items-center gap-3 px-4 py-3 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all">
                         <i class="fas fa-headset w-5 text-center"></i>
                         <span class="font-medium">Live Support</span>
                         <span id="liveSupportBadgeMobile" class="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
                     </a>
 
                     <?php if ($isAdmin): ?>
-                    <a href="dashboard.php?view=create-account" class="flex items-center gap-3 px-4 py-3 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all">
+                    <a href="create_account.php" class="flex items-center gap-3 px-4 py-3 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all">
                         <i class="fas fa-user-plus w-5 text-center"></i>
                         <span class="font-medium">Create Account</span>
                     </a>

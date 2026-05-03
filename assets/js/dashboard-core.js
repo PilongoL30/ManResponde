@@ -1232,6 +1232,13 @@ function svg_icon(name, className = 'w-6 h-6') {
             // Fetch staff data
             const formData = new FormData();
             formData.append('api_action', 'get_staff_data');
+            
+            // Add CSRF token for security
+            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+            if (csrfToken) {
+                // Use the common CSRF token name (_csrf_token)
+                formData.append('_csrf_token', csrfToken);
+            }
 
             const response = await fetch(window.location.href, {
                 method: 'POST',
@@ -1461,30 +1468,41 @@ function svg_icon(name, className = 'w-6 h-6') {
             // Function to init map
             const initMap = (lat, lng, label) => {
                 setTimeout(() => {
-                    if (window.reportMap) {
-                        window.reportMap.remove();
-                        window.reportMap = null;
-                    }
-                    
-                    // Create map instance
-                    window.reportMap = L.map('m_map').setView([lat, lng], 16);
-                    
-                    // Add OpenStreetMap tile layer
-                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                    }).addTo(window.reportMap);
-                    
-                    // Add marker
-                    L.marker([lat, lng]).addTo(window.reportMap)
-                        .bindPopup(label)
-                        .openPopup();
+                    try {
+                        if (window.reportMap) {
+                            window.reportMap.remove();
+                            window.reportMap = null;
+                        }
                         
-                    // Force map redraw after modal animation to prevent gray tiles
-                    setTimeout(() => {
-                        window.reportMap.invalidateSize();
-                    }, 300);
-                    
-                    if (mapStatus) mapStatus.textContent = 'Location found';
+                        if (typeof L === 'undefined') {
+                            console.error('Leaflet library (L) is not loaded!');
+                            if (mapStatus) mapStatus.textContent = 'Map library error';
+                            return;
+                        }
+                        
+                        // Create map instance
+                        window.reportMap = L.map('m_map').setView([lat, lng], 16);
+                        
+                        // Add OpenStreetMap tile layer
+                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                        }).addTo(window.reportMap);
+                        
+                        // Add marker
+                        L.marker([lat, lng]).addTo(window.reportMap)
+                            .bindPopup(label)
+                            .openPopup();
+                            
+                        // Force map redraw after modal animation to prevent gray tiles
+                        setTimeout(() => {
+                            if (window.reportMap) window.reportMap.invalidateSize();
+                        }, 300);
+                        
+                        if (mapStatus) mapStatus.textContent = 'Location found';
+                    } catch (mapErr) {
+                        console.error('Map init error:', mapErr);
+                        if (mapStatus) mapStatus.textContent = 'Map display error';
+                    }
                 }, 100);
             };
 
@@ -1502,32 +1520,62 @@ function svg_icon(name, className = 'w-6 h-6') {
                     const lng = parseFloat(coordMatch[2]);
                     initMap(lat, lng, ds.location);
                 } else {
-                // 2. Geocode address using Nominatim
-                // Append 'Philippines' context if not present to improve accuracy
-                let queryStr = ds.location;
-                if (!queryStr.toLowerCase().includes('philippines')) {
-                    queryStr += ', Philippines';
-                }
-                
-                const query = encodeURIComponent(queryStr);
-                
-                fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${query}&limit=1`)
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data && data.length > 0) {
-                            const lat = parseFloat(data[0].lat);
-                            const lng = parseFloat(data[0].lon);
-                            initMap(lat, lng, ds.location);
-                        } else {
-                            if (mapStatus) mapStatus.textContent = 'Location not found on map';
-                            // Fallback to Manila
-                            initMap(14.5995, 120.9842, 'Location not found: ' + ds.location);
+                    // 3. Geocode address using Nominatim
+                    const performGeocode = (queryStr, strategy = 'full') => {
+                        let finalQuery = queryStr;
+                        if (!finalQuery.toLowerCase().includes('philippines')) {
+                            finalQuery += ', Philippines';
                         }
-                    })
-                    .catch(err => {
-                        console.error('Geocoding error:', err);
-                        if (mapStatus) mapStatus.textContent = 'Map error';
-                    });
+                        
+                        console.log(`Geocoding with strategy ${strategy}:`, finalQuery);
+                        
+                        const encoded = encodeURIComponent(finalQuery);
+                        // Nominatim usage policy requires a User-Agent
+                        fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encoded}&limit=1`, {
+                            headers: { 'User-Agent': 'ManResponde-Dashboard/1.0' }
+                        })
+                            .then(res => res.json())
+                            .then(data => {
+                                if (data && data.length > 0) {
+                                    const lat = parseFloat(data[0].lat);
+                                    const lng = parseFloat(data[0].lon);
+                                    console.log('Geocoding success:', lat, lng);
+                                    initMap(lat, lng, ds.location);
+                                } else {
+                                    // Retry strategies
+                                    if (strategy === 'full') {
+                                        // Strategy 1: Strip Plus Code
+                                        const stripped = ds.location.replace(/^[A-Z0-9]{4,8}\+[A-Z0-9]{2,},?\s*/, '');
+                                        if (stripped !== ds.location && stripped.length > 5) {
+                                            performGeocode(stripped, 'stripped');
+                                        } else {
+                                            performGeocode(ds.location, 'fallback_city');
+                                        }
+                                    } else if (strategy === 'stripped') {
+                                        // Strategy 2: Just the town/province (last 2-3 parts of comma-separated string)
+                                        const parts = ds.location.split(',').map(p => p.trim());
+                                        if (parts.length >= 2) {
+                                            const lastParts = parts.slice(-2).join(', ');
+                                            performGeocode(lastParts, 'minimal');
+                                        } else {
+                                            performGeocode(ds.location, 'fallback_city');
+                                        }
+                                    } else {
+                                        // Final fallback
+                                        if (mapStatus) mapStatus.textContent = 'Location not found on map';
+                                        // Fallback to Manila (or a better default for the region if known)
+                                        console.warn('Geocoding failed all strategies for:', ds.location);
+                                        initMap(14.5995, 120.9842, 'Location not found: ' + ds.location);
+                                    }
+                                }
+                            })
+                            .catch(err => {
+                                console.error('Geocoding network error:', err);
+                                if (mapStatus) mapStatus.textContent = 'Network error';
+                            });
+                    };
+
+                    performGeocode(ds.location);
                 }
             }
         }
@@ -1826,7 +1874,9 @@ function svg_icon(name, className = 'w-6 h-6') {
     // --- EXPORT FUNCTIONS ---
     window.showExportModal = function() {
         const exportModal = document.getElementById('exportModal');
+        if (!exportModal) return;
         const modalContent = exportModal.querySelector('.relative');
+        if (!modalContent) return;
         
         exportModal.classList.remove('opacity-0', 'pointer-events-none');
         modalContent.classList.remove('scale-95', 'opacity-0');
@@ -2068,7 +2118,9 @@ function svg_icon(name, className = 'w-6 h-6') {
             const isBackgroundRefresh = window.isBackgroundRefresh === true;
             window.isBackgroundRefresh = false;
 
-            if (retryCount === 0 && !isBackgroundRefresh) {
+            // Optimization: Skip loading spinner if we have pre-rendered items
+            const hasPreRenderedItems = list.children.length > 0 && !list.querySelector('.text-center.py-16');
+            if (retryCount === 0 && !isBackgroundRefresh && !hasPreRenderedItems) {
                 list.innerHTML = `
                     <div class="text-center py-16">
                         <div class="w-16 h-16 mx-auto mb-4 rounded-full bg-gradient-to-br from-blue-100 to-purple-100 flex items-center justify-center">
@@ -2380,6 +2432,10 @@ function svg_icon(name, className = 'w-6 h-6') {
                     fd.append('pageSize', '10');
                     fd.append('category', 'all');
                     fd.append('status', 'all');
+                    
+                    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+                    if (csrfToken) fd.append('_csrf_token', csrfToken);
+                    
                     await fetch(window.location.href, { method: 'POST', body: fd });
                 } catch (e) {}
             };
